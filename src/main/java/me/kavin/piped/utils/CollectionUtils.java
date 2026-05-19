@@ -150,7 +150,7 @@ public class CollectionUtils {
     /// HLS endpoint at Pi5 (built from DASH streams). The app gets a real http:// URL
     /// either way, so AVPlayer's native HLS engine handles it (aggressive buffering).
     private static String hlsOrSynth(String youtubeHls, String videoId) {
-        String rewritten = null; // Always use synth-hls (yt-proxy handles AVPlayer HEAD requests)
+        String rewritten = (youtubeHls == null || youtubeHls.isEmpty()) ? null : rewriteVideoURL(youtubeHls, java.util.Map.of());
         if (rewritten != null && !rewritten.isEmpty()) return rewritten;
         return me.kavin.piped.consts.Constants.PUBLIC_URL + "/synth-hls/" + videoId + "/master.m3u8";
     }
