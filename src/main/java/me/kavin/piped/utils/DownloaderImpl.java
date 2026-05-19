@@ -21,6 +21,37 @@ public class DownloaderImpl extends Downloader {
     private static long cookie_received;
     private static final Object cookie_lock = new Object();
 
+    // Custom: YouTube cookies loaded from /app/youtube-cookies.txt at startup
+    private static final String YOUTUBE_COOKIES = loadYoutubeCookies();
+
+    private static String loadYoutubeCookies() {
+        String path = System.getenv("YOUTUBE_COOKIES_FILE");
+        if (path == null || path.isEmpty()) path = "/app/youtube-cookies.txt";
+        java.io.File f = new java.io.File(path);
+        if (!f.exists()) {
+            System.out.println("[Piped] No youtube-cookies.txt at " + path);
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("#") || line.isBlank()) continue;
+                String[] parts = line.split("\\t");
+                if (parts.length >= 7) {
+                    if (sb.length() > 0) sb.append("; ");
+                    sb.append(parts[5]).append("=").append(parts[6]);
+                }
+            }
+        } catch (java.io.IOException e) {
+            System.err.println("[Piped] Failed to load youtube-cookies.txt: " + e.getMessage());
+            return null;
+        }
+        if (sb.length() == 0) return null;
+        System.out.println("[Piped] Loaded YouTube cookies (" + sb.length() + " bytes)");
+        return sb.toString();
+    }
+
     /**
      * Executes a request with HTTP/2.
      */
@@ -34,7 +65,25 @@ public class DownloaderImpl extends Downloader {
         if (saved_cookie != null && !saved_cookie.hasExpired())
             headers.put("Cookie", saved_cookie.getName() + "=" + saved_cookie.getValue());
 
+        // Custom: attach YouTube cookies to requests targeting YouTube hosts
+        if (YOUTUBE_COOKIES != null) {
+            String url = request.url();
+            if (url.contains("youtube.com") || url.contains("googlevideo.com") || url.contains("ytimg.com")) {
+                String existing = headers.get("Cookie");
+                headers.put("Cookie", existing != null ? existing + "; " + YOUTUBE_COOKIES : YOUTUBE_COOKIES);
+            }
+        }
+
         request.headers().forEach((name, values) -> values.forEach(value -> headers.put(name, value)));
+
+        // Custom: override User-Agent to recent Chrome for YouTube requests
+        // â YouTube prueft Cookie/UA-Konsistenz, Firefox-UA mit Chrome-Cookies = invalid.
+        if (YOUTUBE_COOKIES != null) {
+            String urlForUa = request.url();
+            if (urlForUa.contains("youtube.com") || urlForUa.contains("googlevideo.com") || urlForUa.contains("ytimg.com")) {
+                headers.put("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            }
+        }
 
         var future = ReqwestUtils.fetch(request.url(), request.httpMethod(), bytes, headers);
 

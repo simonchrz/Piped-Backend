@@ -13,6 +13,7 @@ import me.kavin.piped.consts.Constants;
 import me.kavin.piped.server.handlers.*;
 import me.kavin.piped.server.handlers.auth.AuthPlaylistHandlers;
 import me.kavin.piped.server.handlers.auth.FeedHandlers;
+import me.kavin.piped.server.handlers.auth.HistoryHandlers;
 import me.kavin.piped.server.handlers.auth.StorageHandlers;
 import me.kavin.piped.server.handlers.auth.UserHandlers;
 import me.kavin.piped.utils.*;
@@ -112,6 +113,37 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     try {
                         return getJsonResponse(StreamHandlers.streamsResponse(request.getPathParameter("videoId")),
                                 "public, s-maxage=21540, max-age=30", true);
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(GET, "/synth-hls/:videoId/:filename", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        String videoId = request.getPathParameter("videoId");
+                        String filename = request.getPathParameter("filename");
+                        byte[] body;
+                        if (filename.equals("master.m3u8")) {
+                            body = SynthHlsHandlers.masterPlaylist(videoId);
+                        } else if (filename.equals("audio.m3u8")) {
+                            body = SynthHlsHandlers.audioPlaylist(videoId);
+                        } else if (filename.startsWith("video") && filename.endsWith(".m3u8")) {
+                            int idx = Integer.parseInt(filename.substring(5, filename.length() - 5));
+                            body = SynthHlsHandlers.videoPlaylist(videoId, idx);
+                        } else {
+                            return io.activej.http.HttpResponse.ofCode(404);
+                        }
+                        return getRawResponse(body, "application/vnd.apple.mpegurl", "public, max-age=300");
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(GET, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        return YtProxyHandlers.handle(request);
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(HttpMethod.HEAD, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        return YtProxyHandlers.handle(request);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     }
@@ -295,7 +327,17 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     }
                 })).map(GET, "/feed", AsyncServlet.ofBlocking(executor, request -> {
                     try {
-                        return getJsonResponse(FeedHandlers.feedResponse(request.getQueryParameter("authToken")),
+                        String beforeStr = request.getQueryParameter("before");
+                        String limitStr = request.getQueryParameter("limit");
+                        Long before = null;
+                        Integer limit = null;
+                        if (beforeStr != null && !beforeStr.isEmpty()) {
+                            try { before = Long.parseLong(beforeStr); } catch (NumberFormatException ignored) {}
+                        }
+                        if (limitStr != null && !limitStr.isEmpty()) {
+                            try { limit = Integer.parseInt(limitStr); } catch (NumberFormatException ignored) {}
+                        }
+                        return getJsonResponse(FeedHandlers.feedResponse(request.getQueryParameter("authToken"), before, limit),
                                 "private");
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
@@ -339,6 +381,30 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                                 String[].class);
                         return getJsonResponse(FeedHandlers.importResponse(request.getHeader(AUTHORIZATION),
                                 subscriptions, Boolean.parseBoolean(request.getQueryParameter("override"))), "private");
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(GET, "/user/history", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        String limitStr = request.getQueryParameter("limit");
+                        String beforeStr = request.getQueryParameter("before");
+                        Integer limit = (limitStr != null && !limitStr.isEmpty()) ? Integer.parseInt(limitStr) : null;
+                        Long before = (beforeStr != null && !beforeStr.isEmpty()) ? Long.parseLong(beforeStr) : null;
+                        return getJsonResponse(HistoryHandlers.getHistoryResponse(request.getHeader(AUTHORIZATION), limit, before), "private");
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(POST, "/user/history", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        return getJsonResponse(HistoryHandlers.upsertHistoryResponse(request.getHeader(AUTHORIZATION),
+                                request.loadBody().getResult().asArray()), "private");
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
+                })).map(DELETE, "/user/history", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        return getJsonResponse(HistoryHandlers.deleteHistoryResponse(request.getHeader(AUTHORIZATION),
+                                request.getQueryParameter("videoId")), "private");
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     }

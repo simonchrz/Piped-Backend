@@ -80,7 +80,7 @@ public class CollectionUtils {
                 info.getUploaderName(), substringYouTube(info.getUploaderUrl()), getLastThumbnail(info.getUploaderAvatars()),
                 getLastThumbnail(info.getThumbnails()), info.getDuration(), info.getViewCount(), info.getLikeCount(), info.getDislikeCount(),
                 info.getUploaderSubscriberCount(), info.isUploaderVerified(),
-                audioStreams, videoStreams, relatedStreams, subtitles, livestream, rewriteVideoURL(info.getHlsUrl(), Map.of()),
+                audioStreams, videoStreams, relatedStreams, subtitles, livestream, hlsOrSynth(info.getHlsUrl(), info.getId()),
                 rewriteVideoURL(info.getDashMpdUrl(), Map.of()), null, info.getCategory(), info.getLicence(),
                 info.getPrivacy().name().toLowerCase(), info.getTags(), metaInfo, chapters, previewFrames);
     }
@@ -144,5 +144,14 @@ public class CollectionUtils {
                 .filter(ReadyChannelTabListLinkHandler.class::isInstance)
                 .map(ReadyChannelTabListLinkHandler.class::cast)
                 .toList();
+    }
+
+    /// Return YouTube's HLS URL if non-empty, otherwise fall back to our synthesized
+    /// HLS endpoint at Pi5 (built from DASH streams). The app gets a real http:// URL
+    /// either way, so AVPlayer's native HLS engine handles it (aggressive buffering).
+    private static String hlsOrSynth(String youtubeHls, String videoId) {
+        String rewritten = null; // Always use synth-hls (yt-proxy handles AVPlayer HEAD requests)
+        if (rewritten != null && !rewritten.isEmpty()) return rewritten;
+        return me.kavin.piped.consts.Constants.PUBLIC_URL + "/synth-hls/" + videoId + "/master.m3u8";
     }
 }

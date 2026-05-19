@@ -49,6 +49,7 @@ public class Main {
         NewPipe.init(new DownloaderImpl(), new Localization("en", "US"), ContentCountry.DEFAULT);
         if (!StringUtils.isEmpty(Constants.BG_HELPER_URL))
             YoutubeStreamExtractor.setPoTokenProvider(new BgPoTokenProvider(Constants.BG_HELPER_URL));
+        YoutubeStreamExtractor.setFetchIosClient(true);
         YoutubeParsingHelper.setConsentAccepted(CONSENT_COOKIE);
 
         // Warm up the extractor
@@ -146,7 +147,9 @@ public class Main {
 
                     System.out.println("PubSub: queue size - " + queue.size() + " channels");
 
-                    for (int i = 0; i < Runtime.getRuntime().availableProcessors(); i++) {
+                    // Rate-limit: single thread + 250ms sleep between channels.
+                    // Spreads ~485 channels over ~2min instead of a sub-second burst,
+                    // preventing YouTube anti-bot IP flags from parallel /streams fetches.
                         new Thread(() -> {
 
                             Object o = new Object();
@@ -156,9 +159,7 @@ public class Main {
                                 try {
                                     CompletableFuture<?> future = PubSubHelper.subscribePubSub(channelId);
 
-                                    if (future == null)
-                                        continue;
-
+                                if (future != null) {
                                     future.whenComplete((resp, throwable) -> {
                                         synchronized (o) {
                                             o.notify();
@@ -168,19 +169,21 @@ public class Main {
                                     synchronized (o) {
                                         o.wait();
                                     }
+                                }
+
+                                Thread.sleep(250);
 
                                 } catch (Exception e) {
                                     ExceptionHandler.handle(e);
                                 }
                             }
-                        }, "PubSub-" + i).start();
-                    }
+                    }, "PubSub-rate-limited").start();
 
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
             }
-        }, 0, TimeUnit.MINUTES.toMillis(90));
+        }, 0, TimeUnit.HOURS.toMillis(12));
 
         if (!Constants.DISABLE_PUBSUB) new Timer().scheduleAtFixedRate(new TimerTask() {
             @Override

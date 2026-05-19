@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog https://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <changeSet id="3-0-add-user-history" author="ios-app">
+        <createTable tableName="user_history">
+            <column name="id" type="bigserial" autoIncrement="true">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="user_id" type="bigint"><constraints nullable="false"/></column>
+            <column name="video_id" type="varchar(11)"><constraints nullable="false"/></column>
+            <column name="title" type="varchar(500)"/>
+            <column name="uploader" type="varchar(100)"/>
+            <column name="uploader_url" type="varchar(100)"/>
+            <column name="thumbnail" type="varchar(500)"/>
+            <column name="duration" type="int"/>
+            <column name="watched_at" type="bigint"><constraints nullable="false"/></column>
+            <column name="position_seconds" type="double precision"/>
+        </createTable>
+
+        <addUniqueConstraint tableName="user_history"
+                             columnNames="user_id, video_id"
+                             constraintName="user_history_user_video_uq"/>
+        <createIndex tableName="user_history" indexName="user_history_user_id_idx">
+            <column name="user_id"/>
+        </createIndex>
+        <createIndex tableName="user_history" indexName="user_history_watched_at_idx">
+            <column name="watched_at"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>

@@ -23,9 +23,14 @@ import static me.kavin.piped.utils.URLUtils.rewriteURL;
 
 public class FeedHelpers {
     public static Stream<Video> generateAuthenticatedFeed(StatelessSession s, long userId, int maxResults) {
+        return generateAuthenticatedFeed(s, userId, maxResults, null);
+    }
+
+    public static Stream<Video> generateAuthenticatedFeed(StatelessSession s, long userId, int maxResults, Long before) {
         CriteriaBuilder cb = s.getCriteriaBuilder();
 
-        // Get all videos from subscribed channels, with channel info
+        // Get all videos from subscribed channels, with channel info.
+        // If `before` is given, only return videos uploaded BEFORE that timestamp (for pagination).
         CriteriaQuery<Video> criteria = cb.createQuery(Video.class);
         var root = criteria.from(Video.class);
         root.fetch("channel", JoinType.RIGHT);
@@ -34,11 +39,16 @@ public class FeedHelpers {
         subquery.select(subroot.get("subscribed_ids"))
                 .where(cb.equal(subroot.get("id"), userId));
 
-        criteria.select(root)
-                .where(
-                        root.get("channel").get("uploader_id").in(subquery)
-                )
-                .orderBy(cb.desc(root.get("uploaded")));
+        var channelInSubs = root.get("channel").get("uploader_id").in(subquery);
+        if (before != null) {
+            criteria.select(root)
+                    .where(cb.and(channelInSubs, cb.lessThan(root.get("uploaded"), before)))
+                    .orderBy(cb.desc(root.get("uploaded")));
+        } else {
+            criteria.select(root)
+                    .where(channelInSubs)
+                    .orderBy(cb.desc(root.get("uploaded")));
+        }
 
         return s.createQuery(criteria).setTimeout(20).setMaxResults(maxResults).stream();
     }

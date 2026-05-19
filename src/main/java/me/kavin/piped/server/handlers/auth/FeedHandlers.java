@@ -94,16 +94,22 @@ public class FeedHandlers {
     }
 
     public static byte[] feedResponse(String session) throws IOException {
+        return feedResponse(session, null, null);
+    }
+
+    public static byte[] feedResponse(String session, Long before, Integer limit) throws IOException {
 
         if (StringUtils.isBlank(session))
             ExceptionHandler.throwErrorResponse(new InvalidRequestResponse("session is a required parameter"));
+
+        int maxResults = (limit != null && limit > 0) ? limit : Integer.MAX_VALUE;
 
         User user = DatabaseHelper.getUserFromSession(session);
 
         if (user != null) {
             try (StatelessSession s = DatabaseSessionFactory.createStatelessSession()) {
 
-                List<StreamItem> feedItems = FeedHelpers.generateAuthenticatedFeed(s, user.getId(), Integer.MAX_VALUE)
+                List<StreamItem> feedItems = FeedHelpers.generateAuthenticatedFeed(s, user.getId(), maxResults, before)
                         .parallel().map(video -> {
                             var channel = video.getChannel();
 

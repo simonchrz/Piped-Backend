@@ -55,28 +55,35 @@ public class BgPoTokenProvider implements PoTokenProvider {
 
     private PoTokenResult createWebClientPoToken() throws Exception {
         String visitorDate = getWebVisitorData();
-
-        String poToken = ReqwestUtils.fetch(bgHelperUrl + "/generate", "POST", mapper.writeValueAsBytes(mapper.createObjectNode().put(
-                "visitorData", visitorDate
+        System.out.println("[Piped/Bg] /get_pot POST content_binding length=" + visitorDate.length());
+        // Brainicism's bgutil-pot-server: POST /get_pot mit content_binding (volle visitorData ok)
+        String poToken = ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST", mapper.writeValueAsBytes(mapper.createObjectNode().put(
+                "content_binding", visitorDate
         )), Map.of(
                 "Content-Type", "application/json"
         )).thenApply(response -> {
             try {
-                return mapper.readTree(response.body()).get("poToken").asText();
+                int status = response.status();
+                String body = new String(response.body());
+                System.out.println("[Piped/Bg] /generate response status=" + status + " body=" + body.substring(0, Math.min(200, body.length())));
+                return mapper.readTree(body).get("poToken").asText();
             } catch (Exception e) {
+                System.out.println("[Piped/Bg] /generate parse failed: " + e.getMessage());
                 return null;
             }
         }).join();
 
         if (poToken != null) {
+            System.out.println("[Piped/Bg] new PoToken: " + poToken.substring(0, Math.min(20, poToken.length())) + "... visitor=" + visitorDate.substring(0, Math.min(20, visitorDate.length())) + "...");
             return new PoTokenResult(visitorDate, poToken, null);
         }
-
+        System.out.println("[Piped/Bg] bg-helper returned null poToken!");
         return null;
     }
 
     @Override
     public @Nullable PoTokenResult getWebClientPoToken(String videoId) {
+        System.out.println("[Piped/Bg] getWebClientPoToken called for " + videoId);
         try {
             return getPoTokenPooled();
         } catch (Exception e) {
@@ -87,16 +94,30 @@ public class BgPoTokenProvider implements PoTokenProvider {
 
     @Override
     public @Nullable PoTokenResult getWebEmbedClientPoToken(String videoId) {
+        System.out.println("[Piped/Bg] getWebEmbedClientPoToken called for " + videoId);
+        // Custom: gleiches Token-Pool wie Web-Client — bgutils-Web-PoToken
+        // funktioniert auch fuer den Web-Embedded Player Client.
+        try {
+            return getPoTokenPooled();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
         return null;
     }
 
+    // TEST: Web-PoToken auch fuer Android/iOS — laut yt-dlp wiki nicht cross-platform,
+    // aber kostet uns nichts den Test zu fahren ob YouTube es trotzdem akzeptiert.
     @Override
     public @Nullable PoTokenResult getAndroidClientPoToken(String videoId) {
+        System.out.println("[Piped/Bg] getAndroidClientPoToken called for " + videoId);
+        try { return getPoTokenPooled(); } catch (Exception e) { e.printStackTrace(); }
         return null;
     }
 
     @Override
     public @Nullable PoTokenResult getIosClientPoToken(String videoId) {
+        System.out.println("[Piped/Bg] getIosClientPoToken called for " + videoId);
+        try { return getPoTokenPooled(); } catch (Exception e) { e.printStackTrace(); }
         return null;
     }
 }
