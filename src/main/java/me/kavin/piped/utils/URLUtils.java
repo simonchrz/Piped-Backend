@@ -49,7 +49,11 @@ public class URLUtils {
     }
 
     public static String rewriteVideoURL(final String old, final Map<String, String> extraParams) {
-        return rewriteURL(old, Constants.PROXY_PART, extraParams);
+        // Phase B: opportunistically decrypt obfuscated n-param via the
+        // nsig-decoder sidecar. No-op when NSIG_DECODER_URL is unset, the
+        // URL has no n=, or the sidecar fails -- the original URL is
+        // forwarded into the standard proxy-rewrite either way.
+        return rewriteURL(NSigClient.maybeRewriteN(old), Constants.PROXY_PART, extraParams);
     }
 
     public static String rewriteURL(final String old, final String proxy, final Map<String, String> extraParams) {

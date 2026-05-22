@@ -51,7 +51,22 @@ public class StreamHandlers {
             Sentry.setExtra("videoId", videoId);
             ITransaction transaction = Sentry.startTransaction("StreamInfo fetch", "fetch");
             try {
-                return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                // NPE returns degraded streams (1 muxed video, 0 audio) non-deterministically
+                // for some videos. Up to 3 attempts; accept the first that has both audio
+                // and video. Same retry-on-degraded pattern as SynthHlsHandlers.fetchStreams.
+                StreamInfo info = null;
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                    if (info != null && !info.getAudioStreams().isEmpty()
+                            && (!info.getVideoStreams().isEmpty() || !info.getVideoOnlyStreams().isEmpty())) {
+                        break;
+                    }
+                    System.out.println("[StreamHandlers] " + videoId + " attempt " + (attempt + 1)
+                            + " degraded (audio=" + (info == null ? -1 : info.getAudioStreams().size())
+                            + " video=" + (info == null ? -1 : info.getVideoStreams().size())
+                            + " videoOnly=" + (info == null ? -1 : info.getVideoOnlyStreams().size()) + "), retrying");
+                }
+                return info;
             } catch (Exception e) {
                 if (e instanceof GeographicRestrictionException) {
                     return null;

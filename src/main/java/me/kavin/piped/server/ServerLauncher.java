@@ -61,6 +61,15 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     }
                 }))
                 .map(GET, "/version", AsyncServlet.ofBlocking(executor, request -> getRawResponse(Constants.VERSION.getBytes(UTF_8), "text/plain", "no-store")))
+                // DEBUG: takes ?url=<videoplayback url> and returns the URL after
+                // URLUtils.rewriteVideoURL (incl. nsig-decoder n-rewrite if enabled).
+                .map(GET, "/debug/test_nsig", AsyncServlet.ofBlocking(executor, request -> {
+                    String url = request.getQueryParameter("url");
+                    if (url == null) return getJsonResponse("{\"error\":\"missing url\"}".getBytes(UTF_8), "no-store");
+                    String rewritten = me.kavin.piped.utils.URLUtils.rewriteVideoURL(url, java.util.Map.of());
+                    String body = "{\"input\":\"" + url.replace("\\", "\\\\").replace("\"", "\\\"") + "\",\"rewritten\":\"" + (rewritten == null ? "" : rewritten).replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
+                    return getJsonResponse(body.getBytes(UTF_8), "no-store");
+                }))
                 .map(HttpMethod.OPTIONS, "/*", request -> HttpResponse.ofCode(200))
                 .map(GET, "/webhooks/pubsub", AsyncServlet.ofBlocking(executor, request -> {
                     var topic = request.getQueryParameter("hub.topic");
