@@ -49,7 +49,7 @@ public class Main {
         NewPipe.init(new DownloaderImpl(), new Localization("en", "US"), ContentCountry.DEFAULT);
         if (!StringUtils.isEmpty(Constants.BG_HELPER_URL))
             YoutubeStreamExtractor.setPoTokenProvider(new BgPoTokenProvider(Constants.BG_HELPER_URL));
-        YoutubeStreamExtractor.setFetchIosClient(true);
+        YoutubeStreamExtractor.setFetchIosClient(false);
         YoutubeParsingHelper.setConsentAccepted(CONSENT_COOKIE);
 
         // Warm up the extractor
