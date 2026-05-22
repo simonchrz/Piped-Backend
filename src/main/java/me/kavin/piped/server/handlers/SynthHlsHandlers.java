@@ -3,6 +3,7 @@ package me.kavin.piped.server.handlers;
 import me.kavin.piped.utils.CollectionUtils;
 import me.kavin.piped.utils.obj.PipedStream;
 import me.kavin.piped.utils.obj.Streams;
+import me.kavin.piped.utils.Multithreading;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 
 import java.nio.charset.StandardCharsets;
@@ -135,7 +136,7 @@ public class SynthHlsHandlers {
     }
 
     private static final ConcurrentMap<String, CacheEntry> streamsCache = new ConcurrentHashMap<>();
-    private static final long CACHE_TTL_MS = 300_000L; // 5 minutes
+    private static final long CACHE_TTL_MS = 10_000L; // 10s - short enough to refresh cpn on retry
 
     private static class CacheEntry {
         final Streams streams;
@@ -150,8 +151,19 @@ public class SynthHlsHandlers {
         synchronized (streamsCache) {
             e = streamsCache.get(videoId);
             if (e != null && e.fresh()) return e.streams;
-            StreamInfo info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
-            Streams s = CollectionUtils.collectStreamInfo(info);
+            // Wrap NPE call in Multithreading.supplyAsync to match StreamHandlers.streamsResponse
+            // threading context (direct getInfo() can return degraded streams). Retry up to 3x
+            // on degraded result (0 video or 0 audio) - happens non-deterministically.
+            Streams s = null;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                StreamInfo info = Multithreading.supplyAsync(() -> {
+                    try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId); }
+                    catch (Exception ex) { throw new RuntimeException(ex); }
+                }).get();
+                s = CollectionUtils.collectStreamInfo(info);
+                if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
+                System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
+            }
             streamsCache.put(videoId, new CacheEntry(s));
             return s;
         }
