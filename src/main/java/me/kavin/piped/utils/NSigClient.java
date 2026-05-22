@@ -46,15 +46,10 @@ public final class NSigClient {
      * return the original url unchanged.
      */
     public static String maybeRewriteN(final String url) {
-        if (!isEnabled() || url == null) return url;
-        if (!url.contains("googlevideo.com")) return url;
-        Matcher m = N_QUERY.matcher(url);
-        if (!m.find()) return url;
-        final String oldN = m.group(2);
-        final String decoded = decryptN(oldN);
-        if (decoded == null || decoded.equals(oldN)) return url;
-        // Replace only the FIRST n= occurrence (m.group(1) keeps ? or & separator).
-        return url.substring(0, m.start()) + m.group(1) + "n=" + decoded + url.substring(m.end());
+        // No-op: NPE's YoutubeJavaScriptPlayerManager now handles n-decode via
+        // the same sidecar. A second pass here would re-encode the already
+        // decoded n and produce a garbage 9-char value -> HTTP 403.
+        return url;
     }
 
     private static String decryptN(final String obfuscated) {
