@@ -149,25 +149,29 @@ public class ChannelHandlers {
                             .map(Video::getId)
                             .toList();
 
-                    streamInfoItems
-                            .stream()
-                            .parallel()
-                            .forEach(item -> {
-                                try {
-                                    String id = YOUTUBE_SERVICE.getStreamLHFactory().getId(item.getUrl());
-                                    if (videoIdsPresent.contains(id))
-                                        VideoHelpers.updateVideo(id, item);
-                                    else if (item.getUploadDate() != null) {
-                                        // shorts tab doesn't have upload date
-                                        // we don't want to fetch each video's upload date
-                                        long time = item.getUploadDate().offsetDateTime().toInstant().toEpochMilli();
-                                        if ((System.currentTimeMillis() - time) < TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION))
-                                            VideoHelpers.handleNewVideo(item.getUrl(), time, channel);
-                                    }
-                                } catch (Exception e) {
-                                    throw new RuntimeException(e);
+                    // Sequential statt parallel: handleNewVideo fetcht das
+                    // Video (= YT-call). Bei einem Channel mit N neuen Videos
+                    // war .parallel() bisher ein N-fach-burst — selbe Failure-
+                    // shape wie der gefixte PubSub-burst. 250ms sleep zwischen
+                    // calls spreizt die Anfragen.
+                    for (var item : streamInfoItems) {
+                        try {
+                            String id = YOUTUBE_SERVICE.getStreamLHFactory().getId(item.getUrl());
+                            if (videoIdsPresent.contains(id)) {
+                                VideoHelpers.updateVideo(id, item);
+                            } else if (item.getUploadDate() != null) {
+                                // shorts tab doesn't have upload date
+                                // we don't want to fetch each video's upload date
+                                long time = item.getUploadDate().offsetDateTime().toInstant().toEpochMilli();
+                                if ((System.currentTimeMillis() - time) < TimeUnit.DAYS.toMillis(Constants.FEED_RETENTION)) {
+                                    VideoHelpers.handleNewVideo(item.getUrl(), time, channel);
+                                    Thread.sleep(250);
                                 }
-                            });
+                            }
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    }
                 }
             }
         });

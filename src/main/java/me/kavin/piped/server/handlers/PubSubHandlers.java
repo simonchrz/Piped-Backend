@@ -43,7 +43,16 @@ public class PubSubHandlers {
     }
 
     static {
-        for (int i = 0; i < Runtime.getRuntime().availableProcessors(); i++) {
+        // Single worker + 250ms sleep between fetches. Original code spawned
+        // availableProcessors() (= 4 on Pi5) parallel workers, each calling
+        // extractor.fetchPage() = full /streams-equivalent InnerTube call.
+        // When 50+ subbed channels publish around the same time (morning
+        // upload-burst), 4 simultaneous /streams hits triggered YouTube's
+        // anti-bot SignInConfirm IP-flag — same failure mode that the
+        // PubSub-renewal patch in Main.java fixed. Cap to 1 worker so a
+        // burst of N videos serialises into ~250ms*N spread instead of
+        // sub-second parallel firing.
+        for (int i = 0; i < 1; i++) {
             new Thread(() -> {
                 try {
                     while (true) {
@@ -61,6 +70,8 @@ public class PubSubHandlers {
                             Sentry.setExtra("videoId", videoId);
                             var extractor = YOUTUBE_SERVICE.getStreamExtractor("https://youtube.com/watch?v=" + videoId);
                             extractor.fetchPage();
+                            // Spread bursts so YouTube doesn't flag us.
+                            Thread.sleep(250);
 
                             Multithreading.runAsync(() -> {
 
