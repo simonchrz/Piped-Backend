@@ -82,7 +82,7 @@ public class CollectionUtils {
                 info.getUploaderSubscriberCount(), info.isUploaderVerified(),
                 audioStreams, videoStreams, relatedStreams, subtitles, livestream, hlsOrSynth(info.getHlsUrl(), info.getId()),
                 rewriteVideoURL(info.getDashMpdUrl(), Map.of()), null, info.getCategory(), info.getLicence(),
-                info.getPrivacy().name().toLowerCase(), info.getTags(), metaInfo, chapters, previewFrames);
+                info.getPrivacy().name().toLowerCase(), info.getTags(), metaInfo, chapters, previewFrames, info.getAgeLimit());
     }
 
     public static List<ContentItem> collectRelatedItems(List<? extends InfoItem> items) {

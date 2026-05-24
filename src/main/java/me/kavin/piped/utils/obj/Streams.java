@@ -17,6 +17,8 @@ public class Streams {
 
     public boolean uploaderVerified;
 
+    public int ageLimit;
+
     public long duration, views, likes, dislikes, uploaderSubscriberCount, uploaded;
 
     public List<PipedStream> audioStreams, videoStreams;
@@ -38,7 +40,8 @@ public class Streams {
                    boolean uploaderVerified, List<PipedStream> audioStreams, List<PipedStream> videoStreams,
                    List<ContentItem> relatedStreams, List<Subtitle> subtitles, boolean livestream, String hls, String dash,
                    String lbryId, String category, String license, String visibility, List<String> tags, List<MetaInfo> metaInfo,
-                   List<ChapterSegment> chapters, List<PreviewFrames> previewFrames) {
+                   List<ChapterSegment> chapters, List<PreviewFrames> previewFrames,
+                   int ageLimit) {
         this.title = title;
         this.description = description;
         this.uploadDate = uploadDate;
@@ -63,6 +66,7 @@ public class Streams {
         this.lbryId = lbryId;
         this.chapters = chapters;
         this.previewFrames = previewFrames;
+        this.ageLimit = ageLimit;
         this.category = category;
         this.license = license;
         this.tags = tags;
