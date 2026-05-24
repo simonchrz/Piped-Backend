@@ -177,22 +177,30 @@ public class SynthHlsHandlers {
             // werden nicht so throttled). Siehe StreamHandlers fuer Detail-Notes.
             if (lastInfo != null && isVideoStreamThrottled(lastInfo)) {
                 System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
-                YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                final String vidId = videoId;
                 try {
-                    final String vidId = videoId;
+                    // ThreadLocal muss INSIDE des Lambdas gesetzt werden -- 
+                    // supplyAsync laeuft auf Worker-Thread, ThreadLocals
+                    // propagieren nicht ueber Thread-Pool-Hop hinweg.
                     StreamInfo retryInfo = Multithreading.supplyAsync(() -> {
-                        try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + vidId); }
-                        catch (Exception ex) { throw new RuntimeException(ex); }
+                        YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                        try {
+                            return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + vidId);
+                        } catch (Exception ex) {
+                            throw new RuntimeException(ex);
+                        } finally {
+                            YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                        }
                     }).get();
                     Streams retryS = CollectionUtils.collectStreamInfo(retryInfo);
                     if (!retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
                         s = retryS;
                         System.out.println("[SynthHls] " + videoId + " WebEmbed-retry success");
+                    } else {
+                        System.out.println("[SynthHls] " + videoId + " WebEmbed-retry returned non-healthy, sticking with original (audio=" + retryS.audioStreams.size() + " video=" + retryS.videoStreams.size() + ")");
                     }
                 } catch (Exception ex) {
                     System.out.println("[SynthHls] " + videoId + " WebEmbed-retry failed: " + ex.getMessage());
-                } finally {
-                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                 }
             }
 
