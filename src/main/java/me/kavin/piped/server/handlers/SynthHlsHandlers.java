@@ -5,6 +5,10 @@ import me.kavin.piped.utils.obj.PipedStream;
 import me.kavin.piped.utils.obj.Streams;
 import me.kavin.piped.utils.Multithreading;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
+import org.schabi.newpipe.extractor.stream.VideoStream;
+import org.schabi.newpipe.extractor.services.youtube.extractors.YoutubeStreamExtractor;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -155,15 +159,43 @@ public class SynthHlsHandlers {
             // threading context (direct getInfo() can return degraded streams). Retry up to 3x
             // on degraded result (0 video or 0 audio) - happens non-deterministically.
             Streams s = null;
+            StreamInfo lastInfo = null;
             for (int attempt = 0; attempt < 3; attempt++) {
                 StreamInfo info = Multithreading.supplyAsync(() -> {
                     try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId); }
                     catch (Exception ex) { throw new RuntimeException(ex); }
                 }).get();
+                lastInfo = info;
                 s = CollectionUtils.collectStreamInfo(info);
                 if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
                 System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
             }
+
+            // Throttle-Check: ANDROID-URLs werden von googlevideo per-IP-Pattern
+            // fuer deep byte-range-fetches 403'd. HEAD-Test gegen clen/2 deckt
+            // das auf -- bei 403 retry mit force-WebEmbed (= WebEmbed-modern-URLs
+            // werden nicht so throttled). Siehe StreamHandlers fuer Detail-Notes.
+            if (lastInfo != null && isVideoStreamThrottled(lastInfo)) {
+                System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
+                YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                try {
+                    final String vidId = videoId;
+                    StreamInfo retryInfo = Multithreading.supplyAsync(() -> {
+                        try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + vidId); }
+                        catch (Exception ex) { throw new RuntimeException(ex); }
+                    }).get();
+                    Streams retryS = CollectionUtils.collectStreamInfo(retryInfo);
+                    if (!retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
+                        s = retryS;
+                        System.out.println("[SynthHls] " + videoId + " WebEmbed-retry success");
+                    }
+                } catch (Exception ex) {
+                    System.out.println("[SynthHls] " + videoId + " WebEmbed-retry failed: " + ex.getMessage());
+                } finally {
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                }
+            }
+
             streamsCache.put(videoId, new CacheEntry(s));
             return s;
         }
@@ -207,4 +239,40 @@ public class SynthHlsHandlers {
         String path = (pathStart >= 0 && pathStart < q) ? pipedProxyUrl.substring(pathStart, q) : "/";
         return pipedProxyUrl; // bypass yt-proxy — googlevideo per-video throttle currently blocks yt-proxy upstream
     }
+
+    /**
+     * HEAD-byte-range-Check fuer Throttle-Detection. Siehe StreamHandlers
+     * fuer identische Implementierung -- duplicated weil shared utility
+     * Refactor groesserer Aufwand waere.
+     */
+    private static boolean isVideoStreamThrottled(StreamInfo info) {
+        if (info == null) return false;
+        VideoStream best = null;
+        for (VideoStream vs : info.getVideoOnlyStreams()) {
+            if (best == null
+                || (vs.getBitrate() > 0 && vs.getBitrate() > best.getBitrate())) {
+                best = vs;
+            }
+        }
+        if (best == null) return false;
+        String url = best.getContent();
+        if (url == null || url.isEmpty() || !url.startsWith("http")) return false;
+        long clen = best.getItagItem() != null
+            ? best.getItagItem().getContentLength() : 0;
+        if (clen < 10_000_000L) return false;
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("HEAD");
+            long offset = clen / 2;
+            conn.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + 1000));
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(3000);
+            int code = conn.getResponseCode();
+            conn.disconnect();
+            return code == 403;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
 }

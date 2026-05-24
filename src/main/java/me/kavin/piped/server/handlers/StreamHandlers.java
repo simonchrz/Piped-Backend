@@ -24,6 +24,10 @@ import org.schabi.newpipe.extractor.exceptions.ContentNotAvailableException;
 import org.schabi.newpipe.extractor.exceptions.GeographicRestrictionException;
 import org.schabi.newpipe.extractor.stream.Description;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
+import org.schabi.newpipe.extractor.stream.VideoStream;
+import org.schabi.newpipe.extractor.services.youtube.extractors.YoutubeStreamExtractor;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import org.schabi.newpipe.extractor.utils.JsonUtils;
 
 import java.io.IOException;
@@ -65,6 +69,37 @@ public class StreamHandlers {
                             + " degraded (audio=" + (info == null ? -1 : info.getAudioStreams().size())
                             + " video=" + (info == null ? -1 : info.getVideoStreams().size())
                             + " videoOnly=" + (info == null ? -1 : info.getVideoOnlyStreams().size()) + "), retrying");
+                }
+
+                // Throttle-Check: ANDROID-URLs werden von googlevideo per-IP-
+                // Pattern fuer deep byte-range-fetches 403'd (= Scrub-forward =
+                // frozen frame) auch wenn Response strukturell healthy aussieht.
+                // HEAD-test gegen die clen/2-Mitte der highest-quality video-URL
+                // deckt das auf. Bei 403 setzen wir NPE's force-WebEmbed
+                // ThreadLocal und rufen StreamInfo nochmal -- WebEmbed-modern-URLs
+                // werden nicht so throttled.
+                if (info != null && isVideoStreamThrottled(info)) {
+                    System.out.println("[StreamHandlers] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                    try {
+                        StreamInfo retryInfo = StreamInfo.getInfo(
+                            "https://www.youtube.com/watch?v=" + videoId);
+                        if (retryInfo != null && !retryInfo.getAudioStreams().isEmpty()
+                                && (!retryInfo.getVideoStreams().isEmpty()
+                                    || !retryInfo.getVideoOnlyStreams().isEmpty())) {
+                            info = retryInfo;
+                            System.out.println("[StreamHandlers] " + videoId + " WebEmbed-retry success (audio="
+                                + info.getAudioStreams().size() + " video="
+                                + info.getVideoStreams().size() + " videoOnly="
+                                + info.getVideoOnlyStreams().size() + ")");
+                        } else {
+                            System.out.println("[StreamHandlers] " + videoId + " WebEmbed-retry returned non-healthy, sticking with original");
+                        }
+                    } catch (Exception e) {
+                        System.out.println("[StreamHandlers] " + videoId + " WebEmbed-retry failed: " + e.getMessage());
+                    } finally {
+                        YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                    }
                 }
                 return info;
             } catch (Exception e) {
@@ -414,4 +449,47 @@ public class StreamHandlers {
         return mapper.writeValueAsBytes(commentsItem);
 
     }
+
+    /**
+     * HEAD-Test gegen die clen/2-Mitte der hoechsten Qualitaets-Video-URL.
+     * Returns true wenn googlevideo 403 antwortet (= per-IP-pattern-throttle
+     * fuer deep byte-range-fetches aktiv).
+     *
+     * Timeout 2s connect + 3s read damit der Test bei langsamem upstream
+     * den Stream-Extract nicht zu lange blockt. Bei Timeout/Exception:
+     * false (= trust the streams, defensiver default).
+     *
+     * Skipt Videos mit contentLength < 10MB (= zu kurz fuer relevanten
+     * Throttle-Risk) und Videos ohne erreichbare URL im VideoStream.
+     */
+    private static boolean isVideoStreamThrottled(StreamInfo info) {
+        if (info == null) return false;
+        VideoStream best = null;
+        for (VideoStream vs : info.getVideoOnlyStreams()) {
+            if (best == null
+                || (vs.getBitrate() > 0 && vs.getBitrate() > best.getBitrate())) {
+                best = vs;
+            }
+        }
+        if (best == null) return false;
+        String url = best.getContent();
+        if (url == null || url.isEmpty() || !url.startsWith("http")) return false;
+        long clen = best.getItagItem() != null
+            ? best.getItagItem().getContentLength() : 0;
+        if (clen < 10_000_000L) return false;
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("HEAD");
+            long offset = clen / 2;
+            conn.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + 1000));
+            conn.setConnectTimeout(2000);
+            conn.setReadTimeout(3000);
+            int code = conn.getResponseCode();
+            conn.disconnect();
+            return code == 403;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
 }
