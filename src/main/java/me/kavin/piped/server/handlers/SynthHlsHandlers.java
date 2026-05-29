@@ -170,6 +170,21 @@ public class SynthHlsHandlers {
         boolean fresh() { return System.currentTimeMillis() - createdAt < CACHE_TTL_MS; }
     }
 
+    /// Resolve-Reuse: let StreamHandlers seed this cache from its /streams
+    /// resolve, so a follow-up /synth-hls/<id>/master build reuses it (cache
+    /// hit, ~ms) instead of a second YouTube resolve (~1.2s + extra IP-block
+    /// risk). StreamHandlers already runs the throttle-check + WebEmbed retry,
+    /// so its Streams are URL-verified (pass verified=true). Same short TTL —
+    /// only the common scroll-prefetch → tap window benefits; longer gaps just
+    /// re-resolve as before.
+    public static void cacheStreams(String videoId, Streams s, boolean urlsVerified) {
+        if (videoId != null && s != null
+                && s.videoStreams != null && !s.videoStreams.isEmpty()
+                && s.audioStreams != null && !s.audioStreams.isEmpty()) {
+            streamsCache.put(videoId, new CacheEntry(s, urlsVerified));
+        }
+    }
+
     /// Default to verified URLs — used by the segment-serving paths.
     private static Streams fetchStreams(String videoId) throws Exception {
         return fetchStreams(videoId, true);

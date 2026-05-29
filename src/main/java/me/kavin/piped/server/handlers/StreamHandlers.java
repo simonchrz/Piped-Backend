@@ -292,6 +292,13 @@ public class StreamHandlers {
 
         Streams streams = CollectionUtils.collectStreamInfo(info);
 
+        // Resolve-Reuse: seed the synth-hls cache so a follow-up
+        // /synth-hls/<id>/master build reuses this resolve instead of doing a
+        // 2nd YouTube resolve (~1.2s saved on a cold tap, no extra YT load).
+        // `info` is already throttle-checked + WebEmbed-upgraded above, so the
+        // collected streams are URL-verified.
+        SynthHlsHandlers.cacheStreams(videoId, streams, true);
+
         String lbryURL = null;
 
         try {
