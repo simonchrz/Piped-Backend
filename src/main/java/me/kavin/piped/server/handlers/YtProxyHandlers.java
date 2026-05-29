@@ -187,55 +187,72 @@ public class YtProxyHandlers {
         return buf;
     }
 
+    private static final long DL_CHUNK_BYTES = 8L * 1024 * 1024; // bounded range chunk
+
     private static void startDownloader(StreamSession sess) {
         Thread t = new Thread(() -> {
-            HttpURLConnection conn = null;
-            try {
-                System.out.println("[YtProxy] " + sess.key + " GET " + sess.targetUrl.substring(0, Math.min(200, sess.targetUrl.length())) + "...");
-                conn = (HttpURLConnection) new URL(sess.targetUrl).openConnection();
-                conn.setRequestMethod("GET");
-                conn.setInstanceFollowRedirects(true);
-                conn.setConnectTimeout(10_000);
-                conn.setReadTimeout(30_000);
-                conn.setRequestProperty("User-Agent", CHROME_UA);
-                if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
-                // No Range header — googlevideo serves 200 OK + full Content-Length on
-                // a single TCP stream. This is what avoids the per-cpn rate-limit.
-                int code = conn.getResponseCode();
-                if (code != 200) {
-                    String errBody = "";
+            try (RandomAccessFile raf = new RandomAccessFile(sess.tmpPath.toFile(), "rw")) {
+                raf.setLength(0);
+                long offset = 0;
+                long total = -1;
+                long lastNotify = 0;
+                System.out.println("[YtProxy] " + sess.key + " GET(range) "
+                        + sess.targetUrl.substring(0, Math.min(160, sess.targetUrl.length())) + "...");
+                // Fill the file via sequential BOUNDED range requests. googlevideo
+                // serves bounded ranges at full speed; a no-Range full GET is
+                // throttled to ~31 KB/s (anti-download). Range requests on the same
+                // cpn are NOT rate-limited (verified). See project memory
+                // googlevideo_throttle_noRange_not_cpn.
+                while (total < 0 || offset < total) {
+                    long chunkEnd = (total < 0) ? offset + DL_CHUNK_BYTES - 1
+                                                : Math.min(offset + DL_CHUNK_BYTES - 1, total - 1);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(sess.targetUrl).openConnection();
                     try {
-                        java.io.InputStream es = conn.getErrorStream();
-                        if (es != null) errBody = new String(es.readAllBytes(), 0, Math.min(200, es.available() > 0 ? es.available() : 200));
-                    } catch (Exception ignored) {}
-                    System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code + " body=" + errBody);
-                    fail(sess);
-                    return;
-                }
-                long len = conn.getHeaderFieldLong("Content-Length", -1);
-                if (len < 0) { fail(sess); return; }
-                synchronized (sess.lock) {
-                    sess.totalLength = len;
-                    sess.lock.notifyAll();
-                }
-                try (InputStream is = conn.getInputStream();
-                     RandomAccessFile raf = new RandomAccessFile(sess.tmpPath.toFile(), "rw")) {
-                    raf.setLength(0);
-                    byte[] buf = new byte[READ_BUF];
-                    int n;
-                    long lastNotify = 0;
-                    while ((n = is.read(buf)) > 0) {
-                        raf.write(buf, 0, n);
-                        long now = sess.downloadedBytes.addAndGet(n);
-                        // Notify readers every ~256 KB so they wake quickly without
-                        // notify-storm. Always notify on completion below.
-                        if (now - lastNotify >= READ_BUF) {
-                            synchronized (sess.lock) { sess.lock.notifyAll(); }
-                            lastNotify = now;
+                        conn.setRequestMethod("GET");
+                        conn.setInstanceFollowRedirects(true);
+                        conn.setConnectTimeout(10_000);
+                        conn.setReadTimeout(30_000);
+                        conn.setRequestProperty("User-Agent", CHROME_UA);
+                        if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
+                        conn.setRequestProperty("Range", "bytes=" + offset + "-" + chunkEnd);
+                        int code = conn.getResponseCode();
+                        if (code != 206 && code != 200) {
+                            String errBody = "";
+                            try {
+                                java.io.InputStream es = conn.getErrorStream();
+                                if (es != null) errBody = new String(es.readAllBytes(), 0,
+                                        Math.min(200, es.available() > 0 ? es.available() : 200));
+                            } catch (Exception ignored) {}
+                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code + " body=" + errBody);
+                            fail(sess);
+                            return;
                         }
+                        if (total < 0) {
+                            total = parseUpstreamTotal(conn);
+                            if (total < 0) { fail(sess); return; }
+                            synchronized (sess.lock) {
+                                sess.totalLength = total;
+                                sess.lock.notifyAll();
+                            }
+                        }
+                        try (InputStream is = conn.getInputStream()) {
+                            byte[] buf = new byte[READ_BUF];
+                            int n;
+                            while ((n = is.read(buf)) > 0) {
+                                raf.write(buf, 0, n);
+                                offset += n;
+                                long now = sess.downloadedBytes.addAndGet(n);
+                                if (now - lastNotify >= READ_BUF) {
+                                    synchronized (sess.lock) { sess.lock.notifyAll(); }
+                                    lastNotify = now;
+                                }
+                            }
+                        }
+                        if (code == 200) break; // server ignored Range, whole file already read
+                    } finally {
+                        conn.disconnect();
                     }
                 }
-                // Rename tmp → final, mark complete
                 Files.move(sess.tmpPath, sess.finalPath, StandardCopyOption.REPLACE_EXISTING);
                 synchronized (sess.lock) {
                     sess.complete = true;
@@ -247,13 +264,24 @@ public class YtProxyHandlers {
             } catch (Exception e) {
                 System.out.println("[YtProxy] " + sess.key + " downloader failed: " + e.getMessage());
                 fail(sess);
-            } finally {
-                if (conn != null) conn.disconnect();
             }
         }, "yt-proxy-stream-" + sess.key);
         t.setDaemon(true);
         t.start();
         sess.downloader = t;
+    }
+
+    /// Total file size from the first chunk: Content-Range "bytes s-e/TOTAL"
+    /// (206), else Content-Length (200 = server ignored Range).
+    private static long parseUpstreamTotal(HttpURLConnection conn) {
+        String cr = conn.getHeaderField("Content-Range");
+        if (cr != null) {
+            int slash = cr.lastIndexOf('/');
+            if (slash >= 0) {
+                try { return Long.parseLong(cr.substring(slash + 1).trim()); } catch (Exception ignored) {}
+            }
+        }
+        return conn.getHeaderFieldLong("Content-Length", -1);
     }
 
     private static void fail(StreamSession sess) {
