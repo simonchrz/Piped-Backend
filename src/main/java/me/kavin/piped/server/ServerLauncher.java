@@ -26,6 +26,8 @@ import org.jetbrains.annotations.NotNull;
 import java.net.InetSocketAddress;
 import java.util.Objects;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 import static io.activej.config.converter.ConfigConverters.ofInetSocketAddress;
 import static io.activej.http.HttpHeaders.*;
@@ -37,6 +39,27 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
 
     private static final HttpHeader FILE_NAME = HttpHeaders.of("x-file-name");
     private static final HttpHeader LAST_ETAG = HttpHeaders.of("x-last-etag");
+
+    // All routes share one virtual-thread executor. YT stream-resolves block on
+    // I/O inside synchronized sections (synth-hls cache, NPE PoToken/nsig, OkHttp
+    // pool) and PIN their carrier platform-thread. With only availableProcessors()
+    // carriers (4 on the Pi5), a few stuck resolves under a googlevideo IP-block
+    // pin them all -> the entire backend (incl. /healthcheck + non-YT routes)
+    // starves. Cap concurrent video-resolves (/streams, /synth-hls) BELOW the
+    // carrier count so a YT-block can never take the whole backend down; excess
+    // resolves fast-reject with 503 instead of piling up and pinning carriers.
+    private static final Semaphore YT_RESOLVE_LIMITER =
+            new Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+
+    /** tryAcquire a resolve slot (500ms), false on saturation/interrupt. */
+    private static boolean ytResolveAcquire() {
+        try {
+            return YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
 
     @Provides
     Executor executor() {
@@ -119,13 +142,19 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         return getErrorResponse(e, request.getPath());
                     }
                 })).map(GET, "/streams/:videoId", AsyncServlet.ofBlocking(executor, request -> {
+                    if (!ytResolveAcquire())
+                        return io.activej.http.HttpResponse.ofCode(503);
                     try {
                         return getJsonResponse(StreamHandlers.streamsResponse(request.getPathParameter("videoId")),
                                 "public, s-maxage=21540, max-age=30", true);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
+                    } finally {
+                        YT_RESOLVE_LIMITER.release();
                     }
                 })).map(GET, "/synth-hls/:videoId/:filename", AsyncServlet.ofBlocking(executor, request -> {
+                    if (!ytResolveAcquire())
+                        return io.activej.http.HttpResponse.ofCode(503);
                     try {
                         String videoId = request.getPathParameter("videoId");
                         String filename = request.getPathParameter("filename");
@@ -143,6 +172,8 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         return getRawResponse(body, "application/vnd.apple.mpegurl", "public, max-age=300");
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
+                    } finally {
+                        YT_RESOLVE_LIMITER.release();
                     }
                 })).map(GET, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
                     try {
