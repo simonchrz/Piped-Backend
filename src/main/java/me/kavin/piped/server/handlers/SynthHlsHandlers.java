@@ -5,7 +5,6 @@ import me.kavin.piped.utils.obj.PipedStream;
 import me.kavin.piped.utils.obj.Streams;
 import me.kavin.piped.utils.Multithreading;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
-import org.schabi.newpipe.extractor.stream.VideoStream;
 import org.schabi.newpipe.extractor.services.youtube.extractors.YoutubeStreamExtractor;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -23,7 +22,12 @@ import java.util.List;
 public class SynthHlsHandlers {
 
     public static byte[] masterPlaylist(String videoId) throws Exception {
-        Streams streams = fetchStreams(videoId);
+        // requireVerified=false: the master only lists variant playlist names,
+        // never segment URLs, so it doesn't need the throttle HEAD-probe /
+        // WebEmbed re-resolve. Skipping that keeps this (the dominant
+        // FILE_LOADED cost) fast; the variant/audio fetches verify before any
+        // segment URL is served.
+        Streams streams = fetchStreams(videoId, false);
         List<PipedStream> videos = pickedVideoStreams(streams);
         PipedStream audio = pickedAudioStream(streams);
         if (videos.isEmpty() || audio == null) {
@@ -140,72 +144,107 @@ public class SynthHlsHandlers {
     }
 
     private static final ConcurrentMap<String, CacheEntry> streamsCache = new ConcurrentHashMap<>();
-    private static final long CACHE_TTL_MS = 10_000L; // 10s - short enough to refresh cpn on retry
+    // 5 min: googlevideo segment URLs stay valid ~6h, and the cpn-refresh that
+    // motivated the old 10s TTL happens per-resolution, not per cache-hit. The
+    // longer window lets app pre-warm + replay + the master→variant fetches all
+    // hit a warm cache instead of re-resolving StreamInfo (~1.2s) every time.
+    private static final long CACHE_TTL_MS = 300_000L;
 
     private static class CacheEntry {
         final Streams streams;
         final long createdAt;
-        CacheEntry(Streams s) { this.streams = s; this.createdAt = System.currentTimeMillis(); }
+        final boolean urlsVerified;   // throttle-checked (+ WebEmbed-upgraded if needed)
+        CacheEntry(Streams s, boolean verified) {
+            this.streams = s; this.createdAt = System.currentTimeMillis(); this.urlsVerified = verified;
+        }
         boolean fresh() { return System.currentTimeMillis() - createdAt < CACHE_TTL_MS; }
     }
 
+    /// Default to verified URLs — used by the segment-serving paths.
     private static Streams fetchStreams(String videoId) throws Exception {
+        return fetchStreams(videoId, true);
+    }
+
+    /// requireVerified=false (master playlist) skips the throttle HEAD-probe +
+    /// WebEmbed re-resolve. The master lists only variant names, so no segment
+    /// URL is ever served from an unverified entry. requireVerified=true
+    /// (variant/audio) guarantees the throttle check ran before segment URLs go
+    /// out. A master fetch that just resolved+cached the streams lets the
+    /// follow-up variant fetch verify from cache WITHOUT a second
+    /// StreamInfo.getInfo (only the cheap HEAD; WebEmbed only if actually 403'd).
+    private static Streams fetchStreams(String videoId, boolean requireVerified) throws Exception {
         CacheEntry e = streamsCache.get(videoId);
-        if (e != null && e.fresh()) return e.streams;
+        if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
         synchronized (streamsCache) {
             e = streamsCache.get(videoId);
-            if (e != null && e.fresh()) return e.streams;
-            // Wrap NPE call in Multithreading.supplyAsync to match StreamHandlers.streamsResponse
-            // threading context (direct getInfo() can return degraded streams). Retry up to 3x
-            // on degraded result (0 video or 0 audio) - happens non-deterministically.
-            Streams s = null;
-            StreamInfo lastInfo = null;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                StreamInfo info = Multithreading.supplyAsync(() -> {
-                    try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId); }
-                    catch (Exception ex) { throw new RuntimeException(ex); }
-                }).get();
-                lastInfo = info;
-                s = CollectionUtils.collectStreamInfo(info);
-                if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
-                System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
-            }
+            if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
 
-            // Throttle-Check: ANDROID-URLs werden von googlevideo per-IP-Pattern
-            // fuer deep byte-range-fetches 403'd. HEAD-Test gegen clen/2 deckt
-            // das auf -- bei 403 retry mit force-WebEmbed (= WebEmbed-modern-URLs
-            // werden nicht so throttled). Siehe StreamHandlers fuer Detail-Notes.
-            if (lastInfo != null && isVideoStreamThrottled(lastInfo)) {
-                System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
-                final String vidId = videoId;
-                try {
-                    // ThreadLocal muss INSIDE des Lambdas gesetzt werden -- 
-                    // supplyAsync laeuft auf Worker-Thread, ThreadLocals
-                    // propagieren nicht ueber Thread-Pool-Hop hinweg.
-                    StreamInfo retryInfo = Multithreading.supplyAsync(() -> {
-                        YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
-                        try {
-                            return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + vidId);
-                        } catch (Exception ex) {
-                            throw new RuntimeException(ex);
-                        } finally {
-                            YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
-                        }
-                    }).get();
-                    Streams retryS = CollectionUtils.collectStreamInfo(retryInfo);
-                    if (!retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
+            // Reuse fresh-but-unverified streams (just cached by a master fetch)
+            // so we don't pay a second StreamInfo.getInfo just to verify.
+            Streams s = (e != null && e.fresh()) ? e.streams : resolveStreams(videoId);
+
+            boolean verified = false;
+            if (requireVerified) {
+                // Throttle-Check: ANDROID-URLs werden von googlevideo per-IP-Pattern
+                // fuer deep byte-range-fetches 403'd. HEAD-Test gegen clen/2 deckt das
+                // auf -- bei 403 retry mit force-WebEmbed (= WebEmbed-modern-URLs werden
+                // nicht so throttled). Siehe StreamHandlers fuer Detail-Notes.
+                if (isStreamsThrottled(s)) {
+                    System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
+                    Streams retryS = resolveStreamsWebEmbed(videoId);
+                    if (retryS != null && !retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
                         s = retryS;
                         System.out.println("[SynthHls] " + videoId + " WebEmbed-retry success");
                     } else {
-                        System.out.println("[SynthHls] " + videoId + " WebEmbed-retry returned non-healthy, sticking with original (audio=" + retryS.audioStreams.size() + " video=" + retryS.videoStreams.size() + ")");
+                        System.out.println("[SynthHls] " + videoId + " WebEmbed-retry non-healthy, behalte original");
                     }
-                } catch (Exception ex) {
-                    System.out.println("[SynthHls] " + videoId + " WebEmbed-retry failed: " + ex.getMessage());
                 }
+                verified = true;
             }
-
-            streamsCache.put(videoId, new CacheEntry(s));
+            streamsCache.put(videoId, new CacheEntry(s, verified));
             return s;
+        }
+    }
+
+    /// Resolve StreamInfo via NewPipe, retrying up to 3x on a degraded result
+    /// (0 video or 0 audio — happens non-deterministically). Wrapped in
+    /// Multithreading.supplyAsync to match StreamHandlers' threading context
+    /// (a direct getInfo() can return degraded streams).
+    private static Streams resolveStreams(String videoId) throws Exception {
+        Streams s = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            StreamInfo info = Multithreading.supplyAsync(() -> {
+                try { return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId); }
+                catch (Exception ex) { throw new RuntimeException(ex); }
+            }).get();
+            s = CollectionUtils.collectStreamInfo(info);
+            if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
+            System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
+        }
+        return s;
+    }
+
+    /// Re-resolve with force-WebEmbed (modern URLs that googlevideo throttles
+    /// less). Returns null on failure — caller keeps the original streams.
+    private static Streams resolveStreamsWebEmbed(String videoId) {
+        try {
+            StreamInfo retryInfo = Multithreading.supplyAsync(() -> {
+                // ThreadLocal muss INSIDE des Lambdas gesetzt werden -- supplyAsync
+                // laeuft auf Worker-Thread, ThreadLocals propagieren nicht ueber den
+                // Thread-Pool-Hop hinweg.
+                YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                try {
+                    return StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex);
+                } finally {
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                }
+            }).get();
+            return CollectionUtils.collectStreamInfo(retryInfo);
+        } catch (Exception ex) {
+            System.out.println("[SynthHls] " + videoId + " WebEmbed-retry failed: " + ex.getMessage());
+            return null;
         }
     }
 
@@ -249,24 +288,19 @@ public class SynthHlsHandlers {
     }
 
     /**
-     * HEAD-byte-range-Check fuer Throttle-Detection. Siehe StreamHandlers
-     * fuer identische Implementierung -- duplicated weil shared utility
-     * Refactor groesserer Aufwand waere.
+     * HEAD-byte-range-Check fuer Throttle-Detection — auf dem tatsaechlich
+     * servierten Video-Stream (pickedVideoStreams). Vorher StreamInfo-basiert;
+     * jetzt auf den collected Streams, damit der Check aus dem Cache heraus
+     * laufen kann, ohne StreamInfo erneut aufzuloesen.
      */
-    private static boolean isVideoStreamThrottled(StreamInfo info) {
-        if (info == null) return false;
-        VideoStream best = null;
-        for (VideoStream vs : info.getVideoOnlyStreams()) {
-            if (best == null
-                || (vs.getBitrate() > 0 && vs.getBitrate() > best.getBitrate())) {
-                best = vs;
-            }
-        }
-        if (best == null) return false;
-        String url = best.getContent();
+    private static boolean isStreamsThrottled(Streams s) {
+        if (s == null) return false;
+        List<PipedStream> vids = pickedVideoStreams(s);
+        if (vids.isEmpty()) return false;
+        PipedStream v = vids.get(0);
+        String url = v.url;
         if (url == null || url.isEmpty() || !url.startsWith("http")) return false;
-        long clen = best.getItagItem() != null
-            ? best.getItagItem().getContentLength() : 0;
+        long clen = v.contentLength;
         if (clen < 10_000_000L) return false;
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
