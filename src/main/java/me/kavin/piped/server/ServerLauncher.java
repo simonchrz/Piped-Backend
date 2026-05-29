@@ -219,11 +219,19 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         return getErrorResponse(e, request.getPath());
                     }
                 })).map(GET, "/clips/:clipId", AsyncServlet.ofBlocking(executor, request -> {
+                    // resolveClipId resolves the underlying video = a YT player-resolve,
+                    // same starvation risk as /streams + /synth-hls. Cap it on the same
+                    // limiter so a YT block cannot pin carriers via /clips either.
+                    if (!ytResolveAcquire())
+                        return io.activej.http.HttpResponse.ofCode(503);
                     try {
-                        return getJsonResponse(StreamHandlers.resolveClipId(request.getPathParameter("clipId")),
+                        return getJsonResponse(withResolveBudget(
+                                () -> StreamHandlers.resolveClipId(request.getPathParameter("clipId"))),
                                 "public, max-age=31536000, immutable");
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
+                    } finally {
+                        YT_RESOLVE_LIMITER.release();
                     }
                 })).map(GET, "/channel/:channelId", AsyncServlet.ofBlocking(executor, request -> {
                     try {
