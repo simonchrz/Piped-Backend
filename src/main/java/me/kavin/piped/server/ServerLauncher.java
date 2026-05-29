@@ -25,9 +25,13 @@ import org.jetbrains.annotations.NotNull;
 
 import java.net.InetSocketAddress;
 import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static io.activej.config.converter.ConfigConverters.ofInetSocketAddress;
 import static io.activej.http.HttpHeaders.*;
@@ -58,6 +62,32 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;
+        }
+    }
+
+    // Total per-resolve deadline. A throttled resolve otherwise stacks
+    // sequential bounded fallbacks (Android cascade 6s + WebEmbed ~20s + HEAD
+    // 5s + force-WebEmbed retry ~20s) into ~30-50s; this caps the wait so the
+    // client gets a fast error instead of a stuck spinner, and the caller's
+    // semaphore slot is freed on return. Normal resolves are ~2s (≤~8s with a
+    // WebEmbed fallback), well under the budget.
+    private static final int RESOLVE_BUDGET_S = 12;
+
+    /** Run a YT resolve under RESOLVE_BUDGET_S; on timeout cancel + throw so
+     *  the handler's catch returns an error fast. Runs on the same cached
+     *  virtual-thread executor; the abandoned task is bounded by the
+     *  Downloader's own 10s per-call timeout. */
+    private static byte[] withResolveBudget(Callable<byte[]> resolve) throws Exception {
+        Future<byte[]> f = Multithreading.getCachedExecutor().submit(resolve);
+        try {
+            return f.get(RESOLVE_BUDGET_S, TimeUnit.SECONDS);
+        } catch (TimeoutException te) {
+            f.cancel(true);
+            throw new RuntimeException("YT resolve exceeded " + RESOLVE_BUDGET_S + "s budget (throttled?)");
+        } catch (ExecutionException ee) {
+            final Throwable c = ee.getCause();
+            if (c instanceof Exception) throw (Exception) c;
+            throw ee;
         }
     }
 
@@ -145,7 +175,8 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     if (!ytResolveAcquire())
                         return io.activej.http.HttpResponse.ofCode(503);
                     try {
-                        return getJsonResponse(StreamHandlers.streamsResponse(request.getPathParameter("videoId")),
+                        return getJsonResponse(withResolveBudget(
+                                () -> StreamHandlers.streamsResponse(request.getPathParameter("videoId"))),
                                 "public, s-maxage=21540, max-age=30", true);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
@@ -160,12 +191,12 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         String filename = request.getPathParameter("filename");
                         byte[] body;
                         if (filename.equals("master.m3u8")) {
-                            body = SynthHlsHandlers.masterPlaylist(videoId);
+                            body = withResolveBudget(() -> SynthHlsHandlers.masterPlaylist(videoId));
                         } else if (filename.equals("audio.m3u8")) {
-                            body = SynthHlsHandlers.audioPlaylist(videoId);
+                            body = withResolveBudget(() -> SynthHlsHandlers.audioPlaylist(videoId));
                         } else if (filename.startsWith("video") && filename.endsWith(".m3u8")) {
-                            int idx = Integer.parseInt(filename.substring(5, filename.length() - 5));
-                            body = SynthHlsHandlers.videoPlaylist(videoId, idx);
+                            final int idx = Integer.parseInt(filename.substring(5, filename.length() - 5));
+                            body = withResolveBudget(() -> SynthHlsHandlers.videoPlaylist(videoId, idx));
                         } else {
                             return io.activej.http.HttpResponse.ofCode(404);
                         }
