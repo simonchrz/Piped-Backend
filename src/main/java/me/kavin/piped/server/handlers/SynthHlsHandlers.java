@@ -144,11 +144,13 @@ public class SynthHlsHandlers {
     }
 
     private static final ConcurrentMap<String, CacheEntry> streamsCache = new ConcurrentHashMap<>();
-    // 5 min: googlevideo segment URLs stay valid ~6h, and the cpn-refresh that
-    // motivated the old 10s TTL happens per-resolution, not per cache-hit. The
-    // longer window lets app pre-warm + replay + the master→variant fetches all
-    // hit a warm cache instead of re-resolving StreamInfo (~1.2s) every time.
-    private static final long CACHE_TTL_MS = 300_000L;
+    // 10s — DELIBERATELY short: a longer TTL reuses the same cpn (client
+    // playback nonce) across separate plays, which googlevideo per-IP throttles
+    // (single-use-cpn). A 5min experiment (2026-05-29) correlated with a
+    // server-side resolve-throttle and was reverted. A safe pre-warm needs a
+    // SPLIT — cache the stable master METADATA long, but resolve FRESH cpn
+    // segment URLs per play — not a blanket TTL bump.
+    private static final long CACHE_TTL_MS = 10_000L;
 
     private static class CacheEntry {
         final Streams streams;
