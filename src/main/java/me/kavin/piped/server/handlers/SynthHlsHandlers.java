@@ -144,6 +144,14 @@ public class SynthHlsHandlers {
     }
 
     private static final ConcurrentMap<String, CacheEntry> streamsCache = new ConcurrentHashMap<>();
+    // ReentrantLock instead of `synchronized (streamsCache)` for the resolve
+    // section: synchronized + blocking I/O PINS the virtual-thread carrier
+    // (Java 21), so a stuck YT resolve holding it starves carriers. A
+    // ReentrantLock lets the vthread unmount during the blocking resolve.
+    // Still a single global lock (serializes resolves = avoids duplicate YT
+    // hits for the same video + caps concurrent YT load) — just de-pinned.
+    private static final java.util.concurrent.locks.ReentrantLock resolveLock =
+            new java.util.concurrent.locks.ReentrantLock();
     // 10s — DELIBERATELY short: a longer TTL reuses the same cpn (client
     // playback nonce) across separate plays, which googlevideo per-IP throttles
     // (single-use-cpn). A 5min experiment (2026-05-29) correlated with a
@@ -177,7 +185,8 @@ public class SynthHlsHandlers {
     private static Streams fetchStreams(String videoId, boolean requireVerified) throws Exception {
         CacheEntry e = streamsCache.get(videoId);
         if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
-        synchronized (streamsCache) {
+        resolveLock.lock();
+        try {
             e = streamsCache.get(videoId);
             if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
 
@@ -205,6 +214,8 @@ public class SynthHlsHandlers {
             }
             streamsCache.put(videoId, new CacheEntry(s, verified));
             return s;
+        } finally {
+            resolveLock.unlock();
         }
     }
 
