@@ -118,9 +118,13 @@ public class YtProxyHandlers {
         try {
             sess.waitUntilHeadersReady(HEADER_WAIT_MS);
         } catch (Exception e) {
+            if (sess.upstream403) return ytProxyFallbackRedirect(host, path, rawQuery);
             return HttpResponse.ofCode(504).withBody(("yt-proxy: header wait: " + e.getMessage()).getBytes());
         }
-        if (sess.failed) return HttpResponse.ofCode(502).withBody("yt-proxy: upstream failed".getBytes());
+        if (sess.failed) {
+            if (sess.upstream403) return ytProxyFallbackRedirect(host, path, rawQuery);
+            return HttpResponse.ofCode(502).withBody("yt-proxy: upstream failed".getBytes());
+        }
         long total = sess.totalLength;
 
         // No-range / HEAD: return file or headers
@@ -150,6 +154,19 @@ public class YtProxyHandlers {
                 .withHeader(HttpHeaders.CONTENT_RANGE, HttpHeaderValue.of("bytes " + start + "-" + end + "/" + total))
                 .withHeader(HttpHeaders.CONTENT_LENGTH, HttpHeaderValue.of(String.valueOf(end - start + 1)))
                 .withHeader(HttpHeaders.ACCEPT_RANGES, HttpHeaderValue.of("bytes"));
+    }
+
+    // On a googlevideo 403 (degraded/blocked URL: old/long videos whose
+    // ANDROID_VR resolve yields legacy progressive itags that 403 byte-range
+    // fetches), redirect the player to the piped-proxy streaming path instead
+    // of hard-failing. piped-proxy forwards the player request shape, which
+    // googlevideo throttles-but-serves rather than 403s. Reconstructs the
+    // pre-rewrite piped-proxy URL (host moves back from path to query param).
+    private static HttpResponse ytProxyFallbackRedirect(String host, String path, String rawQuery) {
+        String fb = me.kavin.piped.consts.Constants.PROXY_PART + path + "?"
+                + (rawQuery == null || rawQuery.isEmpty() ? "" : rawQuery + "&") + "host=" + host;
+        System.out.println("[YtProxy] 403 fallback -> piped-proxy " + host + path);
+        return HttpResponse.ofCode(302).withHeader(HttpHeaders.LOCATION, HttpHeaderValue.of(fb));
     }
 
     private static Path currentBytesPath(StreamSession sess) {
@@ -224,6 +241,7 @@ public class YtProxyHandlers {
                                         Math.min(200, es.available() > 0 ? es.available() : 200));
                             } catch (Exception ignored) {}
                             System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code + " body=" + errBody);
+                            if (code == 403) sess.upstream403 = true;
                             fail(sess);
                             return;
                         }
@@ -301,6 +319,7 @@ public class YtProxyHandlers {
         volatile long totalLength = -1;
         volatile boolean failed = false;
         volatile boolean complete = false;
+        volatile boolean upstream403 = false;
         final AtomicLong downloadedBytes = new AtomicLong(0);
         final Object lock = new Object();
         volatile Thread downloader;

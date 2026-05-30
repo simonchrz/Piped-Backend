@@ -312,7 +312,13 @@ public class SynthHlsHandlers {
         if (host == null) return pipedProxyUrl;
         int pathStart = pipedProxyUrl.indexOf('/', 8);
         String path = (pathStart >= 0 && pathStart < q) ? pipedProxyUrl.substring(pathStart, q) : "/";
-        return pipedProxyUrl; // bypass yt-proxy — googlevideo per-video throttle currently blocks yt-proxy upstream
+        // Route segments through the caching yt-proxy (chunked Range
+        // downloader = full speed). On a 403 (degraded URL) the yt-proxy
+        // 302-redirects back to this piped-proxy URL, so no hard fail.
+        String rest = java.util.Arrays.stream(query.split("&"))
+                .filter(p -> !p.startsWith("host=")).collect(java.util.stream.Collectors.joining("&"));
+        return me.kavin.piped.consts.Constants.PUBLIC_URL + "/yt-proxy/" + host + path
+                + (rest.isEmpty() ? "" : "?" + rest);
     }
 
     /**
