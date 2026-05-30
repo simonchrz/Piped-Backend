@@ -61,6 +61,14 @@ public class YtProxyHandlers {
     /// (videoId + "_" + itag) → active StreamSession.
     private static final ConcurrentHashMap<String, StreamSession> SESSIONS = new ConcurrentHashMap<>();
 
+    // First-chunk cache hit/miss counters (a range already downloaded when
+    // the request arrived = HIT; one that had to block on the in-progress
+    // download = MISS = the populate-timing race the variant-build prewarm
+    // targets). Logged per request with the running rate — server-side
+    // ground truth, unbiased by app-side throttle.
+    private static final AtomicLong ytCacheHits = new AtomicLong(0);
+    private static final AtomicLong ytCacheMisses = new AtomicLong(0);
+
     static {
         // Cleanup orphan .tmp files from previous run (server restart mid-download).
         if (CACHE_DIR != null) {
@@ -174,8 +182,16 @@ public class YtProxyHandlers {
         if (rb == null) return HttpResponse.ofCode(416);
         long start = rb[0];
         long end = Math.min(rb[1], Math.min(start + MAX_RESPONSE_CHUNK - 1, total - 1));
+        boolean hit = Files.exists(sess.finalPath) || sess.downloadedBytes.get() >= end + 1;
+        long waitStart = System.nanoTime();
         try { sess.waitUntilDownloaded(end, DOWNLOAD_WAIT_MS); }
         catch (Exception e) { return HttpResponse.ofCode(504).withBody(("yt-proxy: range wait: " + e.getMessage()).getBytes()); }
+        long waitMs = (System.nanoTime() - waitStart) / 1_000_000;
+        (hit ? ytCacheHits : ytCacheMisses).incrementAndGet();
+        long tot = ytCacheHits.get() + ytCacheMisses.get();
+        System.out.printf("[YtProxy] %s range %d-%d %s wait=%dms (hit-rate %d/%d = %.0f%%)%n",
+                key, start, end, hit ? "HIT" : "MISS", waitMs,
+                ytCacheHits.get(), tot, 100.0 * ytCacheHits.get() / Math.max(1, tot));
 
         byte[] body = readRange(currentBytesPath(sess), start, end);
         return HttpResponse.ofCode(206).withBody(body)
