@@ -317,6 +317,10 @@ public class SynthHlsHandlers {
         // 302-redirects back to this piped-proxy URL, so no hard fail.
         String rest = java.util.Arrays.stream(query.split("&"))
                 .filter(p -> !p.startsWith("host=")).collect(java.util.stream.Collectors.joining("&"));
+        // Start the first-chunk download now (variant build is ~200ms before
+        // mpv asks for the first segment) so it is a cache HIT, not a ~850ms
+        // synchronous googlevideo pull. Single fetch - the yt-proxy caches.
+        YtProxyHandlers.prewarm(host, path, rest);
         return me.kavin.piped.consts.Constants.PUBLIC_URL + "/yt-proxy/" + host + path
                 + (rest.isEmpty() ? "" : "?" + rest);
     }

@@ -74,6 +74,35 @@ public class YtProxyHandlers {
         }
     }
 
+    /// Pre-warm the cache for a (videoId,itag): create the StreamSession +
+    /// start the chunked-range download NOW, so by the time mpv requests the
+    /// first segment the leading bytes are already on disk (cache HIT ~250ms
+    /// instead of a ~850ms synchronous googlevideo pull). Called from the
+    /// synth-hls variant build, which runs ~200ms before mpv's first segment
+    /// request. Idempotent; returns at once, download runs in the background.
+    /// Safe vs the old piped-proxy warmup double-fetch concern: the yt-proxy
+    /// CACHES, so this is a single fetch.
+    public static void prewarm(String host, String path, String rawQuery) {
+        if (host == null || host.isEmpty()) return;
+        String targetUrl = "https://" + host + path
+                + (rawQuery == null || rawQuery.isEmpty() ? "" : "?" + rawQuery);
+        String videoId = "_", itag = "_";
+        if (rawQuery != null) {
+            for (String p : rawQuery.split("&")) {
+                if (p.startsWith("id=")) videoId = p.substring(3);
+                else if (p.startsWith("itag=")) itag = p.substring(5);
+            }
+        }
+        String key = safeKey(videoId + "_" + itag);
+        if (Files.exists(CACHE_DIR.resolve(key + ".mp4"))) return;
+        SESSIONS.computeIfAbsent(key, k -> {
+            StreamSession sess = new StreamSession(k, CACHE_DIR.resolve(k + ".tmp"),
+                    CACHE_DIR.resolve(k + ".mp4"), targetUrl);
+            startDownloader(sess);
+            return sess;
+        });
+    }
+
     public static HttpResponse handle(HttpRequest request) throws IOException {
         String fullPath = request.getPath();
         if (!fullPath.startsWith(PREFIX)) return HttpResponse.ofCode(404);
