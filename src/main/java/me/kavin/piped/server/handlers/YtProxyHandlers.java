@@ -57,6 +57,14 @@ public class YtProxyHandlers {
     /// chunk's Range request as needed — same pattern the old chunk-rewrite
     /// path used, just now backed by a single upstream connection per cpn.
     private static final long MAX_RESPONSE_CHUNK = 10L * 1024 * 1024;
+    /// Seek fast-path threshold. The downloader fills the file sequentially from
+    /// offset 0; a Range request normally blocks until the fill reaches it. For
+    /// a forward seek whose target is more than this many bytes AHEAD of the
+    /// current fill, blocking would take seconds (16s+ for a mid-point seek on a
+    /// long video), so instead fetch that range DIRECTLY from googlevideo
+    /// (bounded Range = ~1.4 MB/s, ~1s) and return at once. The sequential
+    /// downloader keeps running to complete the full-file cache for next time.
+    private static final long SEEK_AHEAD_MARGIN = 16L * 1024 * 1024;
 
     /// (videoId + "_" + itag) → active StreamSession.
     private static final ConcurrentHashMap<String, StreamSession> SESSIONS = new ConcurrentHashMap<>();
@@ -68,6 +76,7 @@ public class YtProxyHandlers {
     // ground truth, unbiased by app-side throttle.
     private static final AtomicLong ytCacheHits = new AtomicLong(0);
     private static final AtomicLong ytCacheMisses = new AtomicLong(0);
+    private static final AtomicLong ytSeekFetches = new AtomicLong(0);
 
     static {
         // Cleanup orphan .tmp files from previous run (server restart mid-download).
@@ -183,6 +192,27 @@ public class YtProxyHandlers {
         long start = rb[0];
         long end = Math.min(rb[1], Math.min(start + MAX_RESPONSE_CHUNK - 1, total - 1));
         boolean hit = Files.exists(sess.finalPath) || sess.downloadedBytes.get() >= end + 1;
+
+        // Seek fast-path: a forward seek to bytes the sequential downloader won't
+        // reach for a while → fetch this range directly instead of blocking on
+        // the fill (which is 16s+ for a mid-point seek). Defensive: only on a
+        // clean 206; any failure falls through to the normal blocking path.
+        long dl0 = sess.downloadedBytes.get();
+        if (!hit && start > dl0 + SEEK_AHEAD_MARGIN) {
+            byte[] direct = directRangeFetch(sess.targetUrl, start, end);
+            if (direct != null) {
+                long n = ytSeekFetches.incrementAndGet();
+                System.out.printf("[YtProxy] %s SEEK-FETCH %d-%d (fill@%d, %dMB ahead, #%d)%n",
+                        key, start, end, dl0, (start - dl0) / (1024 * 1024), n);
+                return HttpResponse.ofCode(206).withBody(direct)
+                        .withHeader(HttpHeaders.CONTENT_TYPE, HttpHeaderValue.of("video/mp4"))
+                        .withHeader(HttpHeaders.CONTENT_RANGE, HttpHeaderValue.of("bytes " + start + "-" + end + "/" + total))
+                        .withHeader(HttpHeaders.CONTENT_LENGTH, HttpHeaderValue.of(String.valueOf(end - start + 1)))
+                        .withHeader(HttpHeaders.ACCEPT_RANGES, HttpHeaderValue.of("bytes"));
+            }
+            // direct fetch failed → fall through to the blocking path below.
+        }
+
         long waitStart = System.nanoTime();
         try { sess.waitUntilDownloaded(end, DOWNLOAD_WAIT_MS); }
         catch (Exception e) { return HttpResponse.ofCode(504).withBody(("yt-proxy: range wait: " + e.getMessage()).getBytes()); }
@@ -247,6 +277,44 @@ public class YtProxyHandlers {
             raf.readFully(buf);
         }
         return buf;
+    }
+
+    /// Direct bounded Range GET from googlevideo for [start,end] — the seek
+    /// fast-path. googlevideo serves bounded ranges at full speed (~1.4 MB/s, no
+    /// per-cpn 403 on current ANDROID_VR URLs — verified), so this returns a
+    /// forward-seek segment in ~1s instead of blocking until the sequential
+    /// downloader fills there (16s+ on a long video). Returns null on ANY
+    /// failure (non-206, short read, exception) → caller falls back to the
+    /// blocking path. Does NOT write the shared cache file (no writer
+    /// concurrency with the downloader, which still completes the full cache).
+    private static byte[] directRangeFetch(String targetUrl, long start, long end) {
+        int len = (int) (end - start + 1);
+        if (len <= 0 || len > MAX_RESPONSE_CHUNK) return null;
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(targetUrl).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setInstanceFollowRedirects(true);
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(30_000);
+            conn.setRequestProperty("User-Agent", CHROME_UA);
+            if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
+            conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
+            int code = conn.getResponseCode();
+            // Only a proper 206 gives the requested window. A 200 means Range was
+            // ignored (bytes would start at 0, not `start`) → reject, fall back.
+            if (code != 206) return null;
+            try (InputStream is = conn.getInputStream()) {
+                byte[] buf = new byte[len];
+                int off = 0, n;
+                while (off < len && (n = is.read(buf, off, len - off)) > 0) off += n;
+                return off == len ? buf : null;
+            }
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 
     private static final long DL_CHUNK_BYTES = 8L * 1024 * 1024; // bounded range chunk
