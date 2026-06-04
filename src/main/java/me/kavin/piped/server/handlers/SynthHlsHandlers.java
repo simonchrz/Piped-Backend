@@ -201,13 +201,30 @@ public class SynthHlsHandlers {
         CacheEntry e = streamsCache.get(videoId);
         if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
         resolveLock.lock();
+        // Stage timing for the cold path — split resolve vs throttle-HEAD vs
+        // WebEmbed-retry over real plays, so we can see where a slow cold-start
+        // actually goes (the Pi back-end vs the client player pipeline). One
+        // [SynthHls-timing] line per cache-miss/verify; pure cache hits are
+        // silent (they returned above).
+        long t0 = System.currentTimeMillis();
+        boolean didResolve = false, didThrottleCheck = false, throttled = false;
+        boolean webembedTried = false, webembedOk = false;
+        long resolveMs = 0, throttleMs = 0, webembedMs = 0;
         try {
             e = streamsCache.get(videoId);
             if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
 
             // Reuse fresh-but-unverified streams (just cached by a master fetch)
             // so we don't pay a second StreamInfo.getInfo just to verify.
-            Streams s = (e != null && e.fresh()) ? e.streams : resolveStreams(videoId);
+            Streams s;
+            if (e != null && e.fresh()) {
+                s = e.streams;
+            } else {
+                long r0 = System.currentTimeMillis();
+                s = resolveStreams(videoId);
+                resolveMs = System.currentTimeMillis() - r0;
+                didResolve = true;
+            }
 
             boolean verified = false;
             if (requireVerified) {
@@ -215,11 +232,19 @@ public class SynthHlsHandlers {
                 // fuer deep byte-range-fetches 403'd. HEAD-Test gegen clen/2 deckt das
                 // auf -- bei 403 retry mit force-WebEmbed (= WebEmbed-modern-URLs werden
                 // nicht so throttled). Siehe StreamHandlers fuer Detail-Notes.
-                if (isStreamsThrottled(s)) {
+                didThrottleCheck = true;
+                long th0 = System.currentTimeMillis();
+                throttled = isStreamsThrottled(s);
+                throttleMs = System.currentTimeMillis() - th0;
+                if (throttled) {
                     System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
+                    webembedTried = true;
+                    long w0 = System.currentTimeMillis();
                     Streams retryS = resolveStreamsWebEmbed(videoId);
+                    webembedMs = System.currentTimeMillis() - w0;
                     if (retryS != null && !retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
                         s = retryS;
+                        webembedOk = true;
                         System.out.println("[SynthHls] " + videoId + " WebEmbed-retry success");
                     } else {
                         System.out.println("[SynthHls] " + videoId + " WebEmbed-retry non-healthy, behalte original");
@@ -230,6 +255,14 @@ public class SynthHlsHandlers {
             streamsCache.put(videoId, new CacheEntry(s, verified));
             return s;
         } finally {
+            if (didResolve || didThrottleCheck) {
+                System.out.println("[SynthHls-timing] " + videoId
+                        + " kind=" + (requireVerified ? "variant" : "master")
+                        + " resolveMs=" + resolveMs
+                        + " throttled=" + throttled + " throttleMs=" + throttleMs
+                        + " webembed=" + webembedTried + " webembedOk=" + webembedOk + " webembedMs=" + webembedMs
+                        + " totalMs=" + (System.currentTimeMillis() - t0));
+            }
             resolveLock.unlock();
         }
     }
