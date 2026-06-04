@@ -282,6 +282,18 @@ public class SynthHlsHandlers {
             if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
             System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
         }
+        // Persistent audio=0 (e.g. ARD/WDR-OER uploads like "Die Maus") — the
+        // Android client never returns adaptive audio; web_embedded does. Fall
+        // back like the throttle path does. Verified per yt-dlp: android=0 audio,
+        // web_embedded=4 incl. m4a.
+        if (s != null && s.audioStreams.isEmpty()) {
+            System.out.println("[SynthHls] " + videoId + " persistent degraded (audio=0), force-WebEmbed fallback");
+            Streams retryS = resolveStreamsWebEmbed(videoId);
+            if (retryS != null && !retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
+                s = retryS;
+                System.out.println("[SynthHls] " + videoId + " WebEmbed-fallback success (a=" + s.audioStreams.size() + " v=" + s.videoStreams.size() + ")");
+            }
+        }
         return s;
     }
 

@@ -78,8 +78,19 @@ public class StreamHandlers {
                 // deckt das auf. Bei 403 setzen wir NPE's force-WebEmbed
                 // ThreadLocal und rufen StreamInfo nochmal -- WebEmbed-modern-URLs
                 // werden nicht so throttled.
-                if (info != null && isVideoStreamThrottled(info)) {
-                    System.out.println("[StreamHandlers] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
+                // WebEmbed-Fallback bei (a) Throttle (HEAD=403) ODER (b) persistent
+                // degraded (audio=0 nach den 3 Android-Versuchen). Manche Videos —
+                // v.a. ARD/WDR-OER-Uploads (z.B. "Die Maus") — liefern dem Android-
+                // Client 0 adaptive Audio-Streams; web_embedded liefert sie (verifiziert
+                // per yt-dlp: android=0 audio, web_embedded=4 inkl. m4a). Ohne diesen
+                // Fallback dreht die 3x-Retry-Schleife leer (~5s Cold-Start) und das
+                // Ergebnis bleibt audiolos. Der degraded-Pfad short-circuitet den
+                // HEAD-Probe (kein throttle-Check noetig wenn eh schon audio=0).
+                boolean degraded = info != null && info.getAudioStreams().isEmpty();
+                if (info != null && (degraded || isVideoStreamThrottled(info))) {
+                    System.out.println("[StreamHandlers] " + videoId + " "
+                            + (degraded ? "degraded (audio=0)" : "URLs throttled (HEAD=403 auf clen/2)")
+                            + ", retry mit force-WebEmbed");
                     YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
                     try {
                         StreamInfo retryInfo = StreamInfo.getInfo(
