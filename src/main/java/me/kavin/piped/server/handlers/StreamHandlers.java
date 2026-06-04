@@ -190,7 +190,14 @@ public class StreamHandlers {
         Throwable exception = null;
 
         try {
-            info = futureStream.get(10, TimeUnit.SECONDS);
+            // 18s (was 10s): the degraded-audio WebEmbed fallback adds a second
+            // full resolve on top of the 3 Android attempts (~5s) + WebEmbed
+            // (~5s) -- the chain finishes ~10s, right at the old budget, so
+            // WebEmbed-success videos (e.g. ARD/WDR uploads that only the embed
+            // client serves audio for) raced the timeout and 500'd despite a good
+            // result. Only the rare degraded path uses the headroom; healthy
+            // videos still return in ~2s.
+            info = futureStream.get(18, TimeUnit.SECONDS);
         } catch (ExecutionException e) {
             exception = e.getCause();
             if (

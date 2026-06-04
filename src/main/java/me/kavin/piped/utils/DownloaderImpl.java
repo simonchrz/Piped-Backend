@@ -65,10 +65,21 @@ public class DownloaderImpl extends Downloader {
         if (saved_cookie != null && !saved_cookie.hasExpired())
             headers.put("Cookie", saved_cookie.getName() + "=" + saved_cookie.getValue());
 
-        // Custom: attach YouTube cookies to requests targeting YouTube hosts
+        // Custom: attach YouTube cookies to requests targeting YouTube hosts.
+        // EXCEPT the public base.js page scrapes (iframe_api / embed / watch HTML):
+        // with account cookies YouTube 302-redirects those to a consent/account
+        // flow (0-byte body), so YoutubeJavaScriptExtractor can't find the base.js
+        // URL and the WebEmbed resolve dies ("...didn't provide base player's URL").
+        // These pages are public and must be fetched anonymously; cookies belong on
+        // the segment (googlevideo) + innertube API requests, not the page scrapes.
         if (YOUTUBE_COOKIES != null) {
             String url = request.url();
-            if (url.contains("youtube.com") || url.contains("googlevideo.com") || url.contains("ytimg.com")) {
+            final boolean baseJsPageScrape = url.contains("/iframe_api")
+                    || url.contains("/embed/")
+                    || url.contains("/watch");
+            if (!baseJsPageScrape
+                    && (url.contains("youtube.com") || url.contains("googlevideo.com")
+                        || url.contains("ytimg.com"))) {
                 String existing = headers.get("Cookie");
                 headers.put("Cookie", existing != null ? existing + "; " + YOUTUBE_COOKIES : YOUTUBE_COOKIES);
             }
