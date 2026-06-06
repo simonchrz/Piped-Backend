@@ -280,6 +280,14 @@ public class SynthHlsHandlers {
             }).get();
             s = CollectionUtils.collectStreamInfo(info);
             if (!s.audioStreams.isEmpty() && !s.videoStreams.isEmpty()) break;
+            // audio=0 is the persistent OER pattern (the Android client never
+            // returns adaptive audio for these uploads); retrying NewPipe never
+            // recovers it — only the WebEmbed fallback below does. Break out now
+            // instead of burning 2 more attempts (~2.5s): those wasted retries
+            // pushed consistently-audio=0 channels past the app's request timeout
+            // ("Server antwortet nicht"). The video=0 case below IS transient, so
+            // keep retrying that one.
+            if (s.audioStreams.isEmpty()) break;
             System.out.println("[SynthHls] " + videoId + " attempt " + (attempt + 1) + " degraded (v=" + s.videoStreams.size() + " a=" + s.audioStreams.size() + "), retrying");
         }
         // Persistent audio=0 (e.g. ARD/WDR-OER uploads like "Die Maus") — the
