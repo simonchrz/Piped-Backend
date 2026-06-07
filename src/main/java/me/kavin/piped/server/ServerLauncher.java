@@ -205,12 +205,17 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     // priority=1 = foreground (tap): full pool. Otherwise background
                     // (prefetch): capped so a foreground slot stays reserved.
                     final boolean priority = "1".equals(request.getQueryParameter("priority"));
+                    // Same rendition selection as the synth-hls URL, so the sidx-prewarm
+                    // warms exactly the rendition the tap will request (cold-tap preserved).
+                    final int maxH = SynthHlsHandlers.parseMaxH(request.getQueryParameter("maxh"));
+                    final String[] codecs = SynthHlsHandlers.parseCodecs(request.getQueryParameter("codecs"));
+                    final boolean light = "1".equals(request.getQueryParameter("light"));
                     if (priority ? !ytResolveAcquire() : !ytResolveAcquireBackground())
                         return io.activej.http.HttpResponse.ofCode(503);
                     try {
                         return getJsonResponse(withResolveBudget(
                                 () -> StreamHandlers.streamsResponse(request.getPathParameter("videoId"),
-                                        "1".equals(request.getQueryParameter("light")))),
+                                        light, maxH, codecs)),
                                 "public, s-maxage=21540, max-age=30", true);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
@@ -224,14 +229,18 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     try {
                         String videoId = request.getPathParameter("videoId");
                         String filename = request.getPathParameter("filename");
+                        // Rendition selection (default 1080/avc). masterPlaylist re-encodes
+                        // these onto the variant URIs so video<i>.m3u8 serves the same pick.
+                        final int maxH = SynthHlsHandlers.parseMaxH(request.getQueryParameter("maxh"));
+                        final String[] codecs = SynthHlsHandlers.parseCodecs(request.getQueryParameter("codecs"));
                         byte[] body;
                         if (filename.equals("master.m3u8")) {
-                            body = withResolveBudget(() -> SynthHlsHandlers.masterPlaylist(videoId));
+                            body = withResolveBudget(() -> SynthHlsHandlers.masterPlaylist(videoId, maxH, codecs));
                         } else if (filename.equals("audio.m3u8")) {
                             body = withResolveBudget(() -> SynthHlsHandlers.audioPlaylist(videoId));
                         } else if (filename.startsWith("video") && filename.endsWith(".m3u8")) {
                             final int idx = Integer.parseInt(filename.substring(5, filename.length() - 5));
-                            body = withResolveBudget(() -> SynthHlsHandlers.videoPlaylist(videoId, idx));
+                            body = withResolveBudget(() -> SynthHlsHandlers.videoPlaylist(videoId, idx, maxH, codecs));
                         } else {
                             return io.activej.http.HttpResponse.ofCode(404);
                         }

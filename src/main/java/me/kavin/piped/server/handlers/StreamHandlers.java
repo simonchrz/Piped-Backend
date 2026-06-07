@@ -57,14 +57,20 @@ public class StreamHandlers {
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public static byte[] streamsResponse(String videoId) throws Exception {
-        return streamsResponse(videoId, false);
+        return streamsResponse(videoId, false, 1080, SynthHlsHandlers.DEFAULT_VIDEO_CODECS);
+    }
+
+    public static byte[] streamsResponse(String videoId, boolean light) throws Exception {
+        return streamsResponse(videoId, light, 1080, SynthHlsHandlers.DEFAULT_VIDEO_CODECS);
     }
 
     // light=true (/streams?light=1): skip the ~900ms /next call (related videos +
     // chapters + metaInfo) for the cold-tap playback path. relatedStreams come back
     // empty; the app loads them lazily after playback start. ageLimit stays correct
     // (microformat isFamilySafe, not /next — see YoutubeStreamExtractor.getAgeLimit).
-    public static byte[] streamsResponse(String videoId, boolean light) throws Exception {
+    // maxH/codecs select which rendition the sidx-prewarm warms — must match the
+    // synth-hls tap (the app sends the same ?maxh=&codecs= on both).
+    public static byte[] streamsResponse(String videoId, boolean light, int maxH, String[] codecs) throws Exception {
 
         Sentry.setExtra("videoId", videoId);
 
@@ -377,7 +383,7 @@ public class StreamHandlers {
         // 2nd YouTube resolve (~1.2s saved on a cold tap, no extra YT load).
         // `info` is already throttle-checked + WebEmbed-upgraded above, so the
         // collected streams are URL-verified.
-        SynthHlsHandlers.cacheStreams(videoId, streams, true, light);
+        SynthHlsHandlers.cacheStreams(videoId, streams, true, light, maxH, codecs);
 
         String lbryURL = null;
 

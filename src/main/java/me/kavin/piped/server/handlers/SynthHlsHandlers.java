@@ -22,17 +22,25 @@ import java.util.List;
 public class SynthHlsHandlers {
 
     public static byte[] masterPlaylist(String videoId) throws Exception {
+        return masterPlaylist(videoId, 1080, DEFAULT_VIDEO_CODECS);
+    }
+
+    public static byte[] masterPlaylist(String videoId, int maxH, String[] codecs) throws Exception {
         // requireVerified=false: the master only lists variant playlist names,
         // never segment URLs, so it doesn't need the throttle HEAD-probe /
         // WebEmbed re-resolve. Skipping that keeps this (the dominant
         // FILE_LOADED cost) fast; the variant/audio fetches verify before any
         // segment URL is served.
         Streams streams = fetchStreams(videoId, false);
-        List<PipedStream> videos = pickedVideoStreams(streams);
+        List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         PipedStream audio = pickedAudioStream(streams);
         if (videos.isEmpty() || audio == null) {
             return "#ERROR: no playable streams".getBytes(StandardCharsets.UTF_8);
         }
+        // mpv drops the query on relative variant resolution, so the picked
+        // rendition must be re-encoded into the variant URI — else video0.m3u8
+        // would serve the default 1080/avc and mismatch this master's CODECS.
+        final String q = "?maxh=" + maxH + "&codecs=" + String.join(",", codecs);
         StringBuilder sb = new StringBuilder();
         sb.append("#EXTM3U\n");
         sb.append("#EXT-X-VERSION:7\n");
@@ -48,7 +56,7 @@ public class SynthHlsHandlers {
             String vCodec = v.codec != null ? v.codec : "avc1.64002a";
             sb.append(String.format("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d,CODECS=\"%s,%s\",AUDIO=\"audio\"\n",
                     bw, bw, w, h, fps, vCodec, audioCodec));
-            sb.append("video").append(i).append(".m3u8\n");
+            sb.append("video").append(i).append(".m3u8").append(q).append("\n");
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
@@ -61,8 +69,12 @@ public class SynthHlsHandlers {
     }
 
     public static byte[] videoPlaylist(String videoId, int idx) throws Exception {
+        return videoPlaylist(videoId, idx, 1080, DEFAULT_VIDEO_CODECS);
+    }
+
+    public static byte[] videoPlaylist(String videoId, int idx, int maxH, String[] codecs) throws Exception {
         Streams streams = fetchStreams(videoId);
-        List<PipedStream> videos = pickedVideoStreams(streams);
+        List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         if (idx < 0 || idx >= videos.size()) return "#ERROR".getBytes(StandardCharsets.UTF_8);
         return streamPlaylist(videos.get(idx), streams.duration);
     }
@@ -208,10 +220,19 @@ public class SynthHlsHandlers {
     /// only the common scroll-prefetch → tap window benefits; longer gaps just
     /// re-resolve as before.
     public static void cacheStreams(String videoId, Streams s, boolean urlsVerified) {
-        cacheStreams(videoId, s, urlsVerified, false);
+        cacheStreams(videoId, s, urlsVerified, false, 1080, DEFAULT_VIDEO_CODECS);
     }
 
     public static void cacheStreams(String videoId, Streams s, boolean urlsVerified, boolean syncWarm) {
+        cacheStreams(videoId, s, urlsVerified, syncWarm, 1080, DEFAULT_VIDEO_CODECS);
+    }
+
+    // maxH/codecs select WHICH rendition to warm — must match what the tap will
+    // request on the synth-hls URL, else the prewarm warms the wrong rendition and
+    // the tap's variant-serve goes cold (the cold-tap regression). The app sends the
+    // same ?maxh=&codecs= on /streams?light and the synth-hls URL.
+    public static void cacheStreams(String videoId, Streams s, boolean urlsVerified, boolean syncWarm,
+                                    int maxH, String[] codecs) {
         if (videoId != null && s != null
                 && s.videoStreams != null && !s.videoStreams.isEmpty()
                 && s.audioStreams != null && !s.audioStreams.isEmpty()) {
@@ -225,7 +246,7 @@ public class SynthHlsHandlers {
             // async fire-and-forget variant lost the race under fast light-prefetch
             // (tap arrived before the warm finished). syncWarm=false keeps the old
             // async behavior for non-prefetch callers.
-            if (urlsVerified) warmSidx(s, syncWarm);
+            if (urlsVerified) warmSidx(s, syncWarm, maxH, codecs);
         }
     }
 
@@ -242,10 +263,10 @@ public class SynthHlsHandlers {
     /// video variant — exactly the two playlists mpv opens on a cold tap. The
     /// cache key is cpn-stripped, so warming with the resolve's own URL produces
     /// the same key the tap-time swapCpn'd fetch looks up → HIT.
-    private static void warmSidx(Streams s, boolean sync) {
+    private static void warmSidx(Streams s, boolean sync, int maxH, String[] codecs) {
         try {
             final java.util.List<java.util.concurrent.Future<?>> fs = new ArrayList<>();
-            List<PipedStream> videos = pickedVideoStreams(s);
+            List<PipedStream> videos = pickedVideoStreams(s, maxH, codecs);
             if (!videos.isEmpty()) { var f = warmOne(videos.get(0)); if (f != null) fs.add(f); }
             var fa = warmOne(pickedAudioStream(s)); if (fa != null) fs.add(fa);
             if (sync) {
@@ -415,19 +436,55 @@ public class SynthHlsHandlers {
         }
     }
 
+    // Default: single H.264 1080p-or-less variant (the safe default that avoids
+    // ABR-switching confusion + works on every device). Higher renditions are
+    // opt-in via ?maxh=&codecs= (the app sends only HW-decodable codecs).
+    static final String[] DEFAULT_VIDEO_CODECS = {"avc"};
+
     private static List<PipedStream> pickedVideoStreams(Streams streams) {
-        // Single H.264 1080p-or-less variant — avoids ABR-switching confusion
-        // in Apple HLS engine which made buffer-ahead shrink under high variant count.
-        PipedStream best = null;
-        for (PipedStream s : streams.videoStreams) {
-            if (s.codec == null || !s.codec.startsWith("avc")) continue;
-            int h = s.height;
-            if (h <= 0 || h > 1080) continue;
-            if (best == null || h > best.height || (h == best.height && s.bitrate > best.bitrate)) best = s;
-        }
+        return pickedVideoStreams(streams, 1080, DEFAULT_VIDEO_CODECS);
+    }
+
+    // Pick ONE videoOnly rendition (single-variant — preserves the cold-tap
+    // prewarm): the highest <= maxH within the FIRST preferred codec that has any
+    // matching rendition (codec preference beats resolution, per the app contract).
+    private static List<PipedStream> pickedVideoStreams(Streams streams, int maxH, String[] codecPref) {
         List<PipedStream> out = new ArrayList<>();
-        if (best != null) out.add(best);
+        for (String pref : codecPref) {
+            PipedStream best = null;
+            for (PipedStream s : streams.videoStreams) {
+                if (s.codec == null || !codecMatches(s.codec, pref)) continue;
+                int h = s.height;
+                if (h <= 0 || h > maxH) continue;
+                if (best == null || h > best.height || (h == best.height && s.bitrate > best.bitrate)) best = s;
+            }
+            if (best != null) { out.add(best); return out; }
+        }
         return out;
+    }
+
+    private static boolean codecMatches(String codec, String pref) {
+        switch (pref) {
+            case "av1": return codec.startsWith("av01") || codec.startsWith("av1");
+            case "vp9": return codec.startsWith("vp9")  || codec.startsWith("vp09");
+            case "avc": case "h264": return codec.startsWith("avc");
+            default: return false;
+        }
+    }
+
+    // ?maxh= — cap requested rendition height; default 1080 (today's behavior).
+    public static int parseMaxH(String s) {
+        if (s == null || s.isEmpty()) return 1080;
+        try { int v = Integer.parseInt(s.trim()); return v > 0 ? v : 1080; } catch (Exception e) { return 1080; }
+    }
+
+    // ?codecs=av1,vp9,avc — preference order; default {"avc"} (today's behavior).
+    public static String[] parseCodecs(String s) {
+        if (s == null || s.isEmpty()) return DEFAULT_VIDEO_CODECS;
+        String[] parts = s.trim().toLowerCase().split(",");
+        List<String> out = new ArrayList<>();
+        for (String p : parts) { p = p.trim(); if (!p.isEmpty()) out.add(p); }
+        return out.isEmpty() ? DEFAULT_VIDEO_CODECS : out.toArray(new String[0]);
     }
 
     private static PipedStream pickedAudioStream(Streams streams) {
