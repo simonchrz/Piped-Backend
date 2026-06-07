@@ -228,7 +228,25 @@ public class YtProxyHandlers {
         sess.noteClientRequest(end);
         long waitStart = System.nanoTime();
         try { sess.waitUntilDownloaded(end, DOWNLOAD_WAIT_MS); }
-        catch (Exception e) { return HttpResponse.ofCode(504).withBody(("yt-proxy: range wait: " + e.getMessage()).getBytes()); }
+        catch (Exception e) {
+            // The sequential downloader gave up (CDN stalled on this range — common
+            // on audio=0/WebEmbed segments). Don't freeze the client with a 504:
+            // serve THIS range from a one-shot fresh connection + fresh cpn (the same
+            // cushion the seek fast-path uses). Recovers a transient googlevideo stall
+            // without the client having to fully reload the video.
+            byte[] direct = directRangeFetch(swapCpn(sess.targetUrl), start, end);
+            if (direct != null) {
+                long n = ytSeekFetches.incrementAndGet();
+                System.out.println("[YtProxy] " + key + " STALL-RECOVER direct " + start + "-" + end
+                        + " (downloader gave up; #" + n + ")");
+                return HttpResponse.ofCode(206).withBody(direct)
+                        .withHeader(HttpHeaders.CONTENT_TYPE, HttpHeaderValue.of("video/mp4"))
+                        .withHeader(HttpHeaders.CONTENT_RANGE, HttpHeaderValue.of("bytes " + start + "-" + end + "/" + total))
+                        .withHeader(HttpHeaders.CONTENT_LENGTH, HttpHeaderValue.of(String.valueOf(end - start + 1)))
+                        .withHeader(HttpHeaders.ACCEPT_RANGES, HttpHeaderValue.of("bytes"));
+            }
+            return HttpResponse.ofCode(504).withBody(("yt-proxy: range wait: " + e.getMessage()).getBytes());
+        }
         long waitMs = (System.nanoTime() - waitStart) / 1_000_000;
         (hit ? ytCacheHits : ytCacheMisses).incrementAndGet();
         long tot = ytCacheHits.get() + ytCacheMisses.get();
