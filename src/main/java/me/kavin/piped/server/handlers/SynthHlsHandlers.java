@@ -75,11 +75,14 @@ public class SynthHlsHandlers {
         int mediaStart = stream.indexEnd + 1;
         long mediaLen = stream.contentLength - mediaStart;
         double dur = (double) durationSeconds;
-        String segUrl = rewriteToYtProxy(stream.url);
+        // THE SPLIT: stamp a FRESH single-use cpn into the (possibly long-cached)
+        // URL for THIS play, so the long resolve cache stays throttle-safe.
+        String freshUrl = swapCpn(stream.url);
+        String segUrl = rewriteToYtProxy(freshUrl);
 
         SidxParserJava.Data sidx = null;
         if (stream.indexStart > 0 && stream.indexEnd > stream.indexStart) {
-            sidx = SidxParserJava.fetch(stream.url, stream.indexStart, stream.indexEnd, YOUTUBE_COOKIES);
+            sidx = SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, YOUTUBE_COOKIES);
         }
 
         StringBuilder sb = new StringBuilder();
@@ -152,13 +155,40 @@ public class SynthHlsHandlers {
     // hits for the same video + caps concurrent YT load) — just de-pinned.
     private static final java.util.concurrent.locks.ReentrantLock resolveLock =
             new java.util.concurrent.locks.ReentrantLock();
-    // 10s — DELIBERATELY short: a longer TTL reuses the same cpn (client
-    // playback nonce) across separate plays, which googlevideo per-IP throttles
-    // (single-use-cpn). A 5min experiment (2026-05-29) correlated with a
-    // server-side resolve-throttle and was reverted. A safe pre-warm needs a
-    // SPLIT — cache the stable master METADATA long, but resolve FRESH cpn
-    // segment URLs per play — not a blanket TTL bump.
-    private static final long CACHE_TTL_MS = 10_000L;
+    // THE SPLIT (2026-06-06): cache the expensive resolve (poToken + player-
+    // response + nsig + signed URLs, valid ~5h via the `expire` param) for a long
+    // TTL, but stamp a FRESH cpn into every served segment URL per play
+    // (swapCpn() in streamPlaylist). This is what makes a long TTL safe: the
+    // 2026-05-29 5min-bump outage reused the SAME cpn across plays → googlevideo
+    // single-use-cpn throttle → resolve-hang. The cpn is NOT in the URL's signed
+    // params (sparams), so swapping it keeps the signature valid (verified
+    // 2026-06-06: swapped-cpn fetch returns 206). Fresh cpn per play = single-use
+    // = no reuse-throttle. Result: the master HITs this cache (no 1.4s re-resolve
+    // = the cold-tap win) while segment URLs stay throttle-safe.
+    // Env-overridable for instant revert without a rebuild (set 10000 to disable).
+    private static final long CACHE_TTL_MS = envLong("SYNTH_RESOLVE_TTL_MS", 300_000L);
+
+    private static long envLong(String k, long def) {
+        try { String v = System.getenv(k); return v == null || v.isEmpty() ? def : Long.parseLong(v.trim()); }
+        catch (Exception e) { return def; }
+    }
+
+    // swapCpn replaces the cpn= tracking nonce in a googlevideo URL with a fresh
+    // 16-char one, so a long-cached (cpn-stamped) URL becomes single-use per play.
+    // cpn is not signature-covered (see THE SPLIT above), so this is safe.
+    private static final java.security.SecureRandom CPN_RNG = new java.security.SecureRandom();
+    private static final char[] CPN_ALPHABET =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
+    static String freshCpn() {
+        char[] c = new char[16];
+        for (int i = 0; i < 16; i++) c[i] = CPN_ALPHABET[CPN_RNG.nextInt(CPN_ALPHABET.length)];
+        return new String(c);
+    }
+    static String swapCpn(String url) {
+        if (url == null) return null;
+        // cpn is 16 URL-safe chars; replace the value, keep everything else.
+        return url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1" + freshCpn());
+    }
 
     private static class CacheEntry {
         final Streams streams;
@@ -178,11 +208,67 @@ public class SynthHlsHandlers {
     /// only the common scroll-prefetch → tap window benefits; longer gaps just
     /// re-resolve as before.
     public static void cacheStreams(String videoId, Streams s, boolean urlsVerified) {
+        cacheStreams(videoId, s, urlsVerified, false);
+    }
+
+    public static void cacheStreams(String videoId, Streams s, boolean urlsVerified, boolean syncWarm) {
         if (videoId != null && s != null
                 && s.videoStreams != null && !s.videoStreams.isEmpty()
                 && s.audioStreams != null && !s.audioStreams.isEmpty()) {
             streamsCache.put(videoId, new CacheEntry(s, urlsVerified));
+            // Lever #2: warm the sidx index for the streams mpv opens at tap
+            // (audio + video0) DURING this prefetch, so the variant serve at tap is a
+            // SidxParserJava cache HIT instead of a ~270ms googlevideo round-trip each.
+            // syncWarm=true (the /streams?light prefetch path): BLOCK until the sidx is
+            // cached, so the prefetch returns only once the tap is guaranteed a HIT.
+            // The warm runs OFF the cold-tap critical path (it's the prefetch), and the
+            // async fire-and-forget variant lost the race under fast light-prefetch
+            // (tap arrived before the warm finished). syncWarm=false keeps the old
+            // async behavior for non-prefetch callers.
+            if (urlsVerified) warmSidx(s, syncWarm);
         }
+    }
+
+    // Bounded, daemon: caps concurrent sidx warm-fetches so a broad feed prefetch
+    // can't spawn unbounded threads; excess queues and runs as slots free.
+    private static final java.util.concurrent.ExecutorService SIDX_WARM_POOL =
+            java.util.concurrent.Executors.newFixedThreadPool(4, r -> {
+                Thread t = new Thread(r, "sidx-warm");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /// Pre-fetch the sidx index (cpn-independent, cached) for the audio + first
+    /// video variant — exactly the two playlists mpv opens on a cold tap. The
+    /// cache key is cpn-stripped, so warming with the resolve's own URL produces
+    /// the same key the tap-time swapCpn'd fetch looks up → HIT.
+    private static void warmSidx(Streams s, boolean sync) {
+        try {
+            final java.util.List<java.util.concurrent.Future<?>> fs = new ArrayList<>();
+            List<PipedStream> videos = pickedVideoStreams(s);
+            if (!videos.isEmpty()) { var f = warmOne(videos.get(0)); if (f != null) fs.add(f); }
+            var fa = warmOne(pickedAudioStream(s)); if (fa != null) fs.add(fa);
+            if (sync) {
+                // Block until both sidx fetches are cached (audio + video0 run on the
+                // pool concurrently). Bounded so a hung googlevideo can't stall the
+                // prefetch forever; SidxParser has its own timeout+retry underneath.
+                for (var f : fs) {
+                    try { f.get(4, java.util.concurrent.TimeUnit.SECONDS); }
+                    catch (Exception ignored) { /* best-effort; tap falls back to cold fetch */ }
+                }
+            }
+        } catch (Exception ignored) { /* best-effort */ }
+    }
+
+    private static java.util.concurrent.Future<?> warmOne(PipedStream stream) {
+        if (stream == null || stream.url == null) return null;
+        if (!(stream.indexStart > 0 && stream.indexEnd > stream.indexStart)) return null;
+        final String url = stream.url;
+        final int is = stream.indexStart, ie = stream.indexEnd;
+        return SIDX_WARM_POOL.submit(() -> {
+            try { SidxParserJava.fetch(url, is, ie, YOUTUBE_COOKIES); }
+            catch (Throwable ignored) { /* best-effort warm */ }
+        });
     }
 
     /// Default to verified URLs — used by the segment-serving paths.

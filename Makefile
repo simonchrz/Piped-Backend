@@ -18,7 +18,8 @@ LIBS_JAR    := libs/NewPipeExtractor-patched.jar
 deploy: jar backend restart
 
 jar:
-	cd $(NEWPIPE_DIR) && docker run --rm -v "$$PWD":/app -w /app eclipse-temurin:21-jdk \
+	@mkdir -p $(HOME)/.gradle-docker-cache
+	cd $(NEWPIPE_DIR) && docker run --rm -v "$$PWD":/app -w /app -v $(HOME)/.gradle-docker-cache:/root/.gradle eclipse-temurin:21-jdk \
 		bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null && \
 		         git config --global --add safe.directory /app && \
 		         ./gradlew :extractor:jar -x test --console=plain --no-daemon --no-configuration-cache"

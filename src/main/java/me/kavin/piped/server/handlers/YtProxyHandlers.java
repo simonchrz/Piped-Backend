@@ -66,6 +66,16 @@ public class YtProxyHandlers {
     /// downloader keeps running to complete the full-file cache for next time.
     private static final long SEEK_AHEAD_MARGIN = 16L * 1024 * 1024;
 
+    /// Bounded read-ahead: the downloader pauses once it is this far AHEAD of the
+    /// client's furthest requested byte, instead of eagerly racing to the end of the
+    /// file. Stops a video the user has moved on from (mpv no longer requesting)
+    /// from hogging Pi bandwidth and starving the next tap's first segment.
+    private static final long READAHEAD_MARGIN_BYTES = 12L * 1024 * 1024;
+    /// If the client requests nothing for this long while the downloader is paused
+    /// at the read-ahead cap, treat the stream as abandoned (mpv switched videos)
+    /// and abort the downloader entirely.
+    private static final long ABANDON_IDLE_MS = 10_000;
+
     /// (videoId + "_" + itag) → active StreamSession.
     private static final ConcurrentHashMap<String, StreamSession> SESSIONS = new ConcurrentHashMap<>();
 
@@ -213,6 +223,9 @@ public class YtProxyHandlers {
             // direct fetch failed → fall through to the blocking path below.
         }
 
+        // Record the client's interest so the downloader keeps ~READAHEAD_MARGIN ahead
+        // of here (and doesn't abort this as abandoned while we're actively pulling).
+        sess.noteClientRequest(end);
         long waitStart = System.nanoTime();
         try { sess.waitUntilDownloaded(end, DOWNLOAD_WAIT_MS); }
         catch (Exception e) { return HttpResponse.ofCode(504).withBody(("yt-proxy: range wait: " + e.getMessage()).getBytes()); }
@@ -319,6 +332,27 @@ public class YtProxyHandlers {
 
     private static final long DL_CHUNK_BYTES = 8L * 1024 * 1024; // bounded range chunk
 
+    // Segment-fetch stall-proofing (analogous to the sidx fix). The read timeout
+    // bounds socket INACTIVITY, not transfer time (read() returns as soon as any
+    // bytes arrive), so a slow-but-flowing stream is fine — only a true stall (no
+    // bytes for ~2.5s) trips it. On a stall, retry with a fresh cpn + new
+    // connection: a transient googlevideo range-stall (saw 5-15s cold-tap hangs)
+    // is usually one slow edge; a new attempt routes around it. cpn-agnostic
+    // cache key + verified-safe fresh-cpn segments => no throttle risk.
+    private static final int SEG_CONNECT_TIMEOUT_MS = 2000;
+    private static final int SEG_READ_TIMEOUT_MS = 2500;
+    private static final int SEG_MAX_STALLS = 3; // consecutive zero-progress attempts before giving up
+    private static final java.security.SecureRandom SEG_CPN_RNG = new java.security.SecureRandom();
+    private static final char[] SEG_CPN_ALPHA =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
+
+    private static String swapCpn(String url) {
+        if (url == null) return null;
+        char[] c = new char[16];
+        for (int i = 0; i < 16; i++) c[i] = SEG_CPN_ALPHA[SEG_CPN_RNG.nextInt(SEG_CPN_ALPHA.length)];
+        return url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1" + new String(c));
+    }
+
     private static void startDownloader(StreamSession sess) {
         Thread t = new Thread(() -> {
             try (RandomAccessFile raf = new RandomAccessFile(sess.tmpPath.toFile(), "rw")) {
@@ -333,55 +367,105 @@ public class YtProxyHandlers {
                 // throttled to ~31 KB/s (anti-download). Range requests on the same
                 // cpn are NOT rate-limited (verified). See project memory
                 // googlevideo_throttle_noRange_not_cpn.
+                int consecutiveStalls = 0;
                 while (total < 0 || offset < total) {
+                    // Bounded read-ahead: pause once we're READAHEAD_MARGIN past the
+                    // client's furthest request; resume when it advances. If the client
+                    // goes idle while paused (mpv switched to another video), abort so
+                    // this abandoned stream stops hogging bandwidth for the next tap.
+                    synchronized (sess.lock) {
+                        while (offset > sess.lastRequestedEnd + READAHEAD_MARGIN_BYTES) {
+                            long idle = System.currentTimeMillis() - sess.lastRequestTimeMs;
+                            if (idle > ABANDON_IDLE_MS) {
+                                System.out.println("[YtProxy] " + sess.key + " abandoned (client idle "
+                                        + idle + "ms, fill@" + offset + "/" + total + ") — abort read-ahead");
+                                sess.failed = true;
+                                sess.lock.notifyAll();
+                                SESSIONS.remove(sess.key, sess);
+                                try { Files.deleteIfExists(sess.tmpPath); } catch (Exception ignored) {}
+                                return;
+                            }
+                            // Fixed 1s poll: re-check idle every second. (NOT
+                            // wait(ABANDON_IDLE_MS-idle) — that lands on wait(0) at the
+                            // boundary, which blocks forever with no client to notify.)
+                            try { sess.lock.wait(1000); }
+                            catch (InterruptedException ie) { return; }
+                        }
+                    }
                     long chunkEnd = (total < 0) ? offset + DL_CHUNK_BYTES - 1
                                                 : Math.min(offset + DL_CHUNK_BYTES - 1, total - 1);
-                    HttpURLConnection conn = (HttpURLConnection) new URL(sess.targetUrl).openConnection();
+                    final long before = offset;
+                    // First try the original cpn; on a stall, fresh cpn + new connection.
+                    final String url = consecutiveStalls == 0 ? sess.targetUrl : swapCpn(sess.targetUrl);
+                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
                     try {
                         conn.setRequestMethod("GET");
                         conn.setInstanceFollowRedirects(true);
-                        conn.setConnectTimeout(10_000);
-                        conn.setReadTimeout(30_000);
+                        conn.setConnectTimeout(SEG_CONNECT_TIMEOUT_MS);
+                        conn.setReadTimeout(SEG_READ_TIMEOUT_MS);
                         conn.setRequestProperty("User-Agent", CHROME_UA);
                         if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
                         conn.setRequestProperty("Range", "bytes=" + offset + "-" + chunkEnd);
                         int code = conn.getResponseCode();
-                        if (code != 206 && code != 200) {
+                        if (code == 403) {
+                            // Real reject (not a stall) -> don't retry; trigger the 302 fallback.
                             String errBody = "";
                             try {
                                 java.io.InputStream es = conn.getErrorStream();
                                 if (es != null) errBody = new String(es.readAllBytes(), 0,
                                         Math.min(200, es.available() > 0 ? es.available() : 200));
                             } catch (Exception ignored) {}
-                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code + " body=" + errBody);
-                            if (code == 403) sess.upstream403 = true;
+                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP 403 body=" + errBody);
+                            sess.upstream403 = true;
                             fail(sess);
                             return;
                         }
-                        if (total < 0) {
-                            total = parseUpstreamTotal(conn);
-                            if (total < 0) { fail(sess); return; }
-                            synchronized (sess.lock) {
-                                sess.totalLength = total;
-                                sess.lock.notifyAll();
-                            }
-                        }
-                        try (InputStream is = conn.getInputStream()) {
-                            byte[] buf = new byte[READ_BUF];
-                            int n;
-                            while ((n = is.read(buf)) > 0) {
-                                raf.write(buf, 0, n);
-                                offset += n;
-                                long now = sess.downloadedBytes.addAndGet(n);
-                                if (now - lastNotify >= READ_BUF) {
-                                    synchronized (sess.lock) { sess.lock.notifyAll(); }
-                                    lastNotify = now;
+                        if (code != 206 && code != 200) {
+                            // Transient upstream error -> count as a stall, retry below.
+                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code
+                                    + " (stall " + (consecutiveStalls + 1) + "/" + SEG_MAX_STALLS + ")");
+                        } else {
+                            if (total < 0) {
+                                total = parseUpstreamTotal(conn);
+                                if (total < 0) { fail(sess); return; }
+                                synchronized (sess.lock) {
+                                    sess.totalLength = total;
+                                    sess.lock.notifyAll();
                                 }
                             }
+                            try (InputStream is = conn.getInputStream()) {
+                                byte[] buf = new byte[READ_BUF];
+                                int n;
+                                while ((n = is.read(buf)) > 0) {
+                                    raf.write(buf, 0, n);
+                                    offset += n;
+                                    long now = sess.downloadedBytes.addAndGet(n);
+                                    if (now - lastNotify >= READ_BUF) {
+                                        synchronized (sess.lock) { sess.lock.notifyAll(); }
+                                        lastNotify = now;
+                                    }
+                                }
+                            }
+                            if (code == 200) break; // server ignored Range, whole file already read
                         }
-                        if (code == 200) break; // server ignored Range, whole file already read
+                    } catch (IOException e) {
+                        // Stall/timeout mid-fetch. Any partial bytes already advanced
+                        // `offset`; the next attempt resumes from there (bytes=offset-...).
+                        System.out.println("[YtProxy] " + sess.key + " range stall at offset " + offset
+                                + " (" + e.getClass().getSimpleName() + ", stall "
+                                + (consecutiveStalls + 1) + "/" + SEG_MAX_STALLS + ")");
                     } finally {
                         conn.disconnect();
+                    }
+                    // Progress resets the stall budget; pure no-progress attempts count
+                    // down. A moving stream never hits the cap (bounded ~2.5s per stall).
+                    if (offset > before) {
+                        consecutiveStalls = 0;
+                    } else if (++consecutiveStalls >= SEG_MAX_STALLS) {
+                        System.out.println("[YtProxy] " + sess.key + " gave up after " + SEG_MAX_STALLS
+                                + " stalls at offset " + offset);
+                        fail(sess);
+                        return;
                     }
                 }
                 Files.move(sess.tmpPath, sess.finalPath, StandardCopyOption.REPLACE_EXISTING);
@@ -436,12 +520,27 @@ public class YtProxyHandlers {
         final AtomicLong downloadedBytes = new AtomicLong(0);
         final Object lock = new Object();
         volatile Thread downloader;
+        // Furthest byte the client has requested + when it last asked — drives the
+        // bounded read-ahead + abandoned-abort in the downloader loop.
+        volatile long lastRequestedEnd = 0;
+        volatile long lastRequestTimeMs;
 
         StreamSession(String key, Path tmpPath, Path finalPath, String targetUrl) {
             this.key = key;
             this.tmpPath = tmpPath;
             this.finalPath = finalPath;
             this.targetUrl = targetUrl;
+            this.lastRequestTimeMs = System.currentTimeMillis();
+        }
+
+        // Called on each client range request: advance the read-ahead target and
+        // wake the (possibly paused) downloader so it keeps ~READAHEAD_MARGIN ahead.
+        void noteClientRequest(long endByte) {
+            synchronized (lock) {
+                if (endByte > lastRequestedEnd) lastRequestedEnd = endByte;
+                lastRequestTimeMs = System.currentTimeMillis();
+                lock.notifyAll();
+            }
         }
 
         void waitUntilHeadersReady(long timeoutMs) throws InterruptedException, IOException {

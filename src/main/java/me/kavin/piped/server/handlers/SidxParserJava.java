@@ -32,20 +32,72 @@ public class SidxParserJava {
     private static final String CHROME_UA =
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+    /// Cache key for a sidx fetch. The sidx (segment index box) is intrinsic to
+    /// the video+itag+byte-range and does NOT depend on the cpn. But SynthHls
+    /// swaps a fresh cpn into the URL per play (swapCpn, throttle-safety) — so
+    /// keying on the raw URL would MISS on every play and re-fetch the index from
+    /// googlevideo. Strip the cpn so the index is reused across plays / prefetch.
+    private static String cacheKey(String url, int start, int end) {
+        String stable = url == null ? "" : url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1X");
+        return stable + "#" + start + "-" + end;
+    }
+
+    // Aggressive per-attempt timeouts: these bound socket INACTIVITY, not total
+    // transfer time (readAllBytes streams; a slow-but-steady large sidx keeps
+    // resetting the read clock). So they catch a transient googlevideo STALL
+    // (saw a single 14172ms fetch) without cutting legit large fetches short.
+    private static final int SIDX_CONNECT_TIMEOUT_MS = 1500;
+    private static final int SIDX_READ_TIMEOUT_MS = 2000;
+    private static final int SIDX_MAX_ATTEMPTS = 3;
+
     /// Fetch + parse sidx for given url at byte range [start, end] (inclusive).
-    /// Resolves nested sidx-chains recursively.
+    /// Resolves nested sidx-chains recursively. Short timeout + fast retry so a
+    /// transient googlevideo range-stall costs ~2s + a retry, not ~14s — the
+    /// prewarm only MOVES the sidx fetch, it doesn't make it stall-proof, so the
+    /// stall-proofing lives here (shared by prewarm AND tap path).
     public static Data fetch(String url, int start, int end, String cookies) {
-        String key = url + "#" + start + "-" + end;
+        String key = cacheKey(url, start, end);
         Data hit = CACHE.get(key);
-        if (hit != null) return hit;
+        if (hit != null) {
+            System.out.println("[SidxCache] HIT itag=" + itagOf(url) + " range=" + start + "-" + end);
+            return hit;
+        }
+        long t0 = System.currentTimeMillis();
+        for (int attempt = 1; attempt <= SIDX_MAX_ATTEMPTS; attempt++) {
+            // On retry, swap the cpn nonce + open a fresh connection — a transient
+            // stall is usually a single slow googlevideo edge/connection; a new
+            // attempt routes around it. sidx is cpn-independent, so the swapped
+            // url resolves to the same cache key.
+            String attemptUrl = attempt == 1 ? url : swapCpn(url);
+            long a0 = System.currentTimeMillis();
+            Data out = fetchOnce(attemptUrl, start, end, cookies);
+            if (out != null) {
+                CACHE.put(key, out);
+                System.out.println("[SidxCache] MISS itag=" + itagOf(url) + " range=" + start + "-" + end
+                        + " fetchMs=" + (System.currentTimeMillis() - t0) + " entries=" + out.entries.size()
+                        + (attempt > 1 ? " attempts=" + attempt : ""));
+                return out;
+            }
+            System.out.println("[SidxCache] RETRY itag=" + itagOf(url) + " range=" + start + "-" + end
+                    + " attempt=" + attempt + " ms=" + (System.currentTimeMillis() - a0));
+        }
+        System.out.println("[SidxCache] GIVEUP itag=" + itagOf(url) + " range=" + start + "-" + end
+                + " fetchMs=" + (System.currentTimeMillis() - t0));
+        return null;
+    }
+
+    /// One network attempt. Returns null on timeout / non-2xx / parse-fail so the
+    /// caller retries. Nested index chains recurse through the public fetch (each
+    /// gets its own retry + cache). Does NOT cache — the outer fetch does.
+    private static Data fetchOnce(String url, int start, int end, String cookies) {
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setRequestMethod("GET");
             conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
             conn.setRequestProperty("User-Agent", CHROME_UA);
             if (cookies != null) conn.setRequestProperty("Cookie", cookies);
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(15000);
+            conn.setConnectTimeout(SIDX_CONNECT_TIMEOUT_MS);
+            conn.setReadTimeout(SIDX_READ_TIMEOUT_MS);
             int code = conn.getResponseCode();
             if (code != 200 && code != 206) {
                 conn.disconnect();
@@ -71,12 +123,29 @@ public class SidxParserJava {
                 }
                 cursor += e.byteSize;
             }
-            Data out = new Data(top.timescale, top.firstOffset, flat);
-            CACHE.put(key, out);
-            return out;
+            return new Data(top.timescale, top.firstOffset, flat);
         } catch (IOException e) {
             return null;
         }
+    }
+
+    private static final java.security.SecureRandom CPN_RNG = new java.security.SecureRandom();
+    private static final char[] CPN_ALPHA =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
+
+    /// Swap the cpn tracking nonce for a fresh one (cpn ∉ signed sparams, so the
+    /// URL stays valid). Used only on retry to dodge a per-connection stall.
+    private static String swapCpn(String url) {
+        if (url == null) return null;
+        char[] c = new char[16];
+        for (int i = 0; i < 16; i++) c[i] = CPN_ALPHA[CPN_RNG.nextInt(CPN_ALPHA.length)];
+        return url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1" + new String(c));
+    }
+
+    private static String itagOf(String url) {
+        if (url == null) return "?";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("[?&]itag=([0-9]+)").matcher(url);
+        return m.find() ? m.group(1) : "?";
     }
 
     private static class RawEntry {

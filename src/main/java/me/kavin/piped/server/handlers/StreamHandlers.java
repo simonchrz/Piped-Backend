@@ -47,28 +47,85 @@ import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper
 import static org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper.prepareDesktopJsonBuilder;
 
 public class StreamHandlers {
+    // videoIds known (from a prior resolve) to return audio=0 from ANDROID and need
+    // the WebEmbed fallback (ARD/WDR-OER uploads). A re-resolve of such a videoId
+    // skips the ANDROID detection attempt and goes straight to WebEmbed (~1s saved).
+    // NOTE: keyed by videoId, not channel — channelId is only known AFTER a resolve,
+    // and /streams carries only the videoId, so this helps re-resolves/re-prefetches
+    // of the SAME video, not first-resolves of new videos from a known-OER channel.
+    private static final java.util.Set<String> KNOWN_AUDIO_ZERO =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     public static byte[] streamsResponse(String videoId) throws Exception {
+        return streamsResponse(videoId, false);
+    }
+
+    // light=true (/streams?light=1): skip the ~900ms /next call (related videos +
+    // chapters + metaInfo) for the cold-tap playback path. relatedStreams come back
+    // empty; the app loads them lazily after playback start. ageLimit stays correct
+    // (microformat isFamilySafe, not /next — see YoutubeStreamExtractor.getAgeLimit).
+    public static byte[] streamsResponse(String videoId, boolean light) throws Exception {
 
         Sentry.setExtra("videoId", videoId);
 
         final var futureStream = Multithreading.supplyAsync(() -> {
             Sentry.setExtra("videoId", videoId);
             ITransaction transaction = Sentry.startTransaction("StreamInfo fetch", "fetch");
+            if (light) YoutubeStreamExtractor.SKIP_NEXT_FOR_THREAD.set(Boolean.TRUE);
             try {
+                final long tResolve0 = System.currentTimeMillis();
+                StreamInfo info = null;
+
+                // C: known-audio=0 (OER) videoId from a prior resolve → skip the ANDROID
+                // detection attempt and resolve directly via WebEmbed (~1s saved). If it
+                // doesn't come back healthy, the marker is stale → drop it + fall through.
+                if (KNOWN_AUDIO_ZERO.contains(videoId)) {
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                    try {
+                        StreamInfo we = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                        if (we != null && !we.getAudioStreams().isEmpty()
+                                && (!we.getVideoStreams().isEmpty() || !we.getVideoOnlyStreams().isEmpty())) {
+                            info = we;
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " known-audio0 -> direct WebEmbed HIT (skipped ANDROID)");
+                        } else {
+                            KNOWN_AUDIO_ZERO.remove(videoId);
+                        }
+                    } catch (Exception e) {
+                        KNOWN_AUDIO_ZERO.remove(videoId);
+                    } finally {
+                        YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                    }
+                }
+
                 // NPE returns degraded streams (1 muxed video, 0 audio) non-deterministically
                 // for some videos. Up to 3 attempts; accept the first that has both audio
                 // and video. Same retry-on-degraded pattern as SynthHlsHandlers.fetchStreams.
-                StreamInfo info = null;
-                for (int attempt = 0; attempt < 3; attempt++) {
-                    info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
-                    if (info != null && !info.getAudioStreams().isEmpty()
-                            && (!info.getVideoStreams().isEmpty() || !info.getVideoOnlyStreams().isEmpty())) {
-                        break;
+                if (info == null) {
+                    for (int attempt = 0; attempt < 3; attempt++) {
+                        info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                        final boolean hasAudio = info != null && !info.getAudioStreams().isEmpty();
+                        final boolean hasVideo = info != null && (!info.getVideoStreams().isEmpty()
+                                || !info.getVideoOnlyStreams().isEmpty());
+                        if (hasAudio && hasVideo) {
+                            break;                       // healthy
+                        }
+                        // audio=0 is the deterministic ARD/WDR-OER signature: the ANDROID
+                        // client returns 0 adaptive audio for those uploads, so retrying
+                        // ANDROID can NEVER add audio — only the WebEmbed fallback below
+                        // can (verified). Break after ONE attempt instead of burning 2
+                        // more ~1s resolves (OER cold-resolve was ~4-7s). Transient null /
+                        // video=0 (genuinely non-deterministic) keep the full retry budget.
+                        if (info != null && !hasAudio) {
+                            System.out.println("[StreamHandlers] " + videoId + " attempt " + (attempt + 1)
+                                    + " audio=0 (OER signature) -> skip ANDROID retries, straight to WebEmbed");
+                            break;
+                        }
+                        System.out.println("[StreamHandlers] " + videoId + " attempt " + (attempt + 1)
+                                + " degraded (audio=" + (info == null ? -1 : info.getAudioStreams().size())
+                                + " video=" + (info == null ? -1 : info.getVideoStreams().size())
+                                + " videoOnly=" + (info == null ? -1 : info.getVideoOnlyStreams().size()) + "), retrying");
                     }
-                    System.out.println("[StreamHandlers] " + videoId + " attempt " + (attempt + 1)
-                            + " degraded (audio=" + (info == null ? -1 : info.getAudioStreams().size())
-                            + " video=" + (info == null ? -1 : info.getVideoStreams().size())
-                            + " videoOnly=" + (info == null ? -1 : info.getVideoOnlyStreams().size()) + "), retrying");
                 }
 
                 // Throttle-Check: ANDROID-URLs werden von googlevideo per-IP-
@@ -99,6 +156,7 @@ public class StreamHandlers {
                                 && (!retryInfo.getVideoStreams().isEmpty()
                                     || !retryInfo.getVideoOnlyStreams().isEmpty())) {
                             info = retryInfo;
+                            if (degraded) KNOWN_AUDIO_ZERO.add(videoId); // remember for next re-resolve
                             System.out.println("[StreamHandlers] " + videoId + " WebEmbed-retry success (audio="
                                 + info.getAudioStreams().size() + " video="
                                 + info.getVideoStreams().size() + " videoOnly="
@@ -112,6 +170,9 @@ public class StreamHandlers {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
                 }
+                System.out.println("[NPE-timing] " + videoId + " total-resolve "
+                        + (System.currentTimeMillis() - tResolve0) + "ms"
+                        + " (nsig/post = total - max(VR,ANDROID) from the [NPE-timing] fetch lines)");
                 return info;
             } catch (Exception e) {
                 if (e instanceof GeographicRestrictionException) {
@@ -120,6 +181,7 @@ public class StreamHandlers {
                 transaction.setThrowable(e);
                 ExceptionUtils.rethrow(e);
             } finally {
+                if (light) YoutubeStreamExtractor.SKIP_NEXT_FOR_THREAD.remove();
                 transaction.finish();
             }
             return null;
@@ -315,7 +377,7 @@ public class StreamHandlers {
         // 2nd YouTube resolve (~1.2s saved on a cold tap, no extra YT load).
         // `info` is already throttle-checked + WebEmbed-upgraded above, so the
         // collected streams are URL-verified.
-        SynthHlsHandlers.cacheStreams(videoId, streams, true);
+        SynthHlsHandlers.cacheStreams(videoId, streams, true, light);
 
         String lbryURL = null;
 

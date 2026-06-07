@@ -55,7 +55,8 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
     private static final Semaphore YT_RESOLVE_LIMITER =
             new Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
 
-    /** tryAcquire a resolve slot (500ms), false on saturation/interrupt. */
+    /** tryAcquire a resolve slot (500ms), false on saturation/interrupt.
+     *  FOREGROUND path (tap / playback): may use any of the slots. */
     private static boolean ytResolveAcquire() {
         try {
             return YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS);
@@ -63,6 +64,35 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
             Thread.currentThread().interrupt();
             return false;
         }
+    }
+
+    // Background (prefetch) resolves must additionally hold YT_BG_LIMITER, which is
+    // sized to leave ≥1 of the YT_RESOLVE_LIMITER slots ALWAYS free for a foreground
+    // tap. Without this, a burst of ~4 prefetch-resolves/tap filled both slots and the
+    // tap-resolve waited ~850ms median in the queue (app-dev correlation 2026-06-07).
+    private static final Semaphore YT_BG_LIMITER =
+            new Semaphore(Math.max(1, (Math.max(2, Runtime.getRuntime().availableProcessors() / 2)) - 1));
+
+    /** Background prefetch resolve slot: hold the bg permit (caps bg concurrency so a
+     *  foreground slot stays reserved) AND a main slot. 503 on saturation = fine for
+     *  best-effort prefetch. */
+    private static boolean ytResolveAcquireBackground() {
+        try {
+            if (!YT_BG_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS)) return false;
+            if (!YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS)) {
+                YT_BG_LIMITER.release();
+                return false;
+            }
+            return true;
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private static void ytResolveReleaseBackground() {
+        YT_RESOLVE_LIMITER.release();
+        YT_BG_LIMITER.release();
     }
 
     // Total per-resolve deadline. A throttled resolve otherwise stacks
@@ -172,16 +202,21 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         return getErrorResponse(e, request.getPath());
                     }
                 })).map(GET, "/streams/:videoId", AsyncServlet.ofBlocking(executor, request -> {
-                    if (!ytResolveAcquire())
+                    // priority=1 = foreground (tap): full pool. Otherwise background
+                    // (prefetch): capped so a foreground slot stays reserved.
+                    final boolean priority = "1".equals(request.getQueryParameter("priority"));
+                    if (priority ? !ytResolveAcquire() : !ytResolveAcquireBackground())
                         return io.activej.http.HttpResponse.ofCode(503);
                     try {
                         return getJsonResponse(withResolveBudget(
-                                () -> StreamHandlers.streamsResponse(request.getPathParameter("videoId"))),
+                                () -> StreamHandlers.streamsResponse(request.getPathParameter("videoId"),
+                                        "1".equals(request.getQueryParameter("light")))),
                                 "public, s-maxage=21540, max-age=30", true);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     } finally {
-                        YT_RESOLVE_LIMITER.release();
+                        if (priority) YT_RESOLVE_LIMITER.release();
+                        else ytResolveReleaseBackground();
                     }
                 })).map(GET, "/synth-hls/:videoId/:filename", AsyncServlet.ofBlocking(executor, request -> {
                     if (!ytResolveAcquire())
