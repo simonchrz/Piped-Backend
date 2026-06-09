@@ -23,6 +23,63 @@ public class DownloaderImpl extends Downloader {
 
     // Custom: YouTube cookies loaded from /app/youtube-cookies.txt at startup
     private static final String YOUTUBE_COOKIES = loadYoutubeCookies();
+    // SAPISID for the TVHTML5 (TV) client's SAPISIDHASH Authorization header.
+    // The TV client requires real account auth (not just the Cookie header) or
+    // YouTube bot-walls it (LOGIN_REQUIRED). WEB_EMBEDDED is cookie-only, so this
+    // is scoped to TVHTML5 (Cobalt UA) requests below.
+    private static final String SAPISID = cookieVal(YOUTUBE_COOKIES, "SAPISID");
+    private static final String SAPISID_1P = cookieVal(YOUTUBE_COOKIES, "__Secure-1PAPISID");
+    private static final String SAPISID_3P = cookieVal(YOUTUBE_COOKIES, "__Secure-3PAPISID");
+
+    private static String cookieVal(String cookieStr, String want) {
+        if (cookieStr == null) return null;
+        for (String c : cookieStr.split("; ")) {
+            int eq = c.indexOf('=');
+            if (eq <= 0) continue;
+            if (c.substring(0, eq).equals(want)) return c.substring(eq + 1);
+        }
+        return null;
+    }
+
+    private static String sha1Hex(String in) {
+        try {
+            byte[] dig = java.security.MessageDigest.getInstance("SHA-1")
+                    .digest(in.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(dig.length * 2);
+            for (byte b : dig) hex.append(Character.forDigit((b >> 4) & 0xF, 16))
+                                  .append(Character.forDigit(b & 0xF, 16));
+            return hex.toString();
+        } catch (Exception e) { return null; }
+    }
+
+    /// Combined SID Authorization header, replicating yt-dlp's
+    /// _get_sid_authorization_header: one space-joined header with a
+    /// SAPISIDHASH / SAPISID1PHASH / SAPISID3PHASH part per available cookie,
+    /// each "<scheme> <ts>_<sha1(ts + ' ' + sid + ' ' + origin)>". The TV client
+    /// bot-wall only clears with all available parts, not SAPISIDHASH alone.
+    private static String sapisidHashAuth(String userSessionId) {
+        long ts = System.currentTimeMillis() / 1000L;
+        String origin = "https://www.youtube.com";
+        // yt-dlp folds the user session id into each hash as the "u" additional
+        // part: hash over "<usid> <ts> <sid> <origin>" and a trailing "_u".
+        String prefix = userSessionId != null ? userSessionId + " " : "";
+        String suffix = userSessionId != null ? "_u" : "";
+        StringBuilder out = new StringBuilder();
+        String[][] schemes = {
+            {"SAPISIDHASH", SAPISID},
+            {"SAPISID1PHASH", SAPISID_1P},
+            {"SAPISID3PHASH", SAPISID_3P},
+        };
+        for (String[] sc : schemes) {
+            String sid = sc[1];
+            if (sid == null) continue;
+            String h = sha1Hex(prefix + ts + " " + sid + " " + origin);
+            if (h == null) continue;
+            if (out.length() > 0) out.append(' ');
+            out.append(sc[0]).append(' ').append(ts).append('_').append(h).append(suffix);
+        }
+        return out.length() == 0 ? null : out.toString();
+    }
 
     private static String loadYoutubeCookies() {
         String path = System.getenv("YOUTUBE_COOKIES_FILE");
@@ -91,8 +148,29 @@ public class DownloaderImpl extends Downloader {
         // â YouTube prueft Cookie/UA-Konsistenz, Firefox-UA mit Chrome-Cookies = invalid.
         if (YOUTUBE_COOKIES != null) {
             String urlForUa = request.url();
-            if (urlForUa.contains("youtube.com") || urlForUa.contains("googlevideo.com") || urlForUa.contains("ytimg.com")) {
+            // The TVHTML5 (TV/Cobalt) client sets its own Cobalt User-Agent and
+            // YouTube validates clientName<->UA consistency: forcing Chrome here
+            // turns a TVHTML5 request into a mismatch -> LOGIN_REQUIRED bot-wall.
+            // So preserve an already-set Cobalt UA; force Chrome only otherwise.
+            String existingUa = headers.get("User-Agent");
+            boolean isCobaltUa = existingUa != null && existingUa.contains("Cobalt");
+            if (!isCobaltUa
+                    && (urlForUa.contains("youtube.com") || urlForUa.contains("googlevideo.com") || urlForUa.contains("ytimg.com"))) {
                 headers.put("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+            }
+            // TVHTML5 (Cobalt UA) needs SAPISIDHASH account auth, not just the
+            // Cookie header, to clear the TV-client bot-wall. Scoped here so the
+            // cookie-only WEB_EMBEDDED auth posture is unchanged.
+            if (isCobaltUa && urlForUa.contains("youtube.com")
+                    && !headers.containsKey("Authorization")) {
+                // user session id is handed over by the TV helper via this
+                // private header; consume + strip it so it never leaves the box.
+                String userSessionId = headers.remove("X-Yt-Auth-Session");
+                String auth = sapisidHashAuth(userSessionId);
+                if (auth != null) {
+                    headers.put("Authorization", auth);
+                    headers.put("X-Origin", "https://www.youtube.com");
+                }
             }
         }
 

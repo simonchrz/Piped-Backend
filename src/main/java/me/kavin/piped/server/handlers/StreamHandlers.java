@@ -188,15 +188,58 @@ public class StreamHandlers {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
                 }
-                // Final segment-liveness gate. If, after the WebEmbed upgrade, the
-                // served segment URLs are STILL 403 (googlevideo throttle storm),
-                // don't hand the app a 200 with dead URLs (the bug from the audio0
-                // report) — surface a distinct 503 ThrottledResponse so the app shows
-                // "YouTube is rate-limiting" instead of a generic timeout. Scoped to
-                // the suspect path so healthy videos pay no extra probe.
-                if (throttleSuspect && info != null && isVideoStreamThrottled(info)) {
+                boolean testForceThrottle = info != null
+                        && videoId.equals(System.getenv("YT_TEST_FORCE_THROTTLE"));
+                boolean stillThrottled = testForceThrottle
+                        || (throttleSuspect && info != null && isVideoStreamThrottled(info));
+
+                // Storm-fallback: WebEmbed segments are 403, so try the
+                // authenticated TVHTML5 (TV) client. Its URLs carry ratebypass and
+                // survive googlevideo throttle storms that kill WebEmbed's. Only
+                // reached on the suspect path during an actual 403 (or the test env).
+                if (stillThrottled) {
                     System.out.println("[StreamHandlers] " + videoId
-                            + " STILL throttled after WebEmbed upgrade (segments 403) -> 503 throttled");
+                            + " WebEmbed still throttled -> trying authenticated TVHTML5");
+                    // Defensive: clear any WebEmbed force (ThreadLocals persist on
+                    // pooled threads) so the TV resolve is pure TVHTML5 -- otherwise
+                    // audio itags dedupe onto leftover WebEmbed URLs.
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                    YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.set(Boolean.TRUE);
+                    try {
+                        StreamInfo tv = StreamInfo.getInfo(
+                            "https://www.youtube.com/watch?v=" + videoId);
+                        if (tv != null && !tv.getAudioStreams().isEmpty()
+                                && (!tv.getVideoStreams().isEmpty()
+                                    || !tv.getVideoOnlyStreams().isEmpty())) {
+                            // Drop TV-only legacy itags 148/149 (HE-AAC dups of 140)
+                            // that 500 on fetch; keep the standard playable formats.
+                            tv.getAudioStreams().removeIf(a -> a.getItagItem() != null
+                                    && (a.getItagItem().id == 148 || a.getItagItem().id == 149));
+                            if (testForceThrottle || !isVideoStreamThrottled(tv)) {
+                                info = tv;
+                                stillThrottled = false;
+                                System.out.println("[StreamHandlers] " + videoId
+                                        + " TVHTML5 storm-fallback OK (audio="
+                                        + tv.getAudioStreams().size() + " client=TVHTML5)");
+                            } else {
+                                System.out.println("[StreamHandlers] " + videoId
+                                        + " TVHTML5 also throttled");
+                            }
+                        }
+                    } catch (Exception e) {
+                        System.out.println("[StreamHandlers] " + videoId
+                                + " TVHTML5 fallback failed: " + e.getMessage());
+                    } finally {
+                        YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.remove();
+                    }
+                }
+
+                // Final segment-liveness gate: WebEmbed AND TVHTML5 both 403 -> don't
+                // hand the app a 200 with dead URLs; surface a distinct 503 so it can
+                // show "YouTube is rate-limiting" instead of a generic timeout.
+                if (stillThrottled) {
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " STILL throttled after WebEmbed + TVHTML5 (segments 403) -> 503 throttled");
                     ExceptionHandler.throwErrorResponse(new ThrottledResponse(
                             "YouTube is rate-limiting playback for this video (segment URLs return "
                             + "403). Transient googlevideo throttle - try again shortly."));
