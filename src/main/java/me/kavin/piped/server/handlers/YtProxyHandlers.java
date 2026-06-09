@@ -24,6 +24,14 @@ import java.util.concurrent.atomic.AtomicLong;
 /// HTTP proxy for YouTube googlevideo.com URLs with single-connection-per-cpn
 /// streaming cache.
 ///
+/// CORRECTION (2026-06-09): the **Strategy** paragraph below is STALE/WRONG.
+/// The actual downloader (startDownloader) uses sequential BOUNDED Range
+/// chunks (DL_CHUNK_BYTES, same cpn) -- a no-Range full GET is the
+/// anti-download-throttled path (~31 KB/s), Range is full speed (verified
+/// 13.4 MB/s through this handler). See memory googlevideo_throttle_noRange_not_cpn.
+/// The text from here to '// Also handles' describes a design that is no
+/// longer in use; trust the code, not this paragraph.
+///
 /// **Strategy**: one open-ended request to googlevideo per (videoId, itag).
 /// googlevideo streams the entire file in a single 200 OK TCP connection
 /// (no Range header → no per-cpn rate-limit triggered). The downloader thread

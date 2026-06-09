@@ -13,6 +13,7 @@ import me.kavin.piped.utils.obj.federation.FederatedGeoBypassRequest;
 import me.kavin.piped.utils.obj.federation.FederatedGeoBypassResponse;
 import me.kavin.piped.utils.obj.federation.FederatedVideoInfo;
 import me.kavin.piped.utils.resp.InvalidRequestResponse;
+import me.kavin.piped.utils.resp.ThrottledResponse;
 import me.kavin.piped.utils.resp.VideoResolvedResponse;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
@@ -86,6 +87,12 @@ public class StreamHandlers {
                 // detection attempt and resolve directly via WebEmbed (~1s saved). If it
                 // doesn't come back healthy, the marker is stale → drop it + fall through.
                 if (KNOWN_AUDIO_ZERO.contains(videoId)) {
+                    // audio0 fallback: WEB_EMBEDDED is the ONLY client that serves
+                    // audio for these videos (iOS/WEB/TVHTML5 return audio=0/"only
+                    // images"; verified 2026-06-09). The June-09 segment-403s were a
+                    // transient googlevideo throttle storm, not a permanent block, so
+                    // WebEmbed remains the audio0 path. (TVHTML5 was tried and rejected
+                    // by YT: WATCH=bot-gated, EMBED="no longer supported".)
                     YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
                     try {
                         StreamInfo we = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
@@ -150,7 +157,12 @@ public class StreamHandlers {
                 // Ergebnis bleibt audiolos. Der degraded-Pfad short-circuitet den
                 // HEAD-Probe (kein throttle-Check noetig wenn eh schon audio=0).
                 boolean degraded = info != null && info.getAudioStreams().isEmpty();
-                if (info != null && (degraded || isVideoStreamThrottled(info))) {
+                // One HEAD probe decides the suspect path (degraded short-circuits it,
+                // so audio0 videos skip the probe). Healthy videos: exactly this one
+                // probe, same as before; the final liveness gate below only re-probes
+                // when this is true, keeping the extra HEAD off the fast path.
+                boolean throttleSuspect = info != null && (degraded || isVideoStreamThrottled(info));
+                if (throttleSuspect) {
                     System.out.println("[StreamHandlers] " + videoId + " "
                             + (degraded ? "degraded (audio=0)" : "URLs throttled (HEAD=403 auf clen/2)")
                             + ", retry mit force-WebEmbed");
@@ -175,6 +187,19 @@ public class StreamHandlers {
                     } finally {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
+                }
+                // Final segment-liveness gate. If, after the WebEmbed upgrade, the
+                // served segment URLs are STILL 403 (googlevideo throttle storm),
+                // don't hand the app a 200 with dead URLs (the bug from the audio0
+                // report) — surface a distinct 503 ThrottledResponse so the app shows
+                // "YouTube is rate-limiting" instead of a generic timeout. Scoped to
+                // the suspect path so healthy videos pay no extra probe.
+                if (throttleSuspect && info != null && isVideoStreamThrottled(info)) {
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " STILL throttled after WebEmbed upgrade (segments 403) -> 503 throttled");
+                    ExceptionHandler.throwErrorResponse(new ThrottledResponse(
+                            "YouTube is rate-limiting playback for this video (segment URLs return "
+                            + "403). Transient googlevideo throttle - try again shortly."));
                 }
                 System.out.println("[NPE-timing] " + videoId + " total-resolve "
                         + (System.currentTimeMillis() - tResolve0) + "ms"
