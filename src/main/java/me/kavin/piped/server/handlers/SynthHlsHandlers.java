@@ -32,6 +32,7 @@ public class SynthHlsHandlers {
         // FILE_LOADED cost) fast; the variant/audio fetches verify before any
         // segment URL is served.
         Streams streams = fetchStreams(videoId, false);
+        if (isSabrMode(videoId, streams)) return sabrMaster(videoId);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         PipedStream audio = pickedAudioStream(streams);
         if (videos.isEmpty() || audio == null) {
@@ -63,6 +64,7 @@ public class SynthHlsHandlers {
 
     public static byte[] audioPlaylist(String videoId) throws Exception {
         Streams streams = fetchStreams(videoId);
+        if (isSabrMode(videoId, streams)) return sabrStreamPlaylist(videoId, 140);
         PipedStream audio = pickedAudioStream(streams);
         if (audio == null) return "#ERROR".getBytes(StandardCharsets.UTF_8);
         return streamPlaylist(audio, streams.duration);
@@ -74,6 +76,7 @@ public class SynthHlsHandlers {
 
     public static byte[] videoPlaylist(String videoId, int idx, int maxH, String[] codecs) throws Exception {
         Streams streams = fetchStreams(videoId);
+        if (isSabrMode(videoId, streams)) return sabrStreamPlaylist(videoId, 137);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         if (idx < 0 || idx >= videos.size()) return "#ERROR".getBytes(StandardCharsets.UTF_8);
         return streamPlaylist(videos.get(idx), streams.duration);
@@ -134,6 +137,87 @@ public class SynthHlsHandlers {
         }
         sb.append("#EXT-X-ENDLIST");
         return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    // ---- SABR mode: serve the manifest from the local /sabr cache files when a
+    // video has no direct-URL streams (YouTube SABR-only) -- or when forced via
+    // YT_FORCE_SABR for testing. The SABR fmp4 is standard (ftyp/moov/sidx/...),
+    // so the same sidx->HLS byte-range segmentation applies; only the URL and the
+    // box offsets come from the /sabr file instead of the resolved DASH stream.
+
+    private static boolean isSabrMode(String videoId, Streams streams) {
+        if (videoId.equals(System.getenv("YT_FORCE_SABR"))) return true;
+        // Auto: resolve yielded video formats but NONE has a usable URL.
+        if (streams == null || streams.videoStreams == null || streams.videoStreams.isEmpty()) return false;
+        for (PipedStream v : streams.videoStreams) {
+            if (v.url != null && !v.url.isEmpty()) return false;
+        }
+        System.out.println("[ResolvePath] " + videoId + " -> SABR-FALLBACK (no direct video urls)");
+        return true;
+    }
+
+    private static byte[] sabrMaster(String videoId) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+        sb.append("#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Audio\",DEFAULT=YES,AUTOSELECT=YES,URI=\"audio.m3u8\"\n");
+        sb.append("#EXT-X-STREAM-INF:BANDWIDTH=5128000,AVERAGE-BANDWIDTH=5128000,RESOLUTION=1920x1080,FRAME-RATE=30,CODECS=\"avc1.640028,mp4a.40.2\",AUDIO=\"audio\"\n");
+        sb.append("video0.m3u8?maxh=1080&codecs=avc\n");
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
+        final java.nio.file.Path file = me.kavin.piped.utils.sabr.SabrCache.ensureFile(videoId, itag);
+        if (file == null) return "#ERROR: sabr download failed".getBytes(StandardCharsets.UTF_8);
+        final int[] box = scanSabrSidx(file);
+        if (box == null) return "#ERROR: sabr sidx not found".getBytes(StandardCharsets.UTF_8);
+        final int sidxStart = box[0];
+        final int sidxEnd = sidxStart + box[1] - 1;
+        final String segUrl = me.kavin.piped.consts.Constants.PUBLIC_URL + "/sabr/" + videoId + "/" + itag;
+        final String fetchUrl = "http://localhost:" + me.kavin.piped.consts.Constants.PORT + "/sabr/" + videoId + "/" + itag;
+        final SidxParserJava.Data sidx = SidxParserJava.fetch(fetchUrl, sidxStart, sidxEnd, null);
+        if (sidx == null || sidx.entries.isEmpty())
+            return "#ERROR: sabr sidx parse failed".getBytes(StandardCharsets.UTF_8);
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("#EXTM3U\n#EXT-X-VERSION:7\n");
+        int maxSegDur = 0;
+        for (SidxParserJava.Entry e : sidx.entries) {
+            int d = (int) Math.ceil(e.duration);
+            if (d > maxSegDur) maxSegDur = d;
+        }
+        sb.append("#EXT-X-TARGETDURATION:").append(Math.max(maxSegDur, 1)).append('\n');
+        sb.append("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n");
+        // init segment = everything before the sidx box (ftyp + moov) = [0, sidxStart-1]
+        sb.append(String.format("#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%d@%d\"\n", segUrl, sidxStart, 0));
+        long cursor = sidxEnd + 1L + sidx.firstOffset;
+        for (SidxParserJava.Entry e : sidx.entries) {
+            sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
+            sb.append(String.format("#EXT-X-BYTERANGE:%d@%d\n", e.byteSize, cursor));
+            sb.append(segUrl).append('\n');
+            cursor += e.byteSize;
+        }
+        sb.append("#EXT-X-ENDLIST");
+        return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /// Scans the SABR fmp4's top-level boxes for the sidx box; returns {offset, size}.
+    private static int[] scanSabrSidx(java.nio.file.Path file) throws java.io.IOException {
+        final byte[] h = new byte[8192];
+        int got = 0;
+        try (java.io.InputStream is = java.nio.file.Files.newInputStream(file)) {
+            int n;
+            while (got < h.length && (n = is.read(h, got, h.length - got)) > 0) got += n;
+        }
+        int off = 0;
+        while (off + 8 <= got) {
+            final long size = ((h[off] & 0xffL) << 24) | ((h[off + 1] & 0xffL) << 16)
+                    | ((h[off + 2] & 0xffL) << 8) | (h[off + 3] & 0xffL);
+            final String type = new String(h, off + 4, 4, StandardCharsets.ISO_8859_1);
+            if ("sidx".equals(type)) return new int[]{off, (int) size};
+            if (size <= 0 || size > 100_000_000L) break;
+            off += (int) size;
+        }
+        return null;
     }
 
     private static final String YOUTUBE_COOKIES = loadCookies();

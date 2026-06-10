@@ -244,6 +244,7 @@ public class StreamHandlers {
                             "YouTube is rate-limiting playback for this video (segment URLs return "
                             + "403). Transient googlevideo throttle - try again shortly."));
                 }
+                logResolvePath(videoId, info);
                 System.out.println("[NPE-timing] " + videoId + " total-resolve "
                         + (System.currentTimeMillis() - tResolve0) + "ms"
                         + " (nsig/post = total - max(VR,ANDROID) from the [NPE-timing] fetch lines)");
@@ -623,6 +624,31 @@ public class StreamHandlers {
      * Skipt Videos mit contentLength < 10MB (= zu kurz fuer relevanten
      * Throttle-Risk) und Videos ohne erreichbare URL im VideoStream.
      */
+    /// Logs which resolve path/client actually produced the served streams
+    /// (ANDROID_VR / WEB_EMBEDDED_PLAYER / TVHTML5 / ...), or SABR-ONLY when the
+    /// resolve yielded no direct-URL streams at all (= the day YouTube forces
+    /// SABR for this client). One line per resolve for observability.
+    private static void logResolvePath(String videoId, StreamInfo info) {
+        if (info == null) return;
+        String client;
+        try {
+            String url = null;
+            if (!info.getAudioStreams().isEmpty()) url = info.getAudioStreams().get(0).getContent();
+            else if (!info.getVideoStreams().isEmpty()) url = info.getVideoStreams().get(0).getContent();
+            else if (!info.getVideoOnlyStreams().isEmpty()) url = info.getVideoOnlyStreams().get(0).getContent();
+            if (url == null || url.isEmpty()) {
+                client = "SABR-ONLY(no-direct-urls)";
+            } else {
+                java.util.regex.Matcher m = java.util.regex.Pattern
+                        .compile("[?&]c=([A-Z_0-9]+)").matcher(url);
+                client = m.find() ? m.group(1) : "no-c-param";
+            }
+        } catch (Exception e) {
+            client = "err:" + e.getClass().getSimpleName();
+        }
+        System.out.println("[ResolvePath] " + videoId + " -> " + client);
+    }
+
     private static boolean isVideoStreamThrottled(StreamInfo info) {
         if (info == null) return false;
         VideoStream best = null;

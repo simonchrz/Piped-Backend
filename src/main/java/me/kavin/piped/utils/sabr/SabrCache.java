@@ -27,7 +27,10 @@ public final class SabrCache {
     private static final long MAX_CACHE_BYTES = 8L * 1024 * 1024 * 1024; // 8 GB
     private static final ConcurrentHashMap<String, Object> LOCKS = new ConcurrentHashMap<>();
 
-    public static HttpResponse handle(String videoId, int itag, String range, boolean head) throws Exception {
+    /// Ensures the video has been SABR-downloaded (once, per-videoId lock) and
+    /// returns the cached file for the itag, or null if unavailable. Lets the
+    /// synth-hls layer read the file directly (box scan) without an HTTP hop.
+    public static Path ensureFile(String videoId, int itag) throws Exception {
         final Path file = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
         if (!Files.exists(file)) {
             synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
@@ -36,7 +39,12 @@ public final class SabrCache {
                 }
             }
         }
-        if (!Files.exists(file)) {
+        return Files.exists(file) ? file : null;
+    }
+
+    public static HttpResponse handle(String videoId, int itag, String range, boolean head) throws Exception {
+        final Path file = ensureFile(videoId, itag);
+        if (file == null) {
             return HttpResponse.ofCode(502).withBody("sabr: no media for itag".getBytes());
         }
         try {
