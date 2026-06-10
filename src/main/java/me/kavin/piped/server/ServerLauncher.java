@@ -262,6 +262,28 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     }
+                })).map(GET, "/sabr/:videoId/:itag", AsyncServlet.ofBlocking(executor, request -> {
+                    if (!ytResolveAcquire())
+                        return io.activej.http.HttpResponse.ofCode(503);
+                    try {
+                        final int itag = Integer.parseInt(request.getPathParameter("itag"));
+                        return me.kavin.piped.utils.sabr.SabrCache.handle(
+                                request.getPathParameter("videoId"), itag,
+                                request.getHeader(io.activej.http.HttpHeaders.RANGE), false);
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    } finally {
+                        YT_RESOLVE_LIMITER.release();
+                    }
+                })).map(HttpMethod.HEAD, "/sabr/:videoId/:itag", AsyncServlet.ofBlocking(executor, request -> {
+                    try {
+                        final int itag = Integer.parseInt(request.getPathParameter("itag"));
+                        return me.kavin.piped.utils.sabr.SabrCache.handle(
+                                request.getPathParameter("videoId"), itag,
+                                request.getHeader(io.activej.http.HttpHeaders.RANGE), true);
+                    } catch (Exception e) {
+                        return getErrorResponse(e, request.getPath());
+                    }
                 })).map(GET, "/clips/:clipId", AsyncServlet.ofBlocking(executor, request -> {
                     // resolveClipId resolves the underlying video = a YT player-resolve,
                     // same starvation risk as /streams + /synth-hls. Cap it on the same
