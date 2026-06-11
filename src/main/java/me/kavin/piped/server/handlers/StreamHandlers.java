@@ -14,6 +14,8 @@ import me.kavin.piped.utils.obj.federation.FederatedGeoBypassResponse;
 import me.kavin.piped.utils.obj.federation.FederatedVideoInfo;
 import me.kavin.piped.utils.resp.InvalidRequestResponse;
 import me.kavin.piped.utils.resp.ThrottledResponse;
+import me.kavin.piped.utils.sabr.SabrCache;
+import me.kavin.piped.utils.sabr.SabrHandlers;
 import me.kavin.piped.utils.resp.VideoResolvedResponse;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
@@ -116,7 +118,42 @@ public class StreamHandlers {
                 // and video. Same retry-on-degraded pattern as SynthHlsHandlers.fetchStreams.
                 if (info == null) {
                     for (int attempt = 0; attempt < 3; attempt++) {
-                        info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                        try {
+                            info = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                        } catch (org.schabi.newpipe.extractor.exceptions.SignInConfirmNotBotException sie) {
+                            // YouTube blocks ANONYMOUS watch access for all three
+                            // anonymous clients (VR/ANDROID/WebEmbed) — seen as an
+                            // IP-wide wave 2026-06-11. The authenticated TVHTML5
+                            // session is the designed escape hatch, but until now it
+                            // hung only off the throttle branch (which needs info !=
+                            // null). Try it before surfacing the 500.
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " anonymous clients sign-in-blocked -> trying authenticated TVHTML5");
+                            YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                            YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.set(Boolean.TRUE);
+                            try {
+                                StreamInfo tv = StreamInfo.getInfo(
+                                        "https://www.youtube.com/watch?v=" + videoId);
+                                if (tv != null && !tv.getAudioStreams().isEmpty()
+                                        && (!tv.getVideoStreams().isEmpty()
+                                            || !tv.getVideoOnlyStreams().isEmpty())) {
+                                    // Same TV-only legacy itag filter as the storm path.
+                                    tv.getAudioStreams().removeIf(a -> a.getItagItem() != null
+                                            && (a.getItagItem().id == 148 || a.getItagItem().id == 149));
+                                    info = tv;
+                                    System.out.println("[StreamHandlers] " + videoId
+                                            + " TVHTML5 sign-in-block fallback OK (audio="
+                                            + tv.getAudioStreams().size() + " client=TVHTML5)");
+                                }
+                            } catch (Exception tvE) {
+                                System.out.println("[StreamHandlers] " + videoId
+                                        + " TVHTML5 sign-in-block fallback failed: " + tvE.getMessage());
+                            } finally {
+                                YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.remove();
+                            }
+                            if (info == null) throw sie; // anonymous AND authenticated dead
+                            break;
+                        }
                         final boolean hasAudio = info != null && !info.getAudioStreams().isEmpty();
                         final boolean hasVideo = info != null && (!info.getVideoStreams().isEmpty()
                                 || !info.getVideoOnlyStreams().isEmpty());
@@ -190,14 +227,18 @@ public class StreamHandlers {
                 }
                 boolean testForceThrottle = info != null
                         && videoId.equals(System.getenv("YT_TEST_FORCE_THROTTLE"));
-                boolean stillThrottled = testForceThrottle
+                // Test hook for stage 4: forces the chain PAST TVHTML5 straight
+                // into the SABR storm-fallback (healthy video, fake storm).
+                boolean testForceSabrStorm = info != null
+                        && videoId.equals(System.getenv("YT_TEST_FORCE_SABR_STORM"));
+                boolean stillThrottled = testForceThrottle || testForceSabrStorm
                         || (throttleSuspect && info != null && isVideoStreamThrottled(info));
 
                 // Storm-fallback: WebEmbed segments are 403, so try the
                 // authenticated TVHTML5 (TV) client. Its URLs carry ratebypass and
                 // survive googlevideo throttle storms that kill WebEmbed's. Only
                 // reached on the suspect path during an actual 403 (or the test env).
-                if (stillThrottled) {
+                if (stillThrottled && !testForceSabrStorm) {
                     System.out.println("[StreamHandlers] " + videoId
                             + " WebEmbed still throttled -> trying authenticated TVHTML5");
                     // Defensive: clear any WebEmbed force (ThreadLocals persist on
@@ -234,12 +275,44 @@ public class StreamHandlers {
                     }
                 }
 
+                // Stage 4 — SABR storm-fallback: WebEmbed AND TVHTML5 segment
+                // URLs are 403, but SABR media travels as POST/UMP against
+                // serverAbrStreamingUrl — a different googlevideo request shape
+                // the per-URL throttle may not cover. Cheap viability probe (one
+                // ANDROID player call); on success mark the video so synth-hls
+                // serves it from /sabr and warm the download async (the variant
+                // build blocks on ensureFile until it lands). Double-failure
+                // (storm AND SABR dead) surfaces as a playlist error instead of
+                // this 503 — logged, mark expires after 30 min.
+                // Kill switch: YT_SABR_STORM_FALLBACK=false.
+                if (stillThrottled
+                        && !"false".equalsIgnoreCase(System.getenv("YT_SABR_STORM_FALLBACK"))
+                        && SabrHandlers.sabrViable(videoId)) {
+                    SabrCache.markStorm(videoId);
+                    Multithreading.runAsync(() -> {
+                        try {
+                            // itagsFor triggers the one-time session download and
+                            // returns the ACTUAL picked itags (not always 140/137).
+                            final int[] itags = SabrCache.itagsFor(videoId);
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " SABR storm-warm complete (audio=" + itags[0]
+                                    + " video=" + itags[1] + ")");
+                        } catch (Exception e) {
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " SABR storm-warm failed: " + e.getMessage());
+                        }
+                    });
+                    stillThrottled = false;
+                    System.out.println("[ResolvePath] " + videoId
+                            + " -> SABR-STORM (WebEmbed+TVHTML5 403, serving via /sabr)");
+                }
+
                 // Final segment-liveness gate: WebEmbed AND TVHTML5 both 403 -> don't
                 // hand the app a 200 with dead URLs; surface a distinct 503 so it can
                 // show "YouTube is rate-limiting" instead of a generic timeout.
                 if (stillThrottled) {
                     System.out.println("[StreamHandlers] " + videoId
-                            + " STILL throttled after WebEmbed + TVHTML5 (segments 403) -> 503 throttled");
+                            + " STILL throttled after WebEmbed + TVHTML5 + SABR (segments 403) -> 503 throttled");
                     ExceptionHandler.throwErrorResponse(new ThrottledResponse(
                             "YouTube is rate-limiting playback for this video (segment URLs return "
                             + "403). Transient googlevideo throttle - try again shortly."));

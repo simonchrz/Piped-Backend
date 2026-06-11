@@ -20,7 +20,26 @@ public final class SabrHandlers {
     private static final String ANDROID_UA =
             "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
 
-    public static Map<Integer, byte[]> runSession(String videoId) throws Exception {
+    /// Cheap viability probe for the storm fallback: ONE ANDROID player call.
+    /// SABR is viable when it answers with a serverAbrStreamingUrl — the media
+    /// transport itself is verified later by the actual download (ensureFile).
+    /// Bounded by androidPlayer's own timeouts; any failure = not viable.
+    public static boolean sabrViable(String videoId) {
+        try {
+            return androidPlayer(videoId)
+                    .path("streamingData").path("serverAbrStreamingUrl")
+                    .asText(null) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /// Result of one SABR session: which itags the format picker actually chose
+    /// (NOT always 140/137 — videos without 1080p avc fall back to the first
+    /// matching format) plus the reassembled media bytes per itag.
+    public record SabrMedia(int audioItag, int videoItag, Map<Integer, byte[]> media) {}
+
+    public static SabrMedia runSession(String videoId) throws Exception {
         final JsonNode player = androidPlayer(videoId);
         final JsonNode sd = player.path("streamingData");
         final String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
@@ -38,7 +57,8 @@ public final class SabrHandlers {
         final SabrSession.Fmt pa = new SabrSession.Fmt(aud.path("itag").asInt(), aud.path("lastModified").asLong());
         final SabrSession.Fmt pv = new SabrSession.Fmt(vid.path("itag").asInt(), vid.path("lastModified").asLong());
         final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA);
-        return session.fetchAll(500).media;
+        return new SabrMedia(aud.path("itag").asInt(), vid.path("itag").asInt(),
+                session.fetchAll(500).media);
     }
 
     private static JsonNode pickFormat(JsonNode sd, String mimePrefix, int preferItag) {

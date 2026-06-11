@@ -27,6 +27,28 @@ public final class SabrCache {
     private static final long MAX_CACHE_BYTES = 8L * 1024 * 1024 * 1024; // 8 GB
     private static final ConcurrentHashMap<String, Object> LOCKS = new ConcurrentHashMap<>();
 
+    // ── storm-fallback marks ────────────────────────────────────────────────
+    // videoIds whose direct googlevideo URLs are 403-storming (WebEmbed AND
+    // TVHTML5 dead); synth-hls serves them via /sabr instead — stage 4 of the
+    // resolve chain (StreamHandlers). TTL'd so a video returns to the normal
+    // /yt-proxy path once the transient storm has passed.
+    private static final ConcurrentHashMap<String, Long> STORM_MARKS = new ConcurrentHashMap<>();
+    private static final long STORM_TTL_MS = 30 * 60_000L;
+
+    public static void markStorm(String videoId) {
+        STORM_MARKS.put(videoId, System.currentTimeMillis() + STORM_TTL_MS);
+    }
+
+    public static boolean isStormMarked(String videoId) {
+        final Long exp = STORM_MARKS.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) {
+            STORM_MARKS.remove(videoId);
+            return false;
+        }
+        return true;
+    }
+
     /// Ensures the video has been SABR-downloaded (once, per-videoId lock) and
     /// returns the cached file for the itag, or null if unavailable. Lets the
     /// synth-hls layer read the file directly (box scan) without an HTTP hop.
@@ -34,12 +56,45 @@ public final class SabrCache {
         final Path file = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
         if (!Files.exists(file)) {
             synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
-                if (!Files.exists(file)) {
+                // anyFileFor guard: if the session already ran but produced
+                // DIFFERENT itags (video without 1080p avc), a request for the
+                // absent itag must not re-trigger the whole download forever.
+                if (!Files.exists(file) && !anyFileFor(videoId)) {
                     download(videoId);
                 }
             }
         }
         return Files.exists(file) ? file : null;
+    }
+
+    /// The itags the SABR session ACTUALLY picked for this video, as
+    /// {audio, video}. Ensures the download ran (once); reads the manifest
+    /// download() writes next to the media files. Falls back to {140, 137}
+    /// (the preferred picks) for pre-manifest cache entries.
+    public static int[] itagsFor(String videoId) throws Exception {
+        final Path manifest = DIR.resolve(safe(videoId) + ".itags");
+        if (!Files.exists(manifest)) {
+            synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
+                if (!Files.exists(manifest) && !anyFileFor(videoId)) {
+                    download(videoId);
+                }
+            }
+        }
+        if (Files.exists(manifest)) {
+            final String[] parts = Files.readString(manifest).trim().split("\\s+");
+            if (parts.length == 2) {
+                return new int[]{Integer.parseInt(parts[0]), Integer.parseInt(parts[1])};
+            }
+        }
+        return new int[]{140, 137};
+    }
+
+    private static boolean anyFileFor(String videoId) {
+        try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
+            return s.iterator().hasNext();
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     public static HttpResponse handle(String videoId, int itag, String range, boolean head) throws Exception {
@@ -54,14 +109,18 @@ public final class SabrCache {
     }
 
     private static void download(String videoId) throws Exception {
-        final Map<Integer, byte[]> media = SabrHandlers.runSession(videoId);
-        for (Map.Entry<Integer, byte[]> e : media.entrySet()) {
+        final SabrHandlers.SabrMedia result = SabrHandlers.runSession(videoId);
+        for (Map.Entry<Integer, byte[]> e : result.media().entrySet()) {
             if (e.getValue() == null || e.getValue().length == 0) continue;
             final Path tmp = DIR.resolve(safe(videoId) + "_" + e.getKey() + ".tmp");
             Files.write(tmp, e.getValue());
             Files.move(tmp, DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin"),
                     StandardCopyOption.REPLACE_EXISTING);
         }
+        // Manifest with the ACTUAL picked itags so the serving layer doesn't
+        // have to guess (videos without 1080p avc don't yield 137).
+        Files.writeString(DIR.resolve(safe(videoId) + ".itags"),
+                result.audioItag() + " " + result.videoItag());
         maybeEvict();
     }
 

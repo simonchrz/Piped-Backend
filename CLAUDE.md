@@ -27,10 +27,16 @@ Fork of Piped-Backend that resolves + serves YouTube for the family's Kuckuck iO
 ## YouTube resolve + playback chain (StreamHandlers + SynthHlsHandlers)
 ANDROID_VR (primary, pre-signed, nsig/poToken-free) → on audio=0 (ÖR/Nick) WebEmbed →
 if WebEmbed segments still 403 (googlevideo throttle storm) **TVHTML5** (authenticated TV client)
+→ if TVHTML5 also 403 **SABR storm-fallback** (stage 4, added 2026-06-11: cheap ANDROID-player
+viability probe → 30-min storm-mark → synth-hls serves from `/sabr`, download warms async;
+kill switch `YT_SABR_STORM_FALLBACK=false`, test hook `YT_TEST_FORCE_SABR_STORM=<id>`)
 → else **503 `ThrottledResponse`** (`{"throttled":true}`, so the app shows "rate-limited" not a
 timeout) → if a resolve yields video formats with NO url (SABR-only) **SABR auto-fallback**.
-Each resolve logs `[ResolvePath] <id> -> CLIENT` (or `SABR-ONLY`). The 403s are usually a transient
-storm, not a dead client (memory `youtube_audio0_403_is_transient_throttle`).
+The SABR serving layer reads the ACTUAL picked itags from the `<id>.itags` manifest the download
+writes — videos without 1080p avc don't yield 137 (verified e2e with a 240p/itag-133 video; the
+master's hardcoded RESOLUTION/CODECS line is cosmetically wrong there, players re-probe anyway).
+Each resolve logs `[ResolvePath] <id> -> CLIENT` (or `SABR-ONLY` / `SABR-STORM`). The 403s are
+usually a transient storm, not a dead client (memory `youtube_audio0_403_is_transient_throttle`).
 
 ## TVHTML5 (authenticated TV client, storm fallback)
 Plain TVHTML5 is bot-walled; the crack is a full signed-in TV session:

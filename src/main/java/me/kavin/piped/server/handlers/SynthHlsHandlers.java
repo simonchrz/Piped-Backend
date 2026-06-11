@@ -64,7 +64,9 @@ public class SynthHlsHandlers {
 
     public static byte[] audioPlaylist(String videoId) throws Exception {
         Streams streams = fetchStreams(videoId);
-        if (isSabrMode(videoId, streams)) return sabrStreamPlaylist(videoId, 140);
+        if (isSabrMode(videoId, streams))
+            return sabrStreamPlaylist(videoId,
+                    me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
         PipedStream audio = pickedAudioStream(streams);
         if (audio == null) return "#ERROR".getBytes(StandardCharsets.UTF_8);
         return streamPlaylist(audio, streams.duration);
@@ -76,7 +78,9 @@ public class SynthHlsHandlers {
 
     public static byte[] videoPlaylist(String videoId, int idx, int maxH, String[] codecs) throws Exception {
         Streams streams = fetchStreams(videoId);
-        if (isSabrMode(videoId, streams)) return sabrStreamPlaylist(videoId, 137);
+        if (isSabrMode(videoId, streams))
+            return sabrStreamPlaylist(videoId,
+                    me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         if (idx < 0 || idx >= videos.size()) return "#ERROR".getBytes(StandardCharsets.UTF_8);
         return streamPlaylist(videos.get(idx), streams.duration);
@@ -147,6 +151,9 @@ public class SynthHlsHandlers {
 
     private static boolean isSabrMode(String videoId, Streams streams) {
         if (videoId.equals(System.getenv("YT_FORCE_SABR"))) return true;
+        // Storm-marked by StreamHandlers stage 4 (WebEmbed+TVHTML5 segments 403,
+        // SABR viability probed) — serve from /sabr while the mark lives (30 min).
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return true;
         // Auto: resolve yielded video formats but NONE has a usable URL.
         if (streams == null || streams.videoStreams == null || streams.videoStreams.isEmpty()) return false;
         for (PipedStream v : streams.videoStreams) {
