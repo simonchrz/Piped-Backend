@@ -174,7 +174,7 @@ public class DownloaderImpl extends Downloader {
             }
         }
 
-        var future = ReqwestUtils.fetchWithProxy(request.url(), request.httpMethod(), bytes, headers, EgressManager.activeProxy());
+        var future = ReqwestUtils.fetchWithProxy(request.url(), request.httpMethod(), bytes, headers, EgressManager.activeEgress());
 
         // Recaptcha solver code
         // Commented out, as it hasn't been ported to reqwest4j yet
