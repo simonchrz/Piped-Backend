@@ -14,10 +14,16 @@ currently-clean family and auto-flip on a bot-flag (see
   + `get_or_build_client(proxy)` + JNI `Java_..._fetchWithProxy`; factored the shared
   request path into `run_fetch`. `init`/`fetch` unchanged (backwards-compatible).
   (`""` proxy = direct egress.)
+- `reqwest-jni/Cargo.toml` — bumped `reqwest` 0.12.2 → **0.13.4** (features
+  `rustls, http2, stream, brotli, gzip, socks`, `default-features=false`; note
+  0.13 renamed `rustls-tls`→`rustls`, split out `http2`, and the `rustls` feature
+  pulls the aws-lc-rs crypto provider). No lib.rs changes were needed — the core
+  reqwest API we use (Client/Proxy/request/send/Response) is stable across the bump.
 - `src/main/java/rocks/kavin/reqwest4j/ReqwestUtils.java` — declared the new
   `native CompletableFuture<Response> fetchWithProxy(...)`.
 
-The two modified files are vendored next to this README (`lib.rs`, `ReqwestUtils.java`).
+The modified files are vendored next to this README (`lib.rs`, `Cargo.toml`,
+`ReqwestUtils.java`).
 
 ## Rebuild → `../libs/reqwest4j-egress.jar`
 No `cross`/gradle-rust-plugin needed: the Pi is aarch64, so build the native lib
@@ -25,15 +31,16 @@ natively, then jar-surgery the official 1.0.14 jar (swap the aarch64 `.so` + the
 recompiled `ReqwestUtils.class`).
 
 ```sh
-# 0. clone upstream at the tag and drop the two vendored files in
+# 0. clone upstream at the tag, drop the three vendored files in
 git clone --branch 1.0.14 --depth 1 https://github.com/TeamPiped/reqwest4j.git r4j
-cp lib.rs          r4j/reqwest-jni/src/lib.rs
+cp lib.rs           r4j/reqwest-jni/src/lib.rs
+cp Cargo.toml       r4j/reqwest-jni/Cargo.toml
 cp ReqwestUtils.java r4j/src/main/java/rocks/kavin/reqwest4j/ReqwestUtils.java
 
-# 1. native aarch64 build of libreqwest_jni.so (~90s)
+# 1. native aarch64 build of libreqwest_jni.so (~2.5min; cmake+clang for aws-lc-rs)
 cd r4j/reqwest-jni
 docker run --rm -v "$PWD":/app -w /app -v ~/.cargo-fork-cache:/usr/local/cargo/registry \
-  rust:1-bookworm cargo build --release
+  rust:1-bookworm bash -c 'apt-get update -qq && apt-get install -y -qq cmake clang && cargo build --release'
 #   -> target/release/libreqwest_jni.so   (exports Java_..._fetchWithProxy)
 
 # 2. jar-surgery: official jar + new .so (renamed) + recompiled ReqwestUtils.class
@@ -50,9 +57,4 @@ cp bf/reqwest4j-egress.jar ../libs/reqwest4j-egress.jar   # consumed via build.g
 ```
 
 Verify: `javap -cp ../libs/reqwest4j-egress.jar rocks.kavin.reqwest4j.ReqwestUtils`
-must list `fetchWithProxy`.
-
-## TODO
-- Bump Rust `reqwest` 0.12.2 → 0.13.4 (not a drop-in: `rustls-tls`→`rustls`,
-  aws-lc-rs TLS provider, `http2` now a separate feature; validate YouTube runtime
-  behaviour). Tracked separately.
+must list `fetchWithProxy`; the embedded `.so` is ~6.0 MB on 0.13.4 (aws-lc-rs).
