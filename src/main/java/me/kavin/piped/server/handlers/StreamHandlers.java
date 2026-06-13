@@ -151,6 +151,20 @@ public class StreamHandlers {
                             } finally {
                                 YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.remove();
                             }
+                            if (info == null && me.kavin.piped.utils.EgressManager.flipOnBotFlag()) {
+                                try {
+                                    StreamInfo flipped = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                                    if (flipped != null && !flipped.getAudioStreams().isEmpty()
+                                            && (!flipped.getVideoStreams().isEmpty() || !flipped.getVideoOnlyStreams().isEmpty())) {
+                                        info = flipped;
+                                        System.out.println("[StreamHandlers] " + videoId
+                                                + " egress-flip resolve OK (" + me.kavin.piped.utils.EgressManager.activeLabel() + ")");
+                                    }
+                                } catch (Exception fe) {
+                                    System.out.println("[StreamHandlers] " + videoId
+                                            + " egress-flip retry failed: " + fe.getMessage());
+                                }
+                            }
                             if (info == null) throw sie; // anonymous AND authenticated dead
                             break;
                         }

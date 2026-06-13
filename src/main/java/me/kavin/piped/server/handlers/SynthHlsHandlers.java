@@ -470,6 +470,20 @@ public class SynthHlsHandlers {
     /// Multithreading.supplyAsync to match StreamHandlers' threading context
     /// (a direct getInfo() can return degraded streams).
     private static Streams resolveStreams(String videoId) throws Exception {
+        try {
+            return resolveStreamsInner(videoId);
+        } catch (Exception ex) {
+            if (me.kavin.piped.utils.EgressManager.isSignInBlock(ex)
+                    && me.kavin.piped.utils.EgressManager.flipOnBotFlag()) {
+                System.out.println("[SynthHls] " + videoId + " sign-in-blocked -> egress-flip to "
+                        + me.kavin.piped.utils.EgressManager.activeLabel() + ", retry");
+                return resolveStreamsInner(videoId);
+            }
+            throw ex;
+        }
+    }
+
+    private static Streams resolveStreamsInner(String videoId) throws Exception {
         Streams s = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             StreamInfo info = Multithreading.supplyAsync(() -> {
