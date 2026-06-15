@@ -752,15 +752,17 @@ public class StreamHandlers {
             ? best.getItagItem().getContentLength() : 0;
         if (clen < 10_000_000L) return false;
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setRequestMethod("HEAD");
             long offset = clen / 2;
-            conn.setRequestProperty("Range", "bytes=" + offset + "-" + (offset + 1000));
-            conn.setConnectTimeout(2000);
-            conn.setReadTimeout(3000);
-            int code = conn.getResponseCode();
-            conn.disconnect();
-            return code == 403;
+            // Probe via the SAME egress family the resolve used (EgressManager),
+            // NOT the JVM default (preferIPv6): a v4-locked URL probed from v6
+            // returns a false 403 and trips a spurious 503. This closes the
+            // v4<->v6 inconsistency (resolves use reqwest4j/activeEgress; this
+            // probe used raw HttpURLConnection = JVM default family).
+            var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                    url, "GET", new byte[0],
+                    java.util.Map.of("Range", "bytes=" + offset + "-" + (offset + 1000)),
+                    me.kavin.piped.utils.EgressManager.activeEgress()).join();
+            return resp.status() == 403;
         } catch (Exception e) {
             return false;
         }

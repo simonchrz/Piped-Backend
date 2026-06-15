@@ -250,13 +250,9 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     } finally {
                         YT_RESOLVE_LIMITER.release();
                     }
-                })).map(GET, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
-                    try {
-                        return YtProxyHandlers.handle(request);
-                    } catch (Exception e) {
-                        return getErrorResponse(e, request.getPath());
-                    }
-                })).map(HttpMethod.HEAD, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
+                })).map(GET, "/yt-proxy/*",
+                        request -> YtProxyHandlers.handleAsync(request, executor)
+                ).map(HttpMethod.HEAD, "/yt-proxy/*", AsyncServlet.ofBlocking(executor, request -> {
                     try {
                         return YtProxyHandlers.handle(request);
                     } catch (Exception e) {

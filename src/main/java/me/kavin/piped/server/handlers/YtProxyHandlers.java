@@ -5,6 +5,9 @@ import io.activej.http.HttpHeaders;
 import io.activej.http.HttpMethod;
 import io.activej.http.HttpRequest;
 import io.activej.http.HttpResponse;
+import io.activej.bytebuf.ByteBuf;
+import io.activej.csp.ChannelSupplier;
+import io.activej.promise.Promise;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -136,6 +139,107 @@ public class YtProxyHandlers {
             startDownloader(sess);
             return sess;
         });
+    }
+
+    // Streaming entry point for the GET /yt-proxy/ route. A large-range request
+    // (AVPlayer wants the whole, often single, segment) is served as a FULL-range
+    // stream from the filling disk cache, so the response length matches what was
+    // asked (AVPlayer treats a short read as a fatal -12939). Everything else falls
+    // back to handle()'s byte[] path. The ChannelSupplier MUST be created on the
+    // eventloop, so the blocking prep runs via Promise.ofBlocking and the stream is
+    // built in the .then callback (which runs on the eventloop).
+    public static Promise<HttpResponse> handleAsync(HttpRequest request, java.util.concurrent.Executor executor) {
+        return Promise.ofBlocking(executor, () -> prepareStream(request)).then(prep -> {
+            if (prep != null && prep.sess != null) {
+                final StreamSession sess = prep.sess;
+                final long fStart = prep.start, fEnd = prep.end, fTotal = prep.total;
+                final long SLICE = 4L * 1024 * 1024;
+                final java.util.concurrent.atomic.AtomicLong posRef =
+                        new java.util.concurrent.atomic.AtomicLong(prep.start);
+                ChannelSupplier<ByteBuf> body = ChannelSupplier.ofSupplier(() ->
+                    Promise.ofBlocking(executor, () -> {
+                        long p = posRef.get();
+                        if (p > fEnd) return null; // end of stream
+                        long sliceEnd = Math.min(p + SLICE - 1, fEnd);
+                        sess.noteClientRequest(sliceEnd);
+                        byte[] slice;
+                        try {
+                            sess.waitUntilDownloaded(sliceEnd, DOWNLOAD_WAIT_MS);
+                            slice = readRange(currentBytesPath(sess), p, sliceEnd);
+                        } catch (Exception e) {
+                            byte[] direct = directRangeFetch(swapCpn(sess.targetUrl), p, sliceEnd);
+                            if (direct == null)
+                                throw new IOException("yt-proxy stream stall " + p + "-" + sliceEnd);
+                            slice = direct;
+                        }
+                        posRef.set(sliceEnd + 1);
+                        return ByteBuf.wrapForReading(slice);
+                    }));
+                return Promise.of(HttpResponse.ofCode(206).withBodyStream(body)
+                        .withHeader(HttpHeaders.CONTENT_TYPE, HttpHeaderValue.of("video/mp4"))
+                        .withHeader(HttpHeaders.CONTENT_RANGE, HttpHeaderValue.of("bytes " + fStart + "-" + fEnd + "/" + fTotal))
+                        .withHeader(HttpHeaders.CONTENT_LENGTH, HttpHeaderValue.of(String.valueOf(fEnd - fStart + 1)))
+                        .withHeader(HttpHeaders.ACCEPT_RANGES, HttpHeaderValue.of("bytes")));
+            }
+            return Promise.ofBlocking(executor, () -> {
+                try {
+                    return handle(request);
+                } catch (Exception e) {
+                    return HttpResponse.ofCode(500).withBody(("yt-proxy: " + e.getMessage()).getBytes());
+                }
+            });
+        });
+    }
+
+    private static final class StreamPrep {
+        final StreamSession sess;
+        final long start, end, total;
+        StreamPrep(StreamSession sess, long start, long end, long total) {
+            this.sess = sess; this.start = start; this.end = end; this.total = total;
+        }
+    }
+
+    // Blocking prep: returns a StreamPrep only for a non-cached, large-range GET
+    // (the case that needs full-range streaming); null otherwise (handle() takes it).
+    private static StreamPrep prepareStream(HttpRequest request) {
+        try {
+            String fullPath = request.getPath();
+            if (!fullPath.startsWith(PREFIX)) return null;
+            if (request.getMethod() == HttpMethod.HEAD) return null;
+            String reqRange = request.getHeader(HttpHeaders.RANGE);
+            if (reqRange == null || reqRange.isEmpty()) return null;
+            String afterPrefix = fullPath.substring(PREFIX.length());
+            int firstSlash = afterPrefix.indexOf('/');
+            if (firstSlash < 0) return null;
+            String host = afterPrefix.substring(0, firstSlash);
+            String path = afterPrefix.substring(firstSlash);
+            String rawQuery = request.getQuery();
+            String targetUrl = "https://" + host + path
+                    + (rawQuery == null || rawQuery.isEmpty() ? "" : "?" + rawQuery);
+            Map<String, String> qp = request.getQueryParameters();
+            String key = safeKey(qp.getOrDefault("id", "_") + "_" + qp.getOrDefault("itag", "_"));
+            Path finalPath = CACHE_DIR.resolve(key + ".mp4");
+            if (Files.exists(finalPath)) return null; // fully cached -> handle() serves full range
+            StreamSession sess = SESSIONS.computeIfAbsent(key, k -> {
+                Path tmpPath = CACHE_DIR.resolve(k + ".tmp");
+                StreamSession ses = new StreamSession(k, tmpPath, finalPath, targetUrl);
+                startDownloader(ses);
+                return ses;
+            });
+            sess.waitUntilHeadersReady(HEADER_WAIT_MS);
+            if (sess.failed) return null;
+            long total = sess.totalLength;
+            long[] rb = parseRange(reqRange, total);
+            if (rb == null) return null;
+            long start = rb[0];
+            long reqEnd = Math.min(rb[1], total - 1);
+            if (reqEnd - start + 1 <= MAX_RESPONSE_CHUNK) return null; // small -> capped path
+            System.out.printf("[YtProxy] %s STREAM-FULL %d-%d (%dMB)%n",
+                    key, start, reqEnd, (reqEnd - start + 1) / (1024 * 1024));
+            return new StreamPrep(sess, start, reqEnd, total);
+        } catch (Exception e) {
+            return null; // fall back to handle()
+        }
     }
 
     public static HttpResponse handle(HttpRequest request) throws IOException {
@@ -329,30 +433,21 @@ public class YtProxyHandlers {
     private static byte[] directRangeFetch(String targetUrl, long start, long end) {
         int len = (int) (end - start + 1);
         if (len <= 0 || len > MAX_RESPONSE_CHUNK) return null;
-        HttpURLConnection conn = null;
         try {
-            conn = (HttpURLConnection) new URL(targetUrl).openConnection();
-            conn.setRequestMethod("GET");
-            conn.setInstanceFollowRedirects(true);
-            conn.setConnectTimeout(10_000);
-            conn.setReadTimeout(30_000);
-            conn.setRequestProperty("User-Agent", CHROME_UA);
-            if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
-            conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
-            int code = conn.getResponseCode();
-            // Only a proper 206 gives the requested window. A 200 means Range was
-            // ignored (bytes would start at 0, not `start`) → reject, fall back.
-            if (code != 206) return null;
-            try (InputStream is = conn.getInputStream()) {
-                byte[] buf = new byte[len];
-                int off = 0, n;
-                while (off < len && (n = is.read(buf, off, len - off)) > 0) off += n;
-                return off == len ? buf : null;
-            }
+            java.util.Map<String, String> rh = new java.util.HashMap<>();
+            rh.put("Range", "bytes=" + start + "-" + end);
+            rh.put("User-Agent", CHROME_UA);
+            if (YOUTUBE_COOKIES != null) rh.put("Cookie", YOUTUBE_COOKIES);
+            // Egress the SAME family the resolve used (v4-locked URLs must be
+            // fetched from v4); raw HttpURLConnection obeyed JVM preferIPv6.
+            rocks.kavin.reqwest4j.Response resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                    targetUrl, "GET", new byte[0], rh, me.kavin.piped.utils.EgressManager.activeEgress())
+                    .get(40_000, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (resp.status() != 206) return null;
+            byte[] body = resp.body();
+            return body != null && body.length == len ? body : null;
         } catch (Exception e) {
             return null;
-        } finally {
-            if (conn != null) conn.disconnect();
         }
     }
 
@@ -423,65 +518,51 @@ public class YtProxyHandlers {
                     final long before = offset;
                     // First try the original cpn; on a stall, fresh cpn + new connection.
                     final String url = consecutiveStalls == 0 ? sess.targetUrl : swapCpn(sess.targetUrl);
-                    HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
                     try {
-                        conn.setRequestMethod("GET");
-                        conn.setInstanceFollowRedirects(true);
-                        conn.setConnectTimeout(SEG_CONNECT_TIMEOUT_MS);
-                        conn.setReadTimeout(SEG_READ_TIMEOUT_MS);
-                        conn.setRequestProperty("User-Agent", CHROME_UA);
-                        if (YOUTUBE_COOKIES != null) conn.setRequestProperty("Cookie", YOUTUBE_COOKIES);
-                        conn.setRequestProperty("Range", "bytes=" + offset + "-" + chunkEnd);
-                        int code = conn.getResponseCode();
+                        java.util.Map<String, String> rh = new java.util.HashMap<>();
+                        rh.put("Range", "bytes=" + offset + "-" + chunkEnd);
+                        rh.put("User-Agent", CHROME_UA);
+                        if (YOUTUBE_COOKIES != null) rh.put("Cookie", YOUTUBE_COOKIES);
+                        // Family-pinned (activeEgress): v4-locked URLs must be pulled
+                        // from v4. Raw HttpURLConnection obeyed JVM preferIPv6 -> v6 ->
+                        // 403 on the subset of videos whose googlevideo server has AAAA.
+                        rocks.kavin.reqwest4j.Response resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                                url, "GET", new byte[0], rh, me.kavin.piped.utils.EgressManager.activeEgress())
+                                .get(SEG_CONNECT_TIMEOUT_MS + SEG_READ_TIMEOUT_MS + 10_000L,
+                                        java.util.concurrent.TimeUnit.MILLISECONDS);
+                        int code = resp.status();
                         if (code == 403) {
-                            // Real reject (not a stall) -> don't retry; trigger the 302 fallback.
-                            String errBody = "";
-                            try {
-                                java.io.InputStream es = conn.getErrorStream();
-                                if (es != null) errBody = new String(es.readAllBytes(), 0,
-                                        Math.min(200, es.available() > 0 ? es.available() : 200));
-                            } catch (Exception ignored) {}
-                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP 403 body=" + errBody);
+                            System.out.println("[YtProxy] " + sess.key + " upstream HTTP 403 (egress="
+                                    + me.kavin.piped.utils.EgressManager.activeLabel() + ") -> 302 fallback");
                             sess.upstream403 = true;
                             fail(sess);
                             return;
                         }
                         if (code != 206 && code != 200) {
-                            // Transient upstream error -> count as a stall, retry below.
                             System.out.println("[YtProxy] " + sess.key + " upstream HTTP " + code
                                     + " (stall " + (consecutiveStalls + 1) + "/" + SEG_MAX_STALLS + ")");
                         } else {
                             if (total < 0) {
-                                total = parseUpstreamTotal(conn);
+                                total = parseTotalFromHeaders(resp.headers(), resp.body() == null ? 0 : resp.body().length);
                                 if (total < 0) { fail(sess); return; }
                                 synchronized (sess.lock) {
                                     sess.totalLength = total;
                                     sess.lock.notifyAll();
                                 }
                             }
-                            try (InputStream is = conn.getInputStream()) {
-                                byte[] buf = new byte[READ_BUF];
-                                int n;
-                                while ((n = is.read(buf)) > 0) {
-                                    raf.write(buf, 0, n);
-                                    offset += n;
-                                    long now = sess.downloadedBytes.addAndGet(n);
-                                    if (now - lastNotify >= READ_BUF) {
-                                        synchronized (sess.lock) { sess.lock.notifyAll(); }
-                                        lastNotify = now;
-                                    }
-                                }
+                            byte[] body = resp.body();
+                            if (body != null && body.length > 0) {
+                                raf.write(body);
+                                offset += body.length;
+                                lastNotify = sess.downloadedBytes.addAndGet(body.length);
+                                synchronized (sess.lock) { sess.lock.notifyAll(); }
                             }
-                            if (code == 200) break; // server ignored Range, whole file already read
+                            if (code == 200) break;
                         }
-                    } catch (IOException e) {
-                        // Stall/timeout mid-fetch. Any partial bytes already advanced
-                        // `offset`; the next attempt resumes from there (bytes=offset-...).
+                    } catch (Exception e) {
                         System.out.println("[YtProxy] " + sess.key + " range stall at offset " + offset
                                 + " (" + e.getClass().getSimpleName() + ", stall "
                                 + (consecutiveStalls + 1) + "/" + SEG_MAX_STALLS + ")");
-                    } finally {
-                        conn.disconnect();
                     }
                     // Progress resets the stall budget; pure no-progress attempts count
                     // down. A moving stream never hits the cap (bounded ~2.5s per stall).
@@ -514,6 +595,23 @@ public class YtProxyHandlers {
 
     /// Total file size from the first chunk: Content-Range "bytes s-e/TOTAL"
     /// (206), else Content-Length (200 = server ignored Range).
+    private static long parseTotalFromHeaders(java.util.Map<String, String> h, int bodyLen) {
+        String cr = h.get("content-range");
+        if (cr == null) cr = h.get("Content-Range");
+        if (cr != null) {
+            int slash = cr.lastIndexOf('/');
+            if (slash >= 0) {
+                try { return Long.parseLong(cr.substring(slash + 1).trim()); } catch (Exception ignored) {}
+            }
+        }
+        String cl = h.get("content-length");
+        if (cl == null) cl = h.get("Content-Length");
+        if (cl != null) {
+            try { return Long.parseLong(cl.trim()); } catch (Exception ignored) {}
+        }
+        return bodyLen > 0 ? bodyLen : -1;
+    }
+
     private static long parseUpstreamTotal(HttpURLConnection conn) {
         String cr = conn.getHeaderField("Content-Range");
         if (cr != null) {
