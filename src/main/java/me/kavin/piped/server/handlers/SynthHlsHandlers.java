@@ -55,8 +55,14 @@ public class SynthHlsHandlers {
             int h = v.height > 0 ? v.height : 1080;
             int fps = v.fps > 0 ? v.fps : 30;
             String vCodec = v.codec != null ? v.codec : "avc1.64002a";
-            sb.append(String.format("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d,CODECS=\"%s,%s\",AUDIO=\"audio\"\n",
-                    bw, bw, w, h, fps, vCodec, audioCodec));
+            // Apple HLS requires VIDEO-RANGE for non-SDR (av01 HDR: transfer-chars
+            // field tc=16 -> PQ/HDR10, tc=18 -> HLG). Without it AVPlayer rejects the
+            // HDR variant (CoreMediaErrorDomain -12927). SDR variants stay untouched
+            // (byte-identical master) since SDR is the implicit default.
+            String vr = hlsVideoRange(vCodec);
+            String vrAttr = vr.equals("SDR") ? "" : ("VIDEO-RANGE=" + vr + ",");
+            sb.append(String.format("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d,%sCODECS=\"%s,%s\",AUDIO=\"audio\"\n",
+                    bw, bw, w, h, fps, vrAttr, vCodec, audioCodec));
             sb.append("video").append(i).append(".m3u8").append(q).append("\n");
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
@@ -544,6 +550,17 @@ public class SynthHlsHandlers {
     // Default: single H.264 1080p-or-less variant (the safe default that avoids
     // ABR-switching confusion + works on every device). Higher renditions are
     // opt-in via ?maxh=&codecs= (the app sends only HW-decodable codecs).
+    /** VIDEO-RANGE for an av01 codec string (transfer-characteristics field). */
+    private static String hlsVideoRange(String codec) {
+        if (codec == null || !codec.startsWith("av01")) return "SDR";
+        String[] f = codec.split("\\.");
+        if (f.length >= 8) {
+            if ("16".equals(f[7])) return "PQ";
+            if ("18".equals(f[7])) return "HLG";
+        }
+        return "SDR";
+    }
+
     static final String[] DEFAULT_VIDEO_CODECS = {"avc"};
 
     private static List<PipedStream> pickedVideoStreams(Streams streams) {
