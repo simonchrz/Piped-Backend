@@ -213,6 +213,58 @@ public class StreamHandlers {
                 // probe, same as before; the final liveness gate below only re-probes
                 // when this is true, keeping the extra HEAD off the fast path.
                 boolean throttleSuspect = info != null && (degraded || isVideoStreamThrottled(info));
+
+                // EGRESS-FLIP FIRST (made-for-kids / content-specific throttle):
+                // googlevideo often 403s the media on only ONE egress family (e.g. the
+                // v6 /64) while the OTHER (v4) serves the very same video fine via
+                // ANDROID_VR. The bot-flag autoflip cant see this (its canary is a
+                // normal video that plays on both families). So on throttle/degraded,
+                // TRY a re-resolve on the other family before falling to the WebEmbed
+                // path (which is ALSO throttled on the bad family for these videos).
+                // The trial uses a thread-local egress override; only a CLEAN result
+                // commits the family globally (so yt-proxy segment fetches follow).
+                // A still-bad result (genuine OER audio=0, or a hard-throttle on both
+                // families) leaves the global family untouched and falls through.
+                // Verified 2026-06-20: Jakobs kids content (LEGO/DFB-cards) 403d
+                // wholesale on v6, played on v4. Kill-switch EGRESS_FLIP_ON_THROTTLE=0.
+                if (throttleSuspect && !"0".equals(System.getenv("EGRESS_FLIP_ON_THROTTLE"))) {
+                    String before = me.kavin.piped.utils.EgressManager.activeEgress();
+                    String other = me.kavin.piped.utils.EgressManager.otherFamily();
+                    if (!other.equals(before)) {
+                        me.kavin.piped.utils.EgressManager.beginTrial(other);
+                        boolean committed = false;
+                        try {
+                            StreamInfo flipInfo = StreamInfo.getInfo(
+                                "https://www.youtube.com/watch?v=" + videoId);
+                            boolean flipHealthy = flipInfo != null
+                                && !flipInfo.getAudioStreams().isEmpty()
+                                && (!flipInfo.getVideoStreams().isEmpty()
+                                    || !flipInfo.getVideoOnlyStreams().isEmpty());
+                            if (flipHealthy && !isVideoStreamThrottled(flipInfo)) {
+                                info = flipInfo;
+                                throttleSuspect = false;
+                                committed = true;
+                                System.out.println("[StreamHandlers] " + videoId
+                                    + " egress-flip " + before + "->" + other
+                                    + " CLEAN (audio=" + info.getAudioStreams().size()
+                                    + " video=" + info.getVideoStreams().size()
+                                    + " videoOnly=" + info.getVideoOnlyStreams().size() + ")");
+                            }
+                        } catch (Exception e) {
+                            System.out.println("[StreamHandlers] " + videoId
+                                + " egress-flip re-resolve failed: " + e.getMessage());
+                        } finally {
+                            me.kavin.piped.utils.EgressManager.endTrial();
+                            if (committed)
+                                me.kavin.piped.utils.EgressManager.commitFamily(other);
+                        }
+                        if (!committed)
+                            System.out.println("[StreamHandlers] " + videoId
+                                + " egress-flip " + before + "->" + other
+                                + " did not help -> WebEmbed path");
+                    }
+                }
+
                 if (throttleSuspect) {
                     System.out.println("[StreamHandlers] " + videoId + " "
                             + (degraded ? "degraded (audio=0)" : "URLs throttled (HEAD=403 auf clen/2)")

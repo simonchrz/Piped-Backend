@@ -40,14 +40,48 @@ public class EgressManager {
     private static volatile long lastFlip = 0;
     private static final long RECENT_FLIP_MS = 30_000;
 
+    // Per-thread trial override: a resolve may TRY the other family (set via
+    // beginTrial) without committing the global ACTIVE. activeEgress() returns the
+    // trial value while set, so the trial resolve + its throttle-probe + (on
+    // success) the URLs it produces are all signed for the trial family. Only on a
+    // clean result does the caller commitFamily() to make it global (so yt-proxy
+    // segment fetches use it too). On failure the global family is untouched.
+    private static final ThreadLocal<String> TRIAL = new ThreadLocal<>();
+
     static {
         System.out.println("[Egress] per-request family egress, autoflip=" + ENABLED
                 + ", start=" + ACTIVE.get());
     }
 
-    /** The egress family all reqwest traffic should use right now ("v4"/"v6"). */
+    /** The egress family all reqwest traffic should use right now ("v4"/"v6").
+     *  Honors a per-thread trial override (see TRIAL) if one is active. */
     public static String activeEgress() {
-        return ACTIVE.get();
+        String t = TRIAL.get();
+        return t != null ? t : ACTIVE.get();
+    }
+
+    /** The other family relative to the current global ACTIVE (ignores trial). */
+    public static String otherFamily() {
+        return ACTIVE.get().equals("v6") ? "v4" : "v6";
+    }
+
+    /** Begin a per-thread trial on the given family (does NOT change global ACTIVE). */
+    public static void beginTrial(String family) {
+        TRIAL.set(normalize(family));
+    }
+
+    /** End the per-thread trial (restores activeEgress to the global ACTIVE). */
+    public static void endTrial() {
+        TRIAL.remove();
+    }
+
+    /** Commit a family as the new global ACTIVE (e.g. after a clean trial resolve).
+     *  Stamps lastFlip so the bot-flag autoflip wont immediately fight it. */
+    public static void commitFamily(String family) {
+        synchronized (LOCK) {
+            ACTIVE.set(normalize(family));
+            lastFlip = System.currentTimeMillis();
+        }
     }
 
     public static String activeLabel() {
