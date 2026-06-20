@@ -163,14 +163,45 @@ public class BgPoTokenProvider implements PoTokenProvider {
     @Override
     public @Nullable PoTokenResult getWebEmbedClientPoToken(String videoId) {
         System.out.println("[Piped/Bg] getWebEmbedClientPoToken called for " + videoId);
-        // Custom: gleiches Token-Pool wie Web-Client — bgutils-Web-PoToken
-        // funktioniert auch fuer den Web-Embedded Player Client.
+        // EXPERIMENT 2026-06-20: isFamilySafe videos are forced onto the WebEmbed
+        // path, whose streaming URLs 403 because we send them pot-less
+        // (getPoTokenPooled -> streamingDataPoToken=null). The player pot stays
+        // visitorData-bound; mint a CONTENT-BOUND (videoId) pot for the streaming
+        // URLs and see whether googlevideo accepts it. Falls back to today's
+        // behaviour (no streaming pot) when the content-bound mint fails.
         try {
-            return getPoTokenPooled();
+            PoTokenResult base = getPoTokenPooled();
+            if (base == null) return null;
+            String streamingPot = mintContentBoundPoToken(videoId);
+            System.out.println("[Piped/Bg] webEmbed content-bound streaming pot: "
+                    + (streamingPot != null
+                        ? streamingPot.substring(0, Math.min(16, streamingPot.length())) + "..."
+                        : "NULL (fallback to pot-less)"));
+            return new PoTokenResult(base.visitorData, base.playerRequestPoToken, streamingPot);
         } catch (Exception e) {
             e.printStackTrace();
         }
         return null;
+    }
+
+    /// Mint a po_token bound to the videoId (content binding) rather than
+    /// visitorData — for the WebEmbed streaming URLs. Returns null on failure.
+    private @Nullable String mintContentBoundPoToken(String videoId) {
+        try {
+            return ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST",
+                    mapper.writeValueAsBytes(mapper.createObjectNode().put("content_binding", videoId)),
+                    Map.of("Content-Type", "application/json"))
+                .thenApply(response -> {
+                    try {
+                        return mapper.readTree(new String(response.body())).get("poToken").asText();
+                    } catch (Exception e) {
+                        return null;
+                    }
+                }).join();
+        } catch (Exception e) {
+            System.out.println("[Piped/Bg] content-bound pot mint failed: " + e.getMessage());
+            return null;
+        }
     }
 
     // TEST: Web-PoToken auch fuer Android/iOS — laut yt-dlp wiki nicht cross-platform,
