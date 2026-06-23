@@ -49,6 +49,7 @@ public class SidxParserJava {
     private static final int SIDX_CONNECT_TIMEOUT_MS = 1500;
     private static final int SIDX_READ_TIMEOUT_MS = 2000;
     private static final int SIDX_MAX_ATTEMPTS = 3;
+    private static final int SIDX_MAX_REDIRECTS = 3;
 
     /// Fetch + parse sidx for given url at byte range [start, end] (inclusive).
     /// Resolves nested sidx-chains recursively. Short timeout + fast retry so a
@@ -93,12 +94,37 @@ public class SidxParserJava {
         try {
             HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setRequestMethod("GET");
+            // Auto-follow drops the Range header on the redirected request (-> 200 full
+            // file or a reject); disable it so our manual loop re-applies Range and keeps 206.
+            conn.setInstanceFollowRedirects(false);
             conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
             conn.setRequestProperty("User-Agent", CHROME_UA);
             if (cookies != null) conn.setRequestProperty("Cookie", cookies);
             conn.setConnectTimeout(SIDX_CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(SIDX_READ_TIMEOUT_MS);
             int code = conn.getResponseCode();
+            // Follow googlevideo's CDN load-balancer redirect (302 cms_redirect ->
+            // final edge with ipbypass). NewPipe's downloader disables HttpURLConnection
+            // auto-follow globally, and auto-follow can silently drop the Range header
+            // anyway, so follow manually and RE-APPLY Range to keep getting 206 partials.
+            int redirectHops = 0;
+            while ((code == 301 || code == 302 || code == 303 || code == 307 || code == 308)
+                    && redirectHops < SIDX_MAX_REDIRECTS) {
+                String loc = conn.getHeaderField("Location");
+                conn.disconnect();
+                if (loc == null) return null;
+                conn = (HttpURLConnection) new URL(loc).openConnection();
+                conn.setRequestMethod("GET");
+                conn.setInstanceFollowRedirects(false);
+                conn.setRequestProperty("Range", "bytes=" + start + "-" + end);
+                conn.setRequestProperty("User-Agent", CHROME_UA);
+                if (cookies != null) conn.setRequestProperty("Cookie", cookies);
+                conn.setConnectTimeout(SIDX_CONNECT_TIMEOUT_MS);
+                conn.setReadTimeout(SIDX_READ_TIMEOUT_MS);
+                System.out.println("[SidxCache] REDIRECT itag=" + itagOf(url) + " hop=" + (redirectHops + 1));
+                code = conn.getResponseCode();
+                redirectHops++;
+            }
             if (code != 200 && code != 206) {
                 conn.disconnect();
                 return null;

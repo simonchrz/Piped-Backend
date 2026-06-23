@@ -107,7 +107,10 @@ public class SynthHlsHandlers {
 
         SidxParserJava.Data sidx = null;
         if (stream.indexStart > 0 && stream.indexEnd > stream.indexStart) {
-            sidx = SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, YOUTUBE_COOKIES);
+            // null cookies: the index is public; no need to forward the backend's
+            // ~10KB authenticated cookie jar. Goes via the proxy like the segments
+            // (proxy strips the hop-by-hop Connection header that else 400s).
+            sidx = SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, null);
         }
 
         StringBuilder sb = new StringBuilder();
@@ -384,7 +387,7 @@ public class SynthHlsHandlers {
         final String url = stream.url;
         final int is = stream.indexStart, ie = stream.indexEnd;
         return SIDX_WARM_POOL.submit(() -> {
-            try { SidxParserJava.fetch(url, is, ie, YOUTUBE_COOKIES); }
+            try { SidxParserJava.fetch(url, is, ie, null); }
             catch (Throwable ignored) { /* best-effort warm */ }
         });
     }
