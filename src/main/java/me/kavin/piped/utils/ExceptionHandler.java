@@ -22,6 +22,34 @@ public class ExceptionHandler {
         if (e.getCause() != null && (e instanceof ExecutionException || e instanceof CompletionException))
             e = (Exception) e.getCause();
 
+        // Members-only / private / removed / geo / age-gated videos surface as
+        // NPE's generic "Could not get any stream" (the anon ANDROID/VR clients
+        // return zero streams without a clear reason). Probe the web
+        // playabilityStatus and return YouTube's own localized reason as a clean
+        // 403 so the app shows a meaningful message instead of httpStatus(500).
+        {
+            String m = e.getMessage();
+            Throwable rc = ExceptionUtils.getRootCause(e);
+            String rm = rc != null ? rc.getMessage() : null;
+            boolean noStream = (m != null && m.contains("Could not get any stream"))
+                    || (rm != null && rm.contains("Could not get any stream"));
+            if (noStream && path != null
+                    && (path.startsWith("/streams/") || path.startsWith("/synth-hls/"))) {
+                String videoId = videoIdFromPath(path);
+                if (videoId != null) {
+                    String reason = YoutubeUnplayable.probeReason(videoId);
+                    if (reason != null) {
+                        try {
+                            return new ErrorResponse(403,
+                                    java.util.Map.of("error", reason, "unplayable", true));
+                        } catch (JsonProcessingException ignored) {
+                            // fall through to default handling
+                        }
+                    }
+                }
+            }
+        }
+
         if (e instanceof ContentNotAvailableException || e instanceof ErrorResponse)
             return e;
 
@@ -40,6 +68,21 @@ public class ExceptionHandler {
         }
 
         return e;
+    }
+
+    private static String videoIdFromPath(String path) {
+        String p = path;
+        int q = p.indexOf('?');
+        if (q >= 0) p = p.substring(0, q);
+        String id = null;
+        if (p.startsWith("/streams/")) {
+            id = p.substring("/streams/".length());
+        } else if (p.startsWith("/synth-hls/")) {
+            String rest = p.substring("/synth-hls/".length());
+            int slash = rest.indexOf('/');
+            id = slash >= 0 ? rest.substring(0, slash) : rest;
+        }
+        return (id != null && id.matches("[A-Za-z0-9_-]{11}")) ? id : null;
     }
 
     public static void throwErrorResponse(IStatusCode statusObj) {
