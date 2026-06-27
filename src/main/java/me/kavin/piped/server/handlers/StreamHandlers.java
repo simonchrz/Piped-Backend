@@ -77,6 +77,24 @@ public class StreamHandlers {
 
         Sentry.setExtra("videoId", videoId);
 
+        // Cold-tap Lever #1 (2026-06-27): a /streams?light tap reuses the resolve
+        // a prior /streams?light prefetch already seeded into the synth
+        // streamsCache, instead of a full StreamInfo.getInfo re-resolve. The seed
+        // is urlsVerified=true and cpn freshness is handled downstream at
+        // segment-serve time (synth swapCpn), so serving the cached Streams is
+        // safe. Only for light (the cold-tap path; a related-less response is
+        // expected there). Re-warm sidx+first-segment (idempotent, non-blocking)
+        // so the tap still primes Lever #2's disk cache.
+        if (light) {
+            Streams cachedStreams = SynthHlsHandlers.getFreshVerifiedStreams(videoId);
+            if (cachedStreams != null) {
+                SynthHlsHandlers.cacheStreams(videoId, cachedStreams, true, false, maxH, codecs);
+                System.out.println("[StreamHandlers] " + videoId
+                        + " /streams RESOLVE-CACHE HIT (prefetch-seeded, skipped re-resolve)");
+                return mapper.writeValueAsBytes(cachedStreams);
+            }
+        }
+
         final var futureStream = Multithreading.supplyAsync(() -> {
             Sentry.setExtra("videoId", videoId);
             ITransaction transaction = Sentry.startTransaction("StreamInfo fetch", "fetch");

@@ -319,6 +319,15 @@ public class SynthHlsHandlers {
     /// so its Streams are URL-verified (pass verified=true). Same short TTL —
     /// only the common scroll-prefetch → tap window benefits; longer gaps just
     /// re-resolve as before.
+    /// Cold-tap Lever #1 (2026-06-27): expose a fresh, URL-verified cached
+    /// resolve so the /streams tap can reuse what a prior /streams?light
+    /// prefetch already resolved, instead of a full StreamInfo.getInfo
+    /// re-resolve. Returns null on miss/stale/unverified.
+    public static Streams getFreshVerifiedStreams(String videoId) {
+        CacheEntry e = streamsCache.get(videoId);
+        return (e != null && e.fresh() && e.urlsVerified) ? e.streams : null;
+    }
+
     public static void cacheStreams(String videoId, Streams s, boolean urlsVerified) {
         cacheStreams(videoId, s, urlsVerified, false, 1080, DEFAULT_VIDEO_CODECS);
     }
@@ -389,7 +398,39 @@ public class SynthHlsHandlers {
         return SIDX_WARM_POOL.submit(() -> {
             try { SidxParserJava.fetch(url, is, ie, null); }
             catch (Throwable ignored) { /* best-effort warm */ }
+            // Lever #2 (prefetch-time, 2026-06-27): also kick the first media
+            // segment's download into the yt-proxy disk cache NOW. The variant-
+            // build prewarm fires only ~200ms before AVPlayer's first segment
+            // request -- too late to finish a 1-2MB segment, so the cold tap ate
+            // a ~887ms googlevideo round-trip. Running it here (audio + video0, on
+            // this bounded pool, seconds ahead during the scroll/foreground
+            // prefetch) makes that first fetch a disk HIT (~250ms).
+            try { prewarmFirstSegment(stream); }
+            catch (Throwable ignored) { /* best-effort warm */ }
         });
+    }
+
+    /// Lever #2 helper: parse a piped-proxy stream URL into the yt-proxy
+    /// (host, path, query) and start the cached first-chunk download. Mirrors
+    /// the extraction in rewriteToYtProxy, minus the URL-rewrite return.
+    /// Idempotent (prewarm early-returns if the .mp4 already exists) and
+    /// non-blocking (the download runs on the yt-proxy's own thread).
+    private static void prewarmFirstSegment(PipedStream stream) {
+        if (stream == null || stream.url == null) return;
+        String url = stream.url;
+        int q = url.indexOf('?');
+        if (q < 0) return;
+        String query = url.substring(q + 1);
+        String host = null;
+        for (String pair : query.split("&")) {
+            if (pair.startsWith("host=")) { host = pair.substring(5); break; }
+        }
+        if (host == null) return;
+        int pathStart = url.indexOf('/', 8);
+        String path = (pathStart >= 0 && pathStart < q) ? url.substring(pathStart, q) : "/";
+        String rest = java.util.Arrays.stream(query.split("&"))
+                .filter(p -> !p.startsWith("host=")).collect(java.util.stream.Collectors.joining("&"));
+        YtProxyHandlers.prewarm(host, path, rest);
     }
 
     /// Default to verified URLs — used by the segment-serving paths.
