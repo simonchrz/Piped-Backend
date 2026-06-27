@@ -188,7 +188,7 @@ public class SynthHlsHandlers {
         if (box == null) return "#ERROR: sabr sidx not found".getBytes(StandardCharsets.UTF_8);
         final int sidxStart = box[0];
         final int sidxEnd = sidxStart + box[1] - 1;
-        final String segUrl = me.kavin.piped.consts.Constants.PUBLIC_URL + "/sabr/" + videoId + "/" + itag;
+        final String segUrl = "/sabr/" + videoId + "/" + itag;
         final String fetchUrl = "http://localhost:" + me.kavin.piped.consts.Constants.PORT + "/sabr/" + videoId + "/" + itag;
         final SidxParserJava.Data sidx = SidxParserJava.fetch(fetchUrl, sidxStart, sidxEnd, null);
         if (sidx == null || sidx.entries.isEmpty())
@@ -683,7 +683,7 @@ public class SynthHlsHandlers {
         // mpv asks for the first segment) so it is a cache HIT, not a ~850ms
         // synchronous googlevideo pull. Single fetch - the yt-proxy caches.
         YtProxyHandlers.prewarm(host, path, rest);
-        return me.kavin.piped.consts.Constants.PUBLIC_URL + "/yt-proxy/" + host + path
+        return "/yt-proxy/" + host + path
                 + (rest.isEmpty() ? "" : "?" + rest);
     }
 
