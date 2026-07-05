@@ -2,6 +2,8 @@ package me.kavin.piped.utils.sabr;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import me.kavin.piped.consts.Constants;
+import me.kavin.piped.utils.BgPoTokenProvider;
+import org.schabi.newpipe.extractor.services.youtube.PoTokenResult;
 
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -9,6 +11,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.zip.GZIPInputStream;
 
@@ -26,7 +29,7 @@ public final class SabrHandlers {
     /// Bounded by androidPlayer's own timeouts; any failure = not viable.
     public static boolean sabrViable(String videoId) {
         try {
-            return androidPlayer(videoId)
+            return androidPlayer(videoId, null)
                     .path("streamingData").path("serverAbrStreamingUrl")
                     .asText(null) != null;
         } catch (Exception e) {
@@ -36,11 +39,30 @@ public final class SabrHandlers {
 
     /// Result of one SABR session: which itags the format picker actually chose
     /// (NOT always 140/137 — videos without 1080p avc fall back to the first
-    /// matching format) plus the reassembled media bytes per itag.
-    public record SabrMedia(int audioItag, int videoItag, Map<Integer, byte[]> media) {}
+    /// matching format). Media bytes are streamed to the caller's Sink, not
+    /// returned — a full-length video is ~1 GB and must not live in RAM.
+    public record SabrMedia(int audioItag, int videoItag) {}
 
-    public static SabrMedia runSession(String videoId) throws Exception {
-        final JsonNode player = androidPlayer(videoId);
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink) throws Exception {
+        // A pooled visitorData-bound po_token authorizes the gvs streaming session.
+        // Without it googlevideo caps the SABR readahead at ~60s (one buffer window)
+        // then stops. visitorData goes into the player context; the po_token bytes
+        // go into every ABR streamerContext (SabrSession field 2).
+        final BgPoTokenProvider bg = BgPoTokenProvider.instance();
+        String visitorData = null;
+        byte[] poToken = null;
+        if (bg != null) {
+            final PoTokenResult pot = bg.sabrSessionPoToken();
+            if (pot != null) {
+                visitorData = pot.visitorData;
+                if (pot.playerRequestPoToken != null) poToken = b64(pot.playerRequestPoToken);
+            }
+        }
+        System.out.println("[Sabr] " + videoId + " runSession poToken="
+                + (poToken != null ? poToken.length + "B" : "NONE")
+                + " visitor=" + (visitorData != null ? "yes" : "no"));
+
+        final JsonNode player = androidPlayer(videoId, visitorData);
         final JsonNode sd = player.path("streamingData");
         final String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
         final String ustB64 = findFirst(player, "videoPlaybackUstreamerConfig");
@@ -56,9 +78,12 @@ public final class SabrHandlers {
                 .varintField(64, 34).toByteArray();
         final SabrSession.Fmt pa = new SabrSession.Fmt(aud.path("itag").asInt(), aud.path("lastModified").asLong());
         final SabrSession.Fmt pv = new SabrSession.Fmt(vid.path("itag").asInt(), vid.path("lastModified").asLong());
-        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA);
-        return new SabrMedia(aud.path("itag").asInt(), vid.path("itag").asInt(),
-                session.fetchAll(500).media);
+        // maxIterations bumped 500 -> 8000: a full-length video needs one round per
+        // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
+        // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
+        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA, poToken);
+        session.fetchAll(8000, sink);
+        return new SabrMedia(aud.path("itag").asInt(), vid.path("itag").asInt());
     }
 
     private static JsonNode pickFormat(JsonNode sd, String mimePrefix, int preferItag) {
@@ -70,12 +95,14 @@ public final class SabrHandlers {
         return firstMatch;
     }
 
-    private static JsonNode androidPlayer(String videoId) throws Exception {
+    private static JsonNode androidPlayer(String videoId, String visitorData) throws Exception {
+        final Map<String, Object> client = new HashMap<>(Map.of(
+                "clientName", "ANDROID", "clientVersion", "20.10.38",
+                "androidSdkVersion", 34, "hl", "en", "gl", "US",
+                "osName", "Android", "osVersion", "14", "userAgent", ANDROID_UA));
+        if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
         final String body = Constants.mapper.writeValueAsString(Map.of(
-                "context", Map.of("client", Map.of(
-                        "clientName", "ANDROID", "clientVersion", "20.10.38",
-                        "androidSdkVersion", 34, "hl", "en", "gl", "US",
-                        "osName", "Android", "osVersion", "14", "userAgent", ANDROID_UA)),
+                "context", Map.of("client", client),
                 "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
         final byte[] resp = httpPost(
                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",

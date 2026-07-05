@@ -1,6 +1,5 @@
 package me.kavin.piped.utils;
 
-import lombok.RequiredArgsConstructor;
 import org.jetbrains.annotations.Nullable;
 import org.schabi.newpipe.extractor.services.youtube.PoTokenProvider;
 import org.schabi.newpipe.extractor.services.youtube.PoTokenResult;
@@ -13,10 +12,41 @@ import java.util.regex.Pattern;
 
 import static me.kavin.piped.consts.Constants.mapper;
 
-@RequiredArgsConstructor
 public class BgPoTokenProvider implements PoTokenProvider {
 
     private final String bgHelperUrl;
+
+    // Singleton handle so non-NewPipe call sites (the SABR session, which talks
+    // to googlevideo directly, not via YoutubeStreamExtractor) can reuse the warm
+    // pool + bg-helper without threading an instance through. Set in the ctor;
+    // Main.java constructs exactly one and hands it to setPoTokenProvider().
+    private static volatile BgPoTokenProvider INSTANCE;
+
+    public static @Nullable BgPoTokenProvider instance() { return INSTANCE; }
+
+    public BgPoTokenProvider(String bgHelperUrl) {
+        this.bgHelperUrl = bgHelperUrl;
+        INSTANCE = this;
+    }
+
+    /// SABR accessor: a pooled visitorData-bound token (the same shape yt-dlp uses
+    /// for logged-out googlevideo streaming). Returns null if the pool/helper is
+    /// unavailable. Used by SabrHandlers to authorize the ANDROID player call
+    /// (visitorData in context) + the ABR streamerContext (po_token bytes).
+    public @Nullable PoTokenResult sabrSessionPoToken() {
+        try {
+            return getPoTokenPooled();
+        } catch (Exception e) {
+            System.out.println("[Piped/Bg] sabrSessionPoToken failed: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /// SABR accessor: a videoId-content-bound token (fallback experiment path if
+    /// the visitorData-bound one is rejected by the ANDROID SABR session).
+    public @Nullable String sabrContentBoundPoToken(String videoId) {
+        return mintContentBoundPoToken(videoId);
+    }
 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 

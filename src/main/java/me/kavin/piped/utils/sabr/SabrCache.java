@@ -4,7 +4,9 @@ import io.activej.http.HttpHeaderValue;
 import io.activej.http.HttpHeaders;
 import io.activej.http.HttpResponse;
 
+import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -109,13 +111,36 @@ public final class SabrCache {
     }
 
     private static void download(String videoId) throws Exception {
-        final SabrHandlers.SabrMedia result = SabrHandlers.runSession(videoId);
-        for (Map.Entry<Integer, byte[]> e : result.media().entrySet()) {
-            if (e.getValue() == null || e.getValue().length == 0) continue;
-            final Path tmp = DIR.resolve(safe(videoId) + "_" + e.getKey() + ".tmp");
-            Files.write(tmp, e.getValue());
-            Files.move(tmp, DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin"),
-                    StandardCopyOption.REPLACE_EXISTING);
+        // Stream each format straight to a .part file as segments arrive (Sink),
+        // then atomically publish .part -> .bin. Keeps ~1 GB videos off the heap
+        // (the whole point — the 2 GB container can't hold a full video in RAM).
+        final Map<Integer, Path> parts = new ConcurrentHashMap<>();
+        final Map<Integer, OutputStream> opened = new ConcurrentHashMap<>();
+        final SabrSession.Sink sink = itag -> {
+            final Path part = DIR.resolve(safe(videoId) + "_" + itag + ".part");
+            final OutputStream os = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20);
+            parts.put(itag, part);
+            opened.put(itag, os);
+            return os;
+        };
+        final SabrHandlers.SabrMedia result;
+        try {
+            result = SabrHandlers.runSession(videoId, sink);
+        } finally {
+            // the session closes the streams it was handed; this is defensive for
+            // the error path (runSession throws before the session's finally runs).
+            for (OutputStream os : opened.values()) { try { os.close(); } catch (IOException ignored) {} }
+        }
+        for (Map.Entry<Integer, Path> e : parts.entrySet()) {
+            final Path part = e.getValue();
+            try {
+                if (Files.exists(part) && Files.size(part) > 0) {
+                    Files.move(part, DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin"),
+                            StandardCopyOption.REPLACE_EXISTING);
+                } else {
+                    Files.deleteIfExists(part);
+                }
+            } catch (IOException ignored) {}
         }
         // Manifest with the ACTUAL picked itags so the serving layer doesn't
         // have to guess (videos without 1080p avc don't yield 137).
@@ -220,7 +245,8 @@ public final class SabrCache {
             Files.createDirectories(dir);
             try (var stream = Files.list(dir)) {
                 for (Path p : (Iterable<Path>) stream::iterator) {
-                    if (p.getFileName().toString().endsWith(".tmp")) {
+                    final String n = p.getFileName().toString();
+                    if (n.endsWith(".tmp") || n.endsWith(".part")) {   // orphaned partial downloads
                         try { Files.deleteIfExists(p); } catch (IOException ignored) {}
                     }
                 }
