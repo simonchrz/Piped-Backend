@@ -328,6 +328,37 @@ public class SynthHlsHandlers {
         return (e != null && e.fresh() && e.urlsVerified) ? e.streams : null;
     }
 
+    /// Serve-stale (backlog #6, built 2026-07-05): the last known-good resolve,
+    /// PAST its freshness TTL but with googlevideo URLs still signature-valid
+    /// (the `expire` param covers ~6h; the cache TTL is only minutes). Used as a
+    /// fallback when a re-resolve fails during a transient throttle wave —
+    /// serving a stale-but-valid resolve beats surfacing "Video nicht
+    /// verfügbar". Entries stay in the map until overwritten, so this works
+    /// long after fresh() lapses. cpn freshness is handled downstream per play
+    /// (swapCpn), so an old resolve is throttle-safe to serve. Returns null if
+    /// there's no entry or its URLs are within 120s of expiry.
+    public static Streams getStaleServableStreams(String videoId) {
+        CacheEntry e = streamsCache.get(videoId);
+        if (e == null || e.streams == null) return null;
+        Streams s = e.streams;
+        if (s.videoStreams == null || s.videoStreams.isEmpty()
+                || s.audioStreams == null || s.audioStreams.isEmpty()) return null;
+        long exp = urlExpireEpoch(s.videoStreams.get(0).url);
+        if (exp <= 0 || exp < System.currentTimeMillis() / 1000 + 120) return null;
+        return s;
+    }
+
+    private static final java.util.regex.Pattern EXPIRE_RE =
+            java.util.regex.Pattern.compile("[?&]expire=(\\d+)");
+
+    /// The googlevideo `expire` epoch of a stream URL (signature validity), or 0.
+    private static long urlExpireEpoch(String url) {
+        if (url == null) return 0;
+        var m = EXPIRE_RE.matcher(url);
+        if (!m.find()) return 0;
+        try { return Long.parseLong(m.group(1)); } catch (NumberFormatException e) { return 0; }
+    }
+
     public static void cacheStreams(String videoId, Streams s, boolean urlsVerified) {
         cacheStreams(videoId, s, urlsVerified, false, 1080, DEFAULT_VIDEO_CODECS);
     }
@@ -469,7 +500,21 @@ public class SynthHlsHandlers {
                 s = e.streams;
             } else {
                 long r0 = System.currentTimeMillis();
-                s = resolveStreams(videoId);
+                try {
+                    s = resolveStreams(videoId);
+                } catch (Exception rex) {
+                    // Serve-stale net: re-resolve dead (throttle wave), but the
+                    // previous resolve's URLs are still signature-valid → serve
+                    // those instead of erroring. Cache entry is NOT re-stamped,
+                    // so the next request tries a real resolve again.
+                    Streams stale = getStaleServableStreams(videoId);
+                    if (stale != null) {
+                        System.out.println("[SynthHls] " + videoId + " resolve failed ("
+                                + rex.getClass().getSimpleName() + ") -> serving STALE resolve (urls valid)");
+                        return stale;
+                    }
+                    throw rex;
+                }
                 resolveMs = System.currentTimeMillis() - r0;
                 didResolve = true;
             }
@@ -529,7 +574,15 @@ public class SynthHlsHandlers {
                         + me.kavin.piped.utils.EgressManager.activeLabel() + ", retry");
                 return resolveStreamsInner(videoId);
             }
-            throw ex;
+            // Transient resolve failure (innertube timeout/IO during a googlevideo
+            // throttle wave). Waves pass within seconds — observed 2026-07-05: one
+            // attempt timed out at 10s, the next landed in 2s. One paused retry
+            // turns "Video nicht verfügbar" into a slightly slower play. Only ONE
+            // retry: the fetchStreams caller has a serve-stale net behind this.
+            System.out.println("[SynthHls] " + videoId + " resolve failed ("
+                    + ex.getClass().getSimpleName() + ") -> one-shot retry in 2s");
+            Thread.sleep(2000);
+            return resolveStreamsInner(videoId);
         }
     }
 

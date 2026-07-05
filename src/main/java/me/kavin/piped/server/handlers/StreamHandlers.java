@@ -185,6 +185,20 @@ public class StreamHandlers {
                             }
                             if (info == null) throw sie; // anonymous AND authenticated dead
                             break;
+                        } catch (ContentNotAvailableException perm) {
+                            throw perm; // permanent (unavailable/geo) — retrying can't help
+                        } catch (Exception rex) {
+                            // Transient resolve failure (innertube timeout/IO during a
+                            // googlevideo throttle wave — observed 2026-07-05: one attempt
+                            // timed out at 10s, the next landed in 2s). ONE paused retry;
+                            // a second 10s-failure would blow the outer 18s budget anyway
+                            // (the TimeoutException catch there has the serve-stale net).
+                            if (attempt >= 1) throw rex;
+                            System.out.println("[StreamHandlers] " + videoId + " attempt " + (attempt + 1)
+                                    + " resolve failed transient (" + rex.getClass().getSimpleName()
+                                    + ") -> retry in 1.5s");
+                            Thread.sleep(1500);
+                            continue;
                         }
                         final boolean hasAudio = info != null && !info.getAudioStreams().isEmpty();
                         final boolean hasVideo = info != null && (!info.getVideoStreams().isEmpty()
@@ -499,8 +513,30 @@ public class StreamHandlers {
                     !(exception instanceof ContentNotAvailableException contentNotAvailableException && (contentNotAvailableException.getMessage().equals("This video is not available") || contentNotAvailableException.getMessage().equals("Got error: \"Video unavailable\""))) &&
                             !(e.getCause() instanceof GeographicRestrictionException)
             ) {
+                // Serve-stale net (2026-07-05): the resolve died transiently (throttle
+                // wave), but a previous resolve's googlevideo URLs are still
+                // signature-valid (~6h) — serve those instead of erroring. cpn is
+                // re-stamped per play downstream (synth swapCpn), so this is safe.
+                Streams stale = SynthHlsHandlers.getStaleServableStreams(videoId);
+                if (stale != null) {
+                    System.out.println("[StreamHandlers] " + videoId + " resolve failed ("
+                            + (exception == null ? "?" : exception.getClass().getSimpleName())
+                            + ") -> serving STALE cached resolve");
+                    return mapper.writeValueAsBytes(stale);
+                }
                 ExceptionUtils.rethrow(e);
             }
+        } catch (TimeoutException te) {
+            // The 18s outer budget fired (both cascade attempts hung on a throttle
+            // wave). Same stale net as above; without it this propagated as a raw
+            // 500 to the app ("Video nicht verfügbar").
+            Streams stale = SynthHlsHandlers.getStaleServableStreams(videoId);
+            if (stale != null) {
+                System.out.println("[StreamHandlers] " + videoId
+                        + " resolve timed out (18s) -> serving STALE cached resolve");
+                return mapper.writeValueAsBytes(stale);
+            }
+            throw te;
         }
 
         if (info == null) {
