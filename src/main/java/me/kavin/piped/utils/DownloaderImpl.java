@@ -249,10 +249,62 @@ public class DownloaderImpl extends Downloader {
                     resp.finalUrl());
         }, Multithreading.getCachedExecutor());
 
+        Response response;
         try {
-            return responseFuture.get(10, TimeUnit.SECONDS);
+            response = responseFuture.get(10, TimeUnit.SECONDS);
         } catch (InterruptedException | ExecutionException | TimeoutException e) {
             throw new IOException(e);
         }
+
+        // Custom: truncated-body guard for HTML page scrapes. The transport
+        // can deliver a partial body as if complete (observed 2026-07-06:
+        // embed pages cut near 32 KB losing the ytcfg fields past that
+        // offset — same silent-truncation class as the Mac source cache).
+        // A body that STARTS as an HTML document but doesn't END with
+        // </html> is incomplete: refetch once. JSON/JS responses never
+        // match the prefix, so innertube/base.js are untouched. On a
+        // second short read the response is returned as-is — consumers
+        // (e.g. WebEmbedModern's field check) keep their own backstops.
+        if (isTruncatedHtml(response)) {
+            System.out.println("[Downloader] truncated HTML from " + request.url()
+                    + " (size=" + response.responseBody().length() + ") -> refetch");
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                throw new IOException(ie);
+            }
+            var retryFuture = ReqwestUtils.fetchWithProxy(request.url(), request.httpMethod(),
+                            bytes, headers, EgressManager.activeEgress())
+                    .thenApplyAsync(resp -> {
+                        Map<String, List<String>> headerMap = resp.headers().entrySet().stream()
+                                .collect(Object2ObjectOpenHashMap::new, (m, e) -> m.put(e.getKey(), List.of(e.getValue())), Map::putAll);
+                        return new Response(resp.status(), null, headerMap, new String(resp.body()),
+                                resp.finalUrl());
+                    }, Multithreading.getCachedExecutor());
+            try {
+                response = retryFuture.get(10, TimeUnit.SECONDS);
+            } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                throw new IOException(e);
+            }
+            if (isTruncatedHtml(response)) {
+                System.out.println("[Downloader] STILL truncated after refetch: " + request.url()
+                        + " (size=" + response.responseBody().length() + ")");
+            }
+        }
+        return response;
+    }
+
+    private static boolean isTruncatedHtml(Response response) {
+        if (response.responseCode() < 200 || response.responseCode() >= 300)
+            return false;
+        String body = response.responseBody();
+        if (body == null || body.isEmpty())
+            return false;
+        String head = body.substring(0, Math.min(body.length(), 256)).stripLeading().toLowerCase();
+        if (!(head.startsWith("<!doctype html") || head.startsWith("<html")))
+            return false;
+        int tailFrom = Math.max(0, body.length() - 256);
+        return !body.substring(tailFrom).stripTrailing().toLowerCase().contains("</html>");
     }
 }
