@@ -46,7 +46,7 @@ public class Main {
 
         ReqwestUtils.init(REQWEST_PROXY, REQWEST_PROXY_USER, REQWEST_PROXY_PASS);
 
-        NewPipe.init(new DownloaderImpl(), new Localization("en", "US"), ContentCountry.DEFAULT);
+        NewPipe.init(new DownloaderImpl(), new Localization("de", "DE"), new ContentCountry("DE"));
         if (!StringUtils.isEmpty(Constants.BG_HELPER_URL))
             YoutubeStreamExtractor.setPoTokenProvider(new BgPoTokenProvider(Constants.BG_HELPER_URL));
         YoutubeStreamExtractor.setFetchIosClient(false);
