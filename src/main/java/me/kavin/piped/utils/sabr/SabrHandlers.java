@@ -29,7 +29,7 @@ public final class SabrHandlers {
     /// Bounded by androidPlayer's own timeouts; any failure = not viable.
     public static boolean sabrViable(String videoId) {
         try {
-            return androidPlayer(videoId, null)
+            return androidPlayer(videoId, null, null)
                     .path("streamingData").path("serverAbrStreamingUrl")
                     .asText(null) != null;
         } catch (Exception e) {
@@ -39,11 +39,21 @@ public final class SabrHandlers {
 
     /// Result of one SABR session: which itags the format picker actually chose
     /// (NOT always 140/137 — videos without 1080p avc fall back to the first
-    /// matching format). Media bytes are streamed to the caller's Sink, not
-    /// returned — a full-length video is ~1 GB and must not live in RAM.
-    public record SabrMedia(int audioItag, int videoItag) {}
+    /// matching format), plus the session outcome so SabrCache can decide on a
+    /// family-retry (SABR_ERROR/empty) or a later refill (incomplete). Media
+    /// bytes are streamed to the caller's Sink, not returned — a full-length
+    /// video is ~1 GB and must not live in RAM.
+    public record SabrMedia(int audioItag, int videoItag,
+                            boolean complete, String stopReason, long segments) {}
 
     public static SabrMedia runSession(String videoId, SabrSession.Sink sink) throws Exception {
+        return runSession(videoId, sink, null);
+    }
+
+    /// family: explicit egress family ("v4"/"v6") for BOTH the ANDROID player
+    /// resolve and the SABR session — gvs URLs are IP-signed, so a mismatch
+    /// between resolve- and stream-family 403s. null = global ACTIVE family.
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink, String family) throws Exception {
         // A pooled visitorData-bound po_token authorizes the gvs streaming session.
         // Without it googlevideo caps the SABR readahead at ~60s (one buffer window)
         // then stops. visitorData goes into the player context; the po_token bytes
@@ -62,7 +72,7 @@ public final class SabrHandlers {
                 + (poToken != null ? poToken.length + "B" : "NONE")
                 + " visitor=" + (visitorData != null ? "yes" : "no"));
 
-        final JsonNode player = androidPlayer(videoId, visitorData);
+        final JsonNode player = androidPlayer(videoId, visitorData, family);
         final JsonNode sd = player.path("streamingData");
         final String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
         final String ustB64 = findFirst(player, "videoPlaybackUstreamerConfig");
@@ -81,9 +91,15 @@ public final class SabrHandlers {
         // maxIterations bumped 500 -> 8000: a full-length video needs one round per
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
-        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA, poToken);
-        session.fetchAll(8000, sink);
-        return new SabrMedia(aud.path("itag").asInt(), vid.path("itag").asInt());
+        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA, poToken, family);
+        final SabrSession.Result res = session.fetchAll(8000, sink);
+        long segs = 0;
+        for (var info : res.perFormat.values()) {
+            final Object v = info.get("segments");
+            if (v instanceof Number n) segs += n.longValue();
+        }
+        return new SabrMedia(aud.path("itag").asInt(), vid.path("itag").asInt(),
+                res.complete, res.stopReason, segs);
     }
 
     private static JsonNode pickFormat(JsonNode sd, String mimePrefix, int preferItag) {
@@ -95,7 +111,7 @@ public final class SabrHandlers {
         return firstMatch;
     }
 
-    private static JsonNode androidPlayer(String videoId, String visitorData) throws Exception {
+    private static JsonNode androidPlayer(String videoId, String visitorData, String family) throws Exception {
         final Map<String, Object> client = new HashMap<>(Map.of(
                 "clientName", "ANDROID", "clientVersion", "20.10.38",
                 "androidSdkVersion", 34, "hl", "en", "gl", "US",
@@ -104,11 +120,31 @@ public final class SabrHandlers {
         final String body = Constants.mapper.writeValueAsString(Map.of(
                 "context", Map.of("client", client),
                 "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
-        final byte[] resp = httpPost(
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                body.getBytes(StandardCharsets.UTF_8), "application/json", true,
-                Map.of("User-Agent", ANDROID_UA, "X-Youtube-Client-Name", "3",
-                        "X-Youtube-Client-Version", "20.10.38"));
+        final byte[] resp;
+        if (family != null) {
+            // Explicit-family attempt: same reqwest4j family-pinned socket the
+            // SABR session will use, so the returned serverAbrStreamingUrl is
+            // signed for the family we actually stream on. No gzip — reqwest4j
+            // returns raw bytes and the JSON is small.
+            final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    "POST", body.getBytes(StandardCharsets.UTF_8),
+                    Map.of("Content-Type", "application/json",
+                            "Accept-Encoding", "identity",
+                            "User-Agent", ANDROID_UA, "X-Youtube-Client-Name", "3",
+                            "X-Youtube-Client-Version", "20.10.38"),
+                    family).get(20, java.util.concurrent.TimeUnit.SECONDS);
+            if (r.status() / 100 != 2)
+                throw new IllegalStateException("ANDROID player HTTP " + r.status()
+                        + " (egress=" + family + ")");
+            resp = r.body();
+        } else {
+            resp = httpPost(
+                    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    body.getBytes(StandardCharsets.UTF_8), "application/json", true,
+                    Map.of("User-Agent", ANDROID_UA, "X-Youtube-Client-Name", "3",
+                            "X-Youtube-Client-Version", "20.10.38"));
+        }
         return Constants.mapper.readTree(resp);
     }
 

@@ -111,21 +111,60 @@ public final class SabrCache {
     }
 
     private static void download(String videoId) throws Exception {
-        // Stream each format straight to a .part file as segments arrive (Sink),
-        // then atomically publish .part -> .bin. Keeps ~1 GB videos off the heap
-        // (the whole point — the 2 GB container can't hold a full video in RAM).
+        // Attempt 1 on the global ACTIVE egress family. If the session dies with
+        // SABR_ERROR or produced nothing (googlevideo hard-403 on that family —
+        // seen 2026-07-23 on made-for-kids content during a storm), retry ONCE on
+        // the other family: resolve + session are family-pinned together (gvs
+        // URLs are IP-signed). Whichever attempt wrote more survives (keep-larger
+        // publish), so a refill can never regress an existing partial cache.
+        final String fam1 = me.kavin.piped.utils.EgressManager.activeEgress();
+        SabrHandlers.SabrMedia result = attempt(videoId, fam1);
+        if (result == null || (!result.complete()
+                && ("SABR_ERROR".equals(result.stopReason()) || result.segments() == 0))) {
+            final String fam2 = me.kavin.piped.utils.EgressManager.otherFamily();
+            if (!fam2.equals(fam1)) {
+                System.out.println("[SabrCache] " + videoId + " attempt on " + fam1
+                        + (result == null ? " threw" : " " + result.stopReason()
+                        + " (segs=" + result.segments() + ")")
+                        + " -> family-retry on " + fam2);
+                final SabrHandlers.SabrMedia r2 = attempt(videoId, fam2);
+                if (r2 != null && (result == null || r2.segments() > result.segments())) {
+                    result = r2;
+                    System.out.println("[SabrCache] " + videoId + " family-retry " + fam2
+                            + " won (segs=" + r2.segments() + " complete=" + r2.complete() + ")");
+                }
+            }
+        }
+        if (result == null)
+            throw new IllegalStateException("sabr: both family attempts failed for " + videoId);
+        // Manifest with the ACTUAL picked itags so the serving layer doesn't
+        // have to guess (videos without 1080p avc don't yield 137).
+        Files.writeString(DIR.resolve(safe(videoId) + ".itags"),
+                result.audioItag() + " " + result.videoItag());
+        maybeEvict();
+    }
+
+    /// One SABR download attempt on an explicit egress family: streams each
+    /// format to a fresh .part (Sink), then publishes .part -> .bin — but only
+    /// when the .part is LARGER than any existing .bin, so a storm-crippled
+    /// attempt (or refill) can't overwrite a better earlier cache. Returns the
+    /// session result, or null when the session threw before finishing.
+    private static SabrHandlers.SabrMedia attempt(String videoId, String family) {
         final Map<Integer, Path> parts = new ConcurrentHashMap<>();
         final Map<Integer, OutputStream> opened = new ConcurrentHashMap<>();
         final SabrSession.Sink sink = itag -> {
             final Path part = DIR.resolve(safe(videoId) + "_" + itag + ".part");
+            Files.deleteIfExists(part);
             final OutputStream os = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20);
             parts.put(itag, part);
             opened.put(itag, os);
             return os;
         };
-        final SabrHandlers.SabrMedia result;
+        SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink);
+            result = SabrHandlers.runSession(videoId, sink, family);
+        } catch (Exception e) {
+            System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {
             // the session closes the streams it was handed; this is defensive for
             // the error path (runSession throws before the session's finally runs).
@@ -133,20 +172,47 @@ public final class SabrCache {
         }
         for (Map.Entry<Integer, Path> e : parts.entrySet()) {
             final Path part = e.getValue();
+            final Path bin = DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin");
             try {
-                if (Files.exists(part) && Files.size(part) > 0) {
-                    Files.move(part, DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin"),
-                            StandardCopyOption.REPLACE_EXISTING);
+                final long partSize = Files.exists(part) ? Files.size(part) : 0;
+                final long binSize = Files.exists(bin) ? Files.size(bin) : 0;
+                if (partSize > binSize) {
+                    Files.move(part, bin, StandardCopyOption.REPLACE_EXISTING);
                 } else {
                     Files.deleteIfExists(part);
                 }
             } catch (IOException ignored) {}
         }
-        // Manifest with the ACTUAL picked itags so the serving layer doesn't
-        // have to guess (videos without 1080p avc don't yield 137).
-        Files.writeString(DIR.resolve(safe(videoId) + ".itags"),
-                result.audioItag() + " " + result.videoItag());
-        maybeEvict();
+        return result;
+    }
+
+    // ── refill (incomplete cache heal) ──────────────────────────────────────
+    // The synth-hls playlist layer calls requestRefill when the sidx promises
+    // more bytes than the cache file holds (= a storm truncated the download).
+    // Async + per-video cooldown so playlist polls don't stack sessions; the
+    // keep-larger publish in attempt() makes refills monotonic.
+    private static final ConcurrentHashMap<String, Long> REFILL_LAST = new ConcurrentHashMap<>();
+    private static final long REFILL_COOLDOWN_MS = 5 * 60_000L;
+
+    public static void requestRefill(String videoId) {
+        final long now = System.currentTimeMillis();
+        final boolean[] go = {false};
+        REFILL_LAST.compute(videoId, (k, prev) -> {
+            if (prev != null && now - prev < REFILL_COOLDOWN_MS) return prev;
+            go[0] = true;
+            return now;
+        });
+        if (!go[0]) return;
+        Thread.ofVirtual().name("sabr-refill-" + videoId).start(() -> {
+            synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
+                try {
+                    System.out.println("[SabrCache] " + videoId + " refill (incomplete cache)");
+                    download(videoId);
+                } catch (Exception e) {
+                    System.out.println("[SabrCache] " + videoId + " refill failed: " + e.getMessage());
+                }
+            }
+        });
     }
 
     private static HttpResponse serveFile(Path file, int itag, String range, boolean head) throws IOException {

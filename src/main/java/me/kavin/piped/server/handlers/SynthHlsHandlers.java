@@ -185,14 +185,21 @@ public class SynthHlsHandlers {
         final java.nio.file.Path file = me.kavin.piped.utils.sabr.SabrCache.ensureFile(videoId, itag);
         if (file == null) return "#ERROR: sabr download failed".getBytes(StandardCharsets.UTF_8);
         final int[] box = scanSabrSidx(file);
-        if (box == null) return "#ERROR: sabr sidx not found".getBytes(StandardCharsets.UTF_8);
+        if (box == null) {
+            // Cache so short it lacks even ftyp/moov/sidx — a storm killed the
+            // download before the first UMP media arrived. Kick a refill.
+            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+            return "#ERROR: sabr sidx not found".getBytes(StandardCharsets.UTF_8);
+        }
         final int sidxStart = box[0];
         final int sidxEnd = sidxStart + box[1] - 1;
         final String segUrl = "/sabr/" + videoId + "/" + itag;
         final String fetchUrl = "http://localhost:" + me.kavin.piped.consts.Constants.PORT + "/sabr/" + videoId + "/" + itag;
         final SidxParserJava.Data sidx = SidxParserJava.fetch(fetchUrl, sidxStart, sidxEnd, null);
-        if (sidx == null || sidx.entries.isEmpty())
+        if (sidx == null || sidx.entries.isEmpty()) {
+            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
             return "#ERROR: sabr sidx parse failed".getBytes(StandardCharsets.UTF_8);
+        }
 
         StringBuilder sb = new StringBuilder();
         sb.append("#EXTM3U\n#EXT-X-VERSION:7\n");
@@ -205,14 +212,31 @@ public class SynthHlsHandlers {
         sb.append("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n");
         // init segment = everything before the sidx box (ftyp + moov) = [0, sidxStart-1]
         sb.append(String.format("#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%d@%d\"\n", segUrl, sidxStart, 0));
+        // HONEST playlist (2026-07-23): the sidx indexes the WHOLE video, but a
+        // storm-truncated SABR download leaves the cache file short — advertising
+        // segments beyond the file made /sabr answer 416 and AVPlayer refuse the
+        // video outright. Emit only segments whose bytes are fully on disk; while
+        // truncated, serve EVENT-style (no ENDLIST -> the player polls and the
+        // playlist grows as the refill fills the cache).
+        final long fileLen = java.nio.file.Files.size(file);
         long cursor = sidxEnd + 1L + sidx.firstOffset;
+        int emitted = 0;
         for (SidxParserJava.Entry e : sidx.entries) {
+            if (cursor + e.byteSize > fileLen) break;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
             sb.append(String.format("#EXT-X-BYTERANGE:%d@%d\n", e.byteSize, cursor));
             sb.append(segUrl).append('\n');
             cursor += e.byteSize;
+            emitted++;
         }
-        sb.append("#EXT-X-ENDLIST");
+        if (emitted >= sidx.entries.size()) {
+            sb.append("#EXT-X-ENDLIST");
+        } else {
+            System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated: "
+                    + emitted + "/" + sidx.entries.size() + " segments on disk ("
+                    + fileLen + "B) -> EVENT playlist + refill");
+            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+        }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 

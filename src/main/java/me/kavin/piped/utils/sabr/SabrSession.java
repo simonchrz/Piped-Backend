@@ -2,10 +2,7 @@ package me.kavin.piped.utils.sabr;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -41,6 +38,7 @@ public final class SabrSession {
     public static final class Result {
         public int iterations;
         public boolean complete;
+        public String stopReason = "";
         public final Map<Integer, Map<String, Object>> perFormat = new LinkedHashMap<>();
     }
 
@@ -108,15 +106,23 @@ public final class SabrSession {
     private final Fmt prefAudio;
     private final Fmt prefVideo;
     private final byte[] poToken;   // decoded gvs po_token bytes, or null
+    private final String egressFamily; // "v4"/"v6" — gvs URLs are IP-signed, so the
+                                       // session MUST egress on the same family the
+                                       // player resolve used. null = global ACTIVE.
     private Sink sink;              // set at fetch start
 
     public SabrSession(String abrUrl, byte[] ustreamerConfig, Fmt prefAudio, Fmt prefVideo,
                        byte[] clientInfo, String userAgent) {
-        this(abrUrl, ustreamerConfig, prefAudio, prefVideo, clientInfo, userAgent, null);
+        this(abrUrl, ustreamerConfig, prefAudio, prefVideo, clientInfo, userAgent, null, null);
     }
 
     public SabrSession(String abrUrl, byte[] ustreamerConfig, Fmt prefAudio, Fmt prefVideo,
                        byte[] clientInfo, String userAgent, byte[] poToken) {
+        this(abrUrl, ustreamerConfig, prefAudio, prefVideo, clientInfo, userAgent, poToken, null);
+    }
+
+    public SabrSession(String abrUrl, byte[] ustreamerConfig, Fmt prefAudio, Fmt prefVideo,
+                       byte[] clientInfo, String userAgent, byte[] poToken, String egressFamily) {
         this.abrUrl = abrUrl;
         this.ustreamerConfig = ustreamerConfig;
         this.prefAudio = prefAudio;
@@ -124,6 +130,7 @@ public final class SabrSession {
         this.clientInfo = clientInfo;
         this.userAgent = userAgent;
         this.poToken = poToken;
+        this.egressFamily = egressFamily;
     }
 
     public Result fetchAll(int maxIterations, Sink sink) throws Exception {
@@ -207,6 +214,7 @@ public final class SabrSession {
         } finally {
             for (FState s : states.values()) s.close();
         }
+        res.stopReason = stopReason;
         System.out.println("[Sabr] session end: complete=" + res.complete + " iters=" + res.iterations
                 + " stop=" + stopReason);
         return res;
@@ -372,19 +380,20 @@ public final class SabrSession {
     }
 
     private byte[] post(byte[] body) throws Exception {
-        final HttpURLConnection c = (HttpURLConnection) new URL(abrUrl).openConnection();
-        try {
-            c.setRequestMethod("POST");
-            c.setDoOutput(true);
-            c.setConnectTimeout(10_000);
-            c.setReadTimeout(30_000);
-            c.setRequestProperty("Content-Type", "application/x-protobuf");
-            c.setRequestProperty("Accept-Encoding", "identity");
-            c.setRequestProperty("User-Agent", userAgent);
-            try (OutputStream os = c.getOutputStream()) { os.write(body); }
-            try (InputStream is = c.getInputStream()) { return is.readAllBytes(); }
-        } finally {
-            c.disconnect();
-        }
+        // Through reqwest4j so the socket binds to an explicit egress family —
+        // gvs URLs are IP-signed, and the family-retry in SabrCache needs the
+        // resolve + every ABR request of one attempt on the SAME family.
+        final String family = egressFamily != null
+                ? egressFamily
+                : me.kavin.piped.utils.EgressManager.activeEgress();
+        final var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                abrUrl, "POST", body,
+                Map.of("Content-Type", "application/x-protobuf",
+                        "Accept-Encoding", "identity",
+                        "User-Agent", userAgent),
+                family).get(60, java.util.concurrent.TimeUnit.SECONDS);
+        if (resp.status() / 100 != 2)
+            throw new IOException("SABR POST HTTP " + resp.status() + " (egress=" + family + ")");
+        return resp.body();
     }
 }
