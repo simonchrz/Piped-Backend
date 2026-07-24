@@ -240,6 +240,53 @@ public class StreamHandlers {
                 // Ergebnis bleibt audiolos. Der degraded-Pfad short-circuitet den
                 // HEAD-Probe (kein throttle-Check noetig wenn eh schon audio=0).
                 boolean degraded = info != null && info.getAudioStreams().isEmpty();
+
+                // Kids/OER (audio=0) additive fast-path (2026-07-24): prefer the
+                // authenticated TVHTML5 ("tv") client for made-for-kids/OER content
+                // — yt-dlp-verified to yield clean nsig-solved DIRECT URLs where the
+                // ANDROID client returns audio=0 — BEFORE the WebEmbed cascade below.
+                // Purely additive + regression-proof: only fires on the audio=0
+                // signature, and only commits `info` when TVHTML5 returns healthy
+                // audio+video; on anything else (throw / non-healthy) it leaves `info`
+                // untouched so the existing egress-flip + WebEmbed + storm path runs
+                // exactly as before. throttleSuspect is computed AFTER this on the
+                // (possibly TV) info, so if the TV URLs are themselves throttled in a
+                // storm the normal storm-fallback still engages. Kill-switch
+                // YT_TV_FIRST_FOR_AUDIO0=0. The TV client already existed only as a
+                // sign-in/storm fallback (getTvHtml5PlayerResponse); this just lets
+                // kids content reach it on the happy path.
+                if (degraded && !"0".equals(System.getenv("YT_TV_FIRST_FOR_AUDIO0"))) {
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " audio=0 (kids/OER) -> trying authenticated TVHTML5 first");
+                    YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.set(Boolean.TRUE);
+                    try {
+                        StreamInfo tv = StreamInfo.getInfo(
+                                "https://www.youtube.com/watch?v=" + videoId);
+                        if (tv != null && !tv.getAudioStreams().isEmpty()
+                                && (!tv.getVideoStreams().isEmpty()
+                                    || !tv.getVideoOnlyStreams().isEmpty())) {
+                            // Same TV-only legacy itag filter as the storm/sign-in paths
+                            // (148/149 are TV-client-only formats other stages can't serve).
+                            tv.getAudioStreams().removeIf(a -> a.getItagItem() != null
+                                    && (a.getItagItem().id == 148 || a.getItagItem().id == 149));
+                            info = tv;
+                            degraded = false;
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " TVHTML5-first HIT (audio=" + tv.getAudioStreams().size()
+                                    + " video=" + tv.getVideoStreams().size()
+                                    + " videoOnly=" + tv.getVideoOnlyStreams().size() + ")");
+                        } else {
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " TVHTML5-first not healthy -> WebEmbed cascade");
+                        }
+                    } catch (Exception e) {
+                        System.out.println("[StreamHandlers] " + videoId
+                                + " TVHTML5-first failed: " + e.getMessage() + " -> WebEmbed cascade");
+                    } finally {
+                        YoutubeStreamExtractor.FORCE_TVHTML5_FOR_THREAD.remove();
+                    }
+                }
+
                 // One HEAD probe decides the suspect path (degraded short-circuits it,
                 // so audio0 videos skip the probe). Healthy videos: exactly this one
                 // probe, same as before; the final liveness gate below only re-probes
