@@ -532,8 +532,19 @@ public class YtProxyHandlers {
                                         java.util.concurrent.TimeUnit.MILLISECONDS);
                         int code = resp.status();
                         if (code == 403) {
+                            // Mid-stream 403 = a throttle storm hit the active egress
+                            // family AFTER resolve. Nudge the reactive autoflip so the
+                            // NEXT resolve/tap egresses on the clean family instead of
+                            // every subsequent video also landing on the flagged one
+                            // (the resolve path flips on bot-flag; the streaming path
+                            // never did). flipOnBotFlag() only flips when the OTHER
+                            // family probes clean, so a both-family storm is a no-op.
+                            // This session still 302-falls-back to the client (same
+                            // public IP as the box -> the ip-signed URL stays valid).
+                            boolean flipped = me.kavin.piped.utils.EgressManager.flipOnBotFlag();
                             System.out.println("[YtProxy] " + sess.key + " upstream HTTP 403 (egress="
-                                    + me.kavin.piped.utils.EgressManager.activeLabel() + ") -> 302 fallback");
+                                    + me.kavin.piped.utils.EgressManager.activeLabel() + ") -> 302 fallback"
+                                    + (flipped ? " + egress-flipped" : ""));
                             sess.upstream403 = true;
                             fail(sess);
                             return;
