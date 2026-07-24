@@ -82,6 +82,14 @@ public final class SabrHandlers {
     public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
                                        String family, boolean contentBoundToken,
                                        int clientMode) throws Exception {
+        return runSession(videoId, sink, family, contentBoundToken, clientMode, false, null);
+    }
+
+    /// paced: 1x-Echtzeit-Session (SabrSession.fetchAll paced) für den Kids-
+    /// Readahead-Cap; publishHook läuft pro Runde nach dem Disk-Flush.
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
+                                       String family, boolean contentBoundToken,
+                                       int clientMode, boolean paced, Runnable publishHook) throws Exception {
         final boolean vrClient = clientMode == 1;
         final boolean webClient = clientMode == 2;
         // A pooled visitorData-bound po_token authorizes the gvs streaming session.
@@ -154,7 +162,7 @@ public final class SabrHandlers {
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
         final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
-        final SabrSession.Result res = session.fetchAll(8000, sink);
+        final SabrSession.Result res = session.fetchAll(8000, sink, paced, publishHook);
         long segs = 0;
         for (var info : res.perFormat.values()) {
             final Object v = info.get("segments");

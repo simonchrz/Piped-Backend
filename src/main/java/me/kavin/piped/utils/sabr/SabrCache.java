@@ -15,6 +15,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /// SABR serving layer (Baustein 4). Backs /sabr/<videoId>/<itag>: on first hit
@@ -126,6 +127,58 @@ public final class SabrCache {
     }
 
     private static void download(String videoId) throws Exception {
+        download(videoId, false);
+    }
+
+    // ── kids readahead-cap heal ─────────────────────────────────────────────
+    // Videos whose burst SABR sessions hit the made-for-kids server-side
+    // readahead cap (all token shapes, 2026-07-23 matrix). The async refill goes
+    // straight to a PACED 1x session for these (burst rungs would just re-cap);
+    // EXHAUSTED marks videos where even pacing yielded nothing new — the
+    // playlist layer then closes the truncated playlist with ENDLIST so the
+    // player cleanly plays the partial cache instead of erroring on a
+    // never-growing live playlist (AVPlayer -12646).
+    private static final ConcurrentHashMap<String, Long> CAPPED_MARKS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Long> EXHAUSTED = new ConcurrentHashMap<>();
+    private static final long CAP_MARK_TTL_MS = 30 * 60_000L;
+
+    public static boolean isRefillExhausted(String videoId) {
+        final Long exp = EXHAUSTED.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { EXHAUSTED.remove(videoId); return false; }
+        return true;
+    }
+
+    /// Playlist-Layer: Teil-Cache als VOD BEENDEN statt EVENT-wachsend? True ab
+    /// dem Kids-Cap-Verdict (nicht erst nach dem Paced-Fehlschlag) — der Tap
+    /// während des Sturms spielt dann sofort sauber die vorhandenen Segmente,
+    /// statt an einer (fast sicher) nie wachsenden Live-Playlist zu sterben.
+    /// Wächst der Cache doch (Paced-Erfolg), liefert der nächste Playlist-Build
+    /// automatisch mehr Segmente.
+    public static boolean isPartialTerminal(String videoId) {
+        return isCapMarked(videoId) || isRefillExhausted(videoId);
+    }
+
+    private static boolean isCapMarked(String videoId) {
+        final Long exp = CAPPED_MARKS.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { CAPPED_MARKS.remove(videoId); return false; }
+        return true;
+    }
+
+    private static void download(String videoId, boolean allowPaced) throws Exception {
+        // Known capped (kids): burst rungs are wasted requests — refill goes
+        // straight to the paced 1x session; the sync warm path keeps serving
+        // the existing partial cache untouched.
+        if (isCapMarked(videoId)) {
+            if (!allowPaced) return;
+            final String fam = me.kavin.piped.utils.EgressManager.activeEgress();
+            System.out.println("[SabrCache] " + videoId + " cap-marked -> paced 1x refill on " + fam);
+            final long before = cachedBytes(videoId);
+            final SabrHandlers.SabrMedia rp = attempt(videoId, fam, true, 0, true);
+            finishPaced(videoId, rp, before);
+            return;
+        }
         // Attempt 1 on the global ACTIVE egress family. If the session dies with
         // SABR_ERROR or produced nothing (googlevideo hard-403 on that family —
         // seen 2026-07-23 on made-for-kids content during a storm), retry ONCE on
@@ -163,17 +216,25 @@ public final class SabrCache {
                 System.out.println("[SabrCache] " + videoId + " content-bound retry won"
                         + " (segs=" + r3.segments() + " complete=" + r3.complete() + ")");
             } else {
-                // No further rung. 2026-07-23 experiment matrix on made-for-
-                // kids content: content-bound streamerContext token, player-
+                // Burst rungs exhausted. 2026-07-23 experiment matrix on made-
+                // for-kids content: content-bound streamerContext token, player-
                 // request attestation, ANDROID_VR (UNPLAYABLE for kids) and
                 // WEB_EMBEDDED (no serverAbrStreamingUrl at all) ALL leave the
-                // one-window cap — server-side policy, not a token bug. The
-                // honest EVENT playlist + this refill loop serve whatever the
-                // cap yields; the direct WebEmbed path covers kids playback
-                // outside 403 storms.
+                // one-window cap. 2026-07-24 hypothesis: the cap is relative to
+                // player_time AND the server rejects player_time that outruns
+                // wall-clock — so a PACED 1x session (real player emulation) is
+                // the remaining rung; runs only in the async refill (takes
+                // ~video duration), never in the sync warm path.
                 System.out.println("[SabrCache] " + videoId
-                        + " capped on both token shapes — server-side readahead "
-                        + "cap (kids-content signature), keeping partial cache");
+                        + " capped on both token shapes (kids-content signature)"
+                        + (allowPaced ? " -> paced 1x refill" : " -> partial cache, paced refill pending"));
+                CAPPED_MARKS.put(videoId, System.currentTimeMillis() + CAP_MARK_TTL_MS);
+                if (allowPaced) {
+                    final long before = cachedBytes(videoId);
+                    final SabrHandlers.SabrMedia rp = attempt(videoId, fam1, true, 0, true);
+                    if (rp != null && rp.segments() > result.segments()) result = rp;
+                    finishPaced(videoId, rp, before);
+                }
             }
         }
         if (result == null)
@@ -192,6 +253,12 @@ public final class SabrCache {
     /// session result, or null when the session threw before finishing.
     private static SabrHandlers.SabrMedia attempt(String videoId, String family,
                                                   boolean contentBoundToken, int clientMode) {
+        return attempt(videoId, family, contentBoundToken, clientMode, false);
+    }
+
+    private static SabrHandlers.SabrMedia attempt(String videoId, String family,
+                                                  boolean contentBoundToken, int clientMode,
+                                                  boolean paced) {
         final Map<Integer, Path> parts = new ConcurrentHashMap<>();
         final Map<Integer, OutputStream> opened = new ConcurrentHashMap<>();
         final SabrSession.Sink sink = itag -> {
@@ -202,9 +269,16 @@ public final class SabrCache {
             opened.put(itag, os);
             return os;
         };
+        // Paced sessions run ~video-length; publish the growing .part into the
+        // served .bin once per round so the EVENT playlist keeps growing under
+        // the player (that growth IS the point of pacing).
+        final Runnable publishHook = !paced ? null : () -> {
+            for (Map.Entry<Integer, Path> e : parts.entrySet())
+                publishIfLarger(videoId, e.getKey(), e.getValue(), false);
+        };
         SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, clientMode);
+            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, clientMode, paced, publishHook);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {
@@ -212,20 +286,65 @@ public final class SabrCache {
             // the error path (runSession throws before the session's finally runs).
             for (OutputStream os : opened.values()) { try { os.close(); } catch (IOException ignored) {} }
         }
-        for (Map.Entry<Integer, Path> e : parts.entrySet()) {
-            final Path part = e.getValue();
-            final Path bin = DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin");
-            try {
-                final long partSize = Files.exists(part) ? Files.size(part) : 0;
-                final long binSize = Files.exists(bin) ? Files.size(bin) : 0;
-                if (partSize > binSize) {
+        for (Map.Entry<Integer, Path> e : parts.entrySet())
+            publishIfLarger(videoId, e.getKey(), e.getValue(), true);
+        return result;
+    }
+
+    /// keep-larger publish .part -> .bin. move=true consumes the part (terminal
+    /// publish); move=false copies (incremental — the session keeps appending to
+    /// the part) via temp + ATOMIC_MOVE, so concurrent range-readers never see a
+    /// half-written bin (rename keeps old-inode readers intact on POSIX).
+    private static void publishIfLarger(String videoId, int itag, Path part, boolean move) {
+        final Path bin = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
+        try {
+            final long partSize = Files.exists(part) ? Files.size(part) : 0;
+            final long binSize = Files.exists(bin) ? Files.size(bin) : 0;
+            if (partSize > binSize) {
+                if (move) {
                     Files.move(part, bin, StandardCopyOption.REPLACE_EXISTING);
                 } else {
-                    Files.deleteIfExists(part);
+                    final Path tmp = DIR.resolve(safe(videoId) + "_" + itag + ".pub");
+                    Files.copy(part, tmp, StandardCopyOption.REPLACE_EXISTING);
+                    Files.move(tmp, bin, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
                 }
-            } catch (IOException ignored) {}
+            } else if (move) {
+                Files.deleteIfExists(part);
+            }
+        } catch (IOException ignored) {}
+    }
+
+    /// Summe der servierten .bin-Bytes eines Videos — Netto-Gewinn-Messung für
+    /// den Paced-Verdict (Session-Segmentzähler zählt auch re-downloads).
+    private static long cachedBytes(String videoId) {
+        long n = 0;
+        try (var s = Files.list(DIR)) {
+            for (Path p : s.filter(f -> f.getFileName().toString().startsWith(safe(videoId) + "_")
+                    && f.getFileName().toString().endsWith(".bin")).toList()) {
+                try { n += Files.size(p); } catch (IOException ignored) {}
+            }
+        } catch (IOException ignored) {}
+        return n;
+    }
+
+    /// Verdict nach einem Paced-Refill: complete -> Marks löschen (geheilt);
+    /// kein Netto-Byte-Gewinn -> EXHAUSTED (Playlist-Layer schließt die
+    /// Teil-Playlist mit ENDLIST); Teil-Fortschritt -> Marks behalten, ein
+    /// späterer Refill paced weiter.
+    private static void finishPaced(String videoId, SabrHandlers.SabrMedia r, long beforeBytes) {
+        final long after = cachedBytes(videoId);
+        if (r != null && r.complete()) {
+            CAPPED_MARKS.remove(videoId);
+            EXHAUSTED.remove(videoId);
+            System.out.println("[SabrCache] " + videoId + " paced refill COMPLETE (" + after + "B)");
+        } else if (after <= beforeBytes) {
+            EXHAUSTED.put(videoId, System.currentTimeMillis() + CAP_MARK_TTL_MS);
+            System.out.println("[SabrCache] " + videoId + " paced refill no net gain ("
+                    + beforeBytes + "B -> " + after + "B) -> EXHAUSTED, partial ENDLIST");
+        } else {
+            System.out.println("[SabrCache] " + videoId + " paced refill partial gain ("
+                    + beforeBytes + "B -> " + after + "B), marks kept");
         }
-        return result;
     }
 
     // ── refill (incomplete cache heal) ──────────────────────────────────────
@@ -236,7 +355,11 @@ public final class SabrCache {
     private static final ConcurrentHashMap<String, Long> REFILL_LAST = new ConcurrentHashMap<>();
     private static final long REFILL_COOLDOWN_MS = 5 * 60_000L;
 
+    private static final Set<String> REFILL_ACTIVE = ConcurrentHashMap.newKeySet();
+
     public static void requestRefill(String videoId) {
+        if (isRefillExhausted(videoId)) return;          // paced verdict: nichts zu holen
+        if (REFILL_ACTIVE.contains(videoId)) return;     // paced Session läuft bereits (~Videolänge)
         final long now = System.currentTimeMillis();
         final boolean[] go = {false};
         REFILL_LAST.compute(videoId, (k, prev) -> {
@@ -245,13 +368,16 @@ public final class SabrCache {
             return now;
         });
         if (!go[0]) return;
+        if (!REFILL_ACTIVE.add(videoId)) return;
         Thread.ofVirtual().name("sabr-refill-" + videoId).start(() -> {
             synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
                 try {
                     System.out.println("[SabrCache] " + videoId + " refill (incomplete cache)");
-                    download(videoId);
+                    download(videoId, true);
                 } catch (Exception e) {
                     System.out.println("[SabrCache] " + videoId + " refill failed: " + e.getMessage());
+                } finally {
+                    REFILL_ACTIVE.remove(videoId);
                 }
             }
         });

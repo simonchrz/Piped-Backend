@@ -231,6 +231,17 @@ public class SynthHlsHandlers {
         }
         if (emitted >= sidx.entries.size()) {
             sb.append("#EXT-X-ENDLIST");
+        } else if (me.kavin.piped.utils.sabr.SabrCache.isPartialTerminal(videoId)) {
+            // Kids-Readahead-Cap (ab Verdict) bzw. Paced-Refill erschöpft — die
+            // Teil-Playlist EHRLICH als VOD BEENDEN: der Player spielt die
+            // vorhandenen Segmente sauber durch, statt an einer (fast sicher)
+            // nie wachsenden Live-Playlist zu sterben (AVPlayer -12646). Der
+            // Hintergrund-Refill läuft weiter; wächst der Cache doch, liefert
+            // der nächste Playlist-Build mehr.
+            System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated + cap/exhausted: "
+                    + emitted + "/" + sidx.entries.size() + " -> partial ENDLIST");
+            sb.append("#EXT-X-ENDLIST");
+            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         } else {
             System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated: "
                     + emitted + "/" + sidx.entries.size() + " segments on disk ("

@@ -84,6 +84,10 @@ public final class SabrSession {
             }
         }
 
+        void flush() {
+            try { if (out != null) out.flush(); } catch (IOException ignored) {}
+        }
+
         void close() {
             try { if (out != null) out.close(); } catch (IOException ignored) {}
         }
@@ -134,14 +138,30 @@ public final class SabrSession {
     }
 
     public Result fetchAll(int maxIterations, Sink sink) throws Exception {
+        return fetchAll(maxIterations, sink, false, null);
+    }
+
+    /// paced=true: real-time 1x playback emulation. Made-for-kids gvs enforces a
+    /// server-side readahead cap RELATIVE to the claimed player_time, and it
+    /// rejects a player_time that advances faster than wall-clock (the burst mode
+    /// below claims ~36s of "playback" within ~10s -> the server stops serving;
+    /// 2026-07-24 verdict on top of the 2026-07-23 token-shape matrix). Paced mode
+    /// advances player_time no faster than wall-clock (+ a small head start) and
+    /// sleeps between rounds — the window slides like a real client and the
+    /// download runs at ~1x. publishHook (optional) runs once per round after the
+    /// disk flush so the caller can republish the growing file for live serving.
+    public Result fetchAll(int maxIterations, Sink sink, boolean paced, Runnable publishHook) throws Exception {
         this.sink = sink;
         final Map<Integer, FState> states = new LinkedHashMap<>();
         byte[] playbackCookie = null;
         long playerTimeMs = 0;
         int stuckRounds = 0;
+        final int stuckLimit = paced ? 24 : 3;   // paced: ~2 min quiet before giving up
+        final long wallStart = System.currentTimeMillis();
         final Result res = new Result();
         String stopReason = "maxIterations";
         System.out.println("[Sabr] session start maxIter=" + maxIterations
+                + (paced ? " PACED" : "")
                 + " poToken=" + (poToken != null ? poToken.length + "B" : "NONE"));
 
         try {
@@ -189,13 +209,22 @@ public final class SabrSession {
                 if (sabrError[0]) { stopReason = "SABR_ERROR"; break; }
                 if (states.values().stream().allMatch(FState::complete)) { stopReason = "complete"; break; }
                 if (newSegments[0] == 0) {
-                    if (++stuckRounds > 3) { stopReason = "stuck(no new segments 4 rounds)"; break; }
+                    if (++stuckRounds > stuckLimit) { stopReason = "stuck(no new segments " + (stuckLimit + 1) + " rounds)"; break; }
                 } else {
                     stuckRounds = 0;
                 }
                 // advance the playback head to the buffered frontier (min across
                 // formats, so audio+video march together) to pull the next window.
-                playerTimeMs = states.values().stream().mapToLong(FState::frontierMs).min().orElse(playerTimeMs);
+                final long frontier = states.values().stream().mapToLong(FState::frontierMs).min().orElse(playerTimeMs);
+                if (!paced) {
+                    playerTimeMs = frontier;
+                } else {
+                    // never claim playback ahead of wall-clock (+8s head start)
+                    playerTimeMs = Math.min(frontier, (System.currentTimeMillis() - wallStart) + 8_000);
+                    for (FState s : states.values()) s.flush();
+                    if (publishHook != null) publishHook.run();
+                    Thread.sleep(newSegments[0] > 0 ? 1_000 : 5_000);
+                }
             }
 
             res.complete = states.values().stream().allMatch(FState::complete);
