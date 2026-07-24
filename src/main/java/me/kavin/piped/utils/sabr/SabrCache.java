@@ -35,7 +35,14 @@ public final class SabrCache {
     // resolve chain (StreamHandlers). TTL'd so a video returns to the normal
     // /yt-proxy path once the transient storm has passed.
     private static final ConcurrentHashMap<String, Long> STORM_MARKS = new ConcurrentHashMap<>();
-    private static final long STORM_TTL_MS = 30 * 60_000L;
+    // 30 -> 10 min (2026-07-24): the googlevideo throttle on a video is
+    // TRANSIENT and whole-URL — it comes and goes over minutes (verified: the
+    // same video 403s everywhere, then serves 206 everywhere, then 403s again).
+    // A 30-min mark held the capped SABR path far into recovered windows (yt-dlp
+    // played the video fully while we kept SABR-ing). The self-healing drop on a
+    // healthy resolve (StreamHandlers.clearStorm) handles the common case; this
+    // shorter TTL bounds the worst case when no fresh resolve happens.
+    private static final long STORM_TTL_MS = 10 * 60_000L;
 
     public static void markStorm(String videoId) {
         STORM_MARKS.put(videoId, System.currentTimeMillis() + STORM_TTL_MS);
@@ -49,6 +56,14 @@ public final class SabrCache {
             return false;
         }
         return true;
+    }
+
+    /// Drop a video's storm mark (StreamHandlers calls this when a fresh resolve
+    /// produced healthy direct URLs without falling to SABR — the transient
+    /// throttle window has recovered, so synth-hls should stop serving /sabr and
+    /// return to the direct /yt-proxy URLs on its next poll).
+    public static void clearStorm(String videoId) {
+        STORM_MARKS.remove(videoId);
     }
 
     /// Ensures the video has been SABR-downloaded (once, per-videoId lock) and

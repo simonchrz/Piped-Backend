@@ -378,6 +378,7 @@ public class StreamHandlers {
                         && videoId.equals(System.getenv("YT_TEST_FORCE_SABR_STORM"));
                 boolean stillThrottled = testForceThrottle || testForceSabrStorm
                         || (throttleSuspect && info != null && isVideoStreamThrottled(info));
+                boolean servedViaSabr = false;
 
                 // Storm-fallback: WebEmbed segments are 403, so try the
                 // authenticated TVHTML5 (TV) client. Its URLs carry ratebypass and
@@ -420,6 +421,30 @@ public class StreamHandlers {
                     }
                 }
 
+                // Sequential-playability confirmation before the CAPPED SABR
+                // fallback (2026-07-24). isVideoStreamThrottled probes a clen/2
+                // DEEP-SEEK, which googlevideo 403s during transient throttle
+                // waves even on URLs that serve SEQUENTIAL ranges from offset 0
+                // perfectly — verified live: yt-dlp AND our own yt-proxy download
+                // these videos in full (206) while this path reported "storm".
+                // Playback IS sequential (yt-proxy fills via bounded ranges from
+                // the start; scrub-forward degrades to a slow fill, never breaks),
+                // so a deep-seek-only 403 must NOT commit the video to the 60s-
+                // capped SABR path — that's a strict downgrade from a fully
+                // playable direct URL. Re-probe from offset 0 (same egress as the
+                // real fetch): serves -> keep the direct URLs, skip SABR. Only a
+                // sequential 403 (genuine total block) falls through to SABR.
+                // Not run under the test hooks (they intentionally force the path).
+                // Kill-switch YT_SEQ_PLAYABILITY_GATE=0.
+                if (stillThrottled && !testForceSabrStorm && !testForceThrottle
+                        && !"0".equals(System.getenv("YT_SEQ_PLAYABILITY_GATE"))
+                        && canServeSequentially(info)) {
+                    stillThrottled = false;
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " deep-seek 403 but SEQUENTIAL 206 -> playable, keeping"
+                            + " direct URLs (no SABR)");
+                }
+
                 // Stage 4 — SABR storm-fallback: WebEmbed AND TVHTML5 segment
                 // URLs are 403, but SABR media travels as POST/UMP against
                 // serverAbrStreamingUrl — a different googlevideo request shape
@@ -448,6 +473,7 @@ public class StreamHandlers {
                         }
                     });
                     stillThrottled = false;
+                    servedViaSabr = true;
                     System.out.println("[ResolvePath] " + videoId
                             + " -> SABR-STORM (WebEmbed+TVHTML5 403, serving via /sabr)");
                 }
@@ -461,6 +487,22 @@ public class StreamHandlers {
                     ExceptionHandler.throwErrorResponse(new ThrottledResponse(
                             "YouTube is rate-limiting playback for this video (segment URLs return "
                             + "403). Transient googlevideo throttle - try again shortly."));
+                }
+                // Self-healing storm-mark: this resolve produced healthy direct
+                // URLs WITHOUT falling to SABR (either not throttle-suspect, or the
+                // sequential-playability gate confirmed the URLs serve) — so if the
+                // video was still storm-marked from an earlier bad window, the
+                // window has recovered; drop the mark so synth-hls stops serving the
+                // capped /sabr path and returns to the direct URLs. Closes the
+                // "yt-dlp plays it fully but we keep SABR-ing for 30 min" gap: the
+                // block is transient (whole-URL, comes and goes) but the mark was
+                // sticky. next SynthHls poll re-checks isStormMarked -> false -> direct.
+                if (!servedViaSabr && info != null && !info.getAudioStreams().isEmpty()
+                        && (!info.getVideoStreams().isEmpty() || !info.getVideoOnlyStreams().isEmpty())
+                        && SabrCache.isStormMarked(videoId)) {
+                    SabrCache.clearStorm(videoId);
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " storm-mark cleared (healthy direct resolve — window recovered)");
                 }
                 logResolvePath(videoId, info);
                 System.out.println("[NPE-timing] " + videoId + " total-resolve "
@@ -916,6 +958,42 @@ public class StreamHandlers {
                     java.util.Map.of("Range", "bytes=" + offset + "-" + (offset + 1000)),
                     me.kavin.piped.utils.EgressManager.activeEgress()).join();
             return resp.status() == 403;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // Playability probe: can the best video-only URL serve a SEQUENTIAL range
+    // from offset 0? googlevideo 403s deep mid-file seeks (see
+    // isVideoStreamThrottled's clen/2 probe) during transient throttle waves
+    // while still serving sequential ranges from the start — which is exactly
+    // how the yt-proxy downloader (and yt-dlp) actually stream. A true here
+    // means the video PLAYS via the direct URLs (yt-proxy fills sequentially),
+    // so it must not be downgraded to the capped SABR fallback. Same egress +
+    // a real Chrome UA as the yt-proxy fetch so the probe mirrors playback.
+    private static boolean canServeSequentially(StreamInfo info) {
+        if (info == null) return false;
+        VideoStream best = null;
+        for (VideoStream vs : info.getVideoOnlyStreams()) {
+            if (best == null
+                || (vs.getBitrate() > 0 && vs.getBitrate() > best.getBitrate())) {
+                best = vs;
+            }
+        }
+        if (best == null) return false;
+        String url = best.getContent();
+        if (url == null || url.isEmpty() || !url.startsWith("http")) return false;
+        try {
+            var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                    url, "GET", new byte[0],
+                    java.util.Map.of("Range", "bytes=0-65535",
+                        "User-Agent",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        + "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        + "Chrome/131.0.0.0 Safari/537.36"),
+                    me.kavin.piped.utils.EgressManager.activeEgress()).join();
+            final int s = resp.status();
+            return s == 206 || s == 200;
         } catch (Exception e) {
             return false;
         }
