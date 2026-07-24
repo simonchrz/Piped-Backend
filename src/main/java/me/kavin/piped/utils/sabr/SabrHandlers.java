@@ -22,6 +22,11 @@ public final class SabrHandlers {
 
     private static final String ANDROID_UA =
             "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
+    private static final String ANDROID_VR_UA =
+            "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+    private static final String WEB_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    private static final String WEB_EMBEDDED_VERSION = "1.20260122.01.00";
 
     /// Cheap viability probe for the storm fallback: ONE ANDROID player call.
     /// SABR is viable when it answers with a serverAbrStreamingUrl — the media
@@ -29,7 +34,7 @@ public final class SabrHandlers {
     /// Bounded by androidPlayer's own timeouts; any failure = not viable.
     public static boolean sabrViable(String videoId) {
         try {
-            return androidPlayer(videoId, null, null)
+            return androidPlayer(videoId, null, null, null, false)
                     .path("streamingData").path("serverAbrStreamingUrl")
                     .asText(null) != null;
         } catch (Exception e) {
@@ -47,13 +52,38 @@ public final class SabrHandlers {
                             boolean complete, String stopReason, long segments) {}
 
     public static SabrMedia runSession(String videoId, SabrSession.Sink sink) throws Exception {
-        return runSession(videoId, sink, null);
+        return runSession(videoId, sink, null, false);
     }
 
     /// family: explicit egress family ("v4"/"v6") for BOTH the ANDROID player
     /// resolve and the SABR session — gvs URLs are IP-signed, so a mismatch
     /// between resolve- and stream-family 403s. null = global ACTIVE family.
-    public static SabrMedia runSession(String videoId, SabrSession.Sink sink, String family) throws Exception {
+    /// contentBoundToken: mint a videoId-content-bound po_token for the ABR
+    /// streamerContext instead of the pooled visitorData-bound one. Kids
+    /// content ignores the visitor-bound token (session stalls at the ~60s
+    /// readahead window despite the token being present); content binding is
+    /// the same shape the direct-URL path mints per video (pot= param).
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
+                                       String family, boolean contentBoundToken) throws Exception {
+        return runSession(videoId, sink, family, contentBoundToken, false);
+    }
+
+    /// clientMode 1 = ANDROID_VR (client 28), 2 = WEB_EMBEDDED_PLAYER (client
+    /// 56, the client that verifiably SERVES kids content — and the client the
+    /// pooled visitor-bound web po_token was minted FOR; kids gvs appears to
+    /// enforce client<->token consistency), else ANDROID. Ladder rungs when the
+    /// readahead stalls at one window.
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
+                                       String family, boolean contentBoundToken,
+                                       boolean vrClient) throws Exception {
+        return runSession(videoId, sink, family, contentBoundToken, vrClient ? 1 : 0);
+    }
+
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
+                                       String family, boolean contentBoundToken,
+                                       int clientMode) throws Exception {
+        final boolean vrClient = clientMode == 1;
+        final boolean webClient = clientMode == 2;
         // A pooled visitorData-bound po_token authorizes the gvs streaming session.
         // Without it googlevideo caps the SABR readahead at ~60s (one buffer window)
         // then stops. visitorData goes into the player context; the po_token bytes
@@ -61,18 +91,34 @@ public final class SabrHandlers {
         final BgPoTokenProvider bg = BgPoTokenProvider.instance();
         String visitorData = null;
         byte[] poToken = null;
+        String attestationPoToken = null;
         if (bg != null) {
             final PoTokenResult pot = bg.sabrSessionPoToken();
             if (pot != null) {
                 visitorData = pot.visitorData;
                 if (pot.playerRequestPoToken != null) poToken = b64(pot.playerRequestPoToken);
             }
+            if (contentBoundToken) {
+                final String cb = bg.sabrContentBoundPoToken(videoId);
+                if (cb != null) { poToken = b64(cb); attestationPoToken = cb; }
+                else System.out.println("[Sabr] " + videoId
+                        + " content-bound mint failed -> keeping visitor-bound token");
+            }
         }
         System.out.println("[Sabr] " + videoId + " runSession poToken="
                 + (poToken != null ? poToken.length + "B" : "NONE")
+                + (contentBoundToken ? " (content-bound)" : "")
                 + " visitor=" + (visitorData != null ? "yes" : "no"));
 
-        final JsonNode player = androidPlayer(videoId, visitorData, family);
+        // WEB mode always attests the player call with the pooled web token —
+        // that pairing is the whole point of the rung.
+        if (webClient && attestationPoToken == null && bg != null) {
+            final PoTokenResult pot2 = bg.sabrSessionPoToken();
+            if (pot2 != null) attestationPoToken = pot2.playerRequestPoToken;
+        }
+        final JsonNode player = webClient
+                ? webEmbedPlayer(videoId, visitorData, family, attestationPoToken)
+                : androidPlayer(videoId, visitorData, family, attestationPoToken, vrClient);
         final JsonNode sd = player.path("streamingData");
         final String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
         final String ustB64 = findFirst(player, "videoPlaybackUstreamerConfig");
@@ -82,16 +128,32 @@ public final class SabrHandlers {
         }
         final JsonNode aud = pickFormat(sd, "audio", 140);
         final JsonNode vid = pickFormat(sd, "video", 137);
-        final byte[] clientInfo = new ProtoWriter()
-                .varintField(16, 3).stringField(17, "20.10.38")
-                .stringField(18, "Android").stringField(19, "14")
-                .varintField(64, 34).toByteArray();
+        final byte[] clientInfo;
+        final String ua;
+        if (webClient) {
+            clientInfo = new ProtoWriter()
+                    .varintField(16, 56).stringField(17, WEB_EMBEDDED_VERSION)
+                    .toByteArray();
+            ua = WEB_UA;
+        } else if (vrClient) {
+            clientInfo = new ProtoWriter()
+                    .varintField(16, 28).stringField(17, "1.62.27")
+                    .stringField(18, "Android").stringField(19, "12L")
+                    .varintField(64, 32).toByteArray();
+            ua = ANDROID_VR_UA;
+        } else {
+            clientInfo = new ProtoWriter()
+                    .varintField(16, 3).stringField(17, "20.10.38")
+                    .stringField(18, "Android").stringField(19, "14")
+                    .varintField(64, 34).toByteArray();
+            ua = ANDROID_UA;
+        }
         final SabrSession.Fmt pa = new SabrSession.Fmt(aud.path("itag").asInt(), aud.path("lastModified").asLong());
         final SabrSession.Fmt pv = new SabrSession.Fmt(vid.path("itag").asInt(), vid.path("lastModified").asLong());
         // maxIterations bumped 500 -> 8000: a full-length video needs one round per
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
-        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ANDROID_UA, poToken, family);
+        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
         final SabrSession.Result res = session.fetchAll(8000, sink);
         long segs = 0;
         for (var info : res.perFormat.values()) {
@@ -111,15 +173,58 @@ public final class SabrHandlers {
         return firstMatch;
     }
 
-    private static JsonNode androidPlayer(String videoId, String visitorData, String family) throws Exception {
+    private static JsonNode webEmbedPlayer(String videoId, String visitorData, String family,
+                                           String attestationPoToken) throws Exception {
         final Map<String, Object> client = new HashMap<>(Map.of(
-                "clientName", "ANDROID", "clientVersion", "20.10.38",
-                "androidSdkVersion", 34, "hl", "en", "gl", "US",
-                "osName", "Android", "osVersion", "14", "userAgent", ANDROID_UA));
+                "clientName", "WEB_EMBEDDED_PLAYER", "clientVersion", WEB_EMBEDDED_VERSION,
+                "clientScreen", "EMBED", "hl", "en", "gl", "US", "userAgent", WEB_UA));
         if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
-        final String body = Constants.mapper.writeValueAsString(Map.of(
+        final Map<String, Object> req = new HashMap<>(Map.of(
+                "context", Map.of("client", client,
+                        "thirdParty", Map.of("embedUrl", "https://www.youtube.com/")),
+                "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
+        if (attestationPoToken != null)
+            req.put("serviceIntegrityDimensions", Map.of("poToken", attestationPoToken));
+        final String body = Constants.mapper.writeValueAsString(req);
+        final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                "POST", body.getBytes(StandardCharsets.UTF_8),
+                Map.of("Content-Type", "application/json",
+                        "Accept-Encoding", "identity",
+                        "User-Agent", WEB_UA,
+                        "X-Youtube-Client-Name", "56",
+                        "X-Youtube-Client-Version", WEB_EMBEDDED_VERSION,
+                        "Origin", "https://www.youtube.com",
+                        "Referer", "https://www.youtube.com/"),
+                family != null ? family : me.kavin.piped.utils.EgressManager.activeEgress())
+                .get(20, java.util.concurrent.TimeUnit.SECONDS);
+        if (r.status() / 100 != 2)
+            throw new IllegalStateException("WEB_EMBEDDED player HTTP " + r.status());
+        return Constants.mapper.readTree(r.body());
+    }
+
+    private static JsonNode androidPlayer(String videoId, String visitorData, String family,
+                                          String attestationPoToken, boolean vrClient) throws Exception {
+        final Map<String, Object> client = vrClient
+                ? new HashMap<>(Map.of(
+                        "clientName", "ANDROID_VR", "clientVersion", "1.62.27",
+                        "androidSdkVersion", 32, "hl", "en", "gl", "US",
+                        "osName", "Android", "osVersion", "12L", "userAgent", ANDROID_VR_UA))
+                : new HashMap<>(Map.of(
+                        "clientName", "ANDROID", "clientVersion", "20.10.38",
+                        "androidSdkVersion", 34, "hl", "en", "gl", "US",
+                        "osName", "Android", "osVersion", "14", "userAgent", ANDROID_UA));
+        if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
+        final Map<String, Object> req = new HashMap<>(Map.of(
                 "context", Map.of("client", client),
                 "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
+        // Attestation in the PLAYER request (serviceIntegrityDimensions): for
+        // kids content the ustreamerConfig/abrUrl the player hands out limits
+        // SABR readahead to one window unless the player call itself carried a
+        // po_token — the streamerContext token alone is ignored there.
+        if (attestationPoToken != null)
+            req.put("serviceIntegrityDimensions", Map.of("poToken", attestationPoToken));
+        final String body = Constants.mapper.writeValueAsString(req);
         final byte[] resp;
         if (family != null) {
             // Explicit-family attempt: same reqwest4j family-pinned socket the
@@ -131,8 +236,9 @@ public final class SabrHandlers {
                     "POST", body.getBytes(StandardCharsets.UTF_8),
                     Map.of("Content-Type", "application/json",
                             "Accept-Encoding", "identity",
-                            "User-Agent", ANDROID_UA, "X-Youtube-Client-Name", "3",
-                            "X-Youtube-Client-Version", "20.10.38"),
+                            "User-Agent", vrClient ? ANDROID_VR_UA : ANDROID_UA,
+                            "X-Youtube-Client-Name", vrClient ? "28" : "3",
+                            "X-Youtube-Client-Version", vrClient ? "1.62.27" : "20.10.38"),
                     family).get(20, java.util.concurrent.TimeUnit.SECONDS);
             if (r.status() / 100 != 2)
                 throw new IllegalStateException("ANDROID player HTTP " + r.status()
@@ -142,8 +248,9 @@ public final class SabrHandlers {
             resp = httpPost(
                     "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
                     body.getBytes(StandardCharsets.UTF_8), "application/json", true,
-                    Map.of("User-Agent", ANDROID_UA, "X-Youtube-Client-Name", "3",
-                            "X-Youtube-Client-Version", "20.10.38"));
+                    Map.of("User-Agent", vrClient ? ANDROID_VR_UA : ANDROID_UA,
+                            "X-Youtube-Client-Name", vrClient ? "28" : "3",
+                            "X-Youtube-Client-Version", vrClient ? "1.62.27" : "20.10.38"));
         }
         return Constants.mapper.readTree(resp);
     }

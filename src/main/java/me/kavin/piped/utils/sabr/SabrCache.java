@@ -118,7 +118,7 @@ public final class SabrCache {
         // URLs are IP-signed). Whichever attempt wrote more survives (keep-larger
         // publish), so a refill can never regress an existing partial cache.
         final String fam1 = me.kavin.piped.utils.EgressManager.activeEgress();
-        SabrHandlers.SabrMedia result = attempt(videoId, fam1);
+        SabrHandlers.SabrMedia result = attempt(videoId, fam1, false, 0);
         if (result == null || (!result.complete()
                 && ("SABR_ERROR".equals(result.stopReason()) || result.segments() == 0))) {
             final String fam2 = me.kavin.piped.utils.EgressManager.otherFamily();
@@ -127,12 +127,38 @@ public final class SabrCache {
                         + (result == null ? " threw" : " " + result.stopReason()
                         + " (segs=" + result.segments() + ")")
                         + " -> family-retry on " + fam2);
-                final SabrHandlers.SabrMedia r2 = attempt(videoId, fam2);
+                final SabrHandlers.SabrMedia r2 = attempt(videoId, fam2, false, 0);
                 if (r2 != null && (result == null || r2.segments() > result.segments())) {
                     result = r2;
                     System.out.println("[SabrCache] " + videoId + " family-retry " + fam2
                             + " won (segs=" + r2.segments() + " complete=" + r2.complete() + ")");
                 }
+            }
+        } else if (!result.complete() && result.stopReason() != null
+                && result.stopReason().startsWith("stuck")) {
+            // Readahead-cap signature: data flowed, then the server stopped
+            // sending despite advancing player_time — the visitorData-bound
+            // po_token wasn't accepted for this video (made-for-kids does
+            // this). Retry with a videoId-CONTENT-BOUND token, same family.
+            System.out.println("[SabrCache] " + videoId + " capped at segs="
+                    + result.segments() + " -> content-bound-token retry");
+            final SabrHandlers.SabrMedia r3 = attempt(videoId, fam1, true, 0);
+            if (r3 != null && r3.segments() > result.segments()) {
+                result = r3;
+                System.out.println("[SabrCache] " + videoId + " content-bound retry won"
+                        + " (segs=" + r3.segments() + " complete=" + r3.complete() + ")");
+            } else {
+                // No further rung. 2026-07-23 experiment matrix on made-for-
+                // kids content: content-bound streamerContext token, player-
+                // request attestation, ANDROID_VR (UNPLAYABLE for kids) and
+                // WEB_EMBEDDED (no serverAbrStreamingUrl at all) ALL leave the
+                // one-window cap — server-side policy, not a token bug. The
+                // honest EVENT playlist + this refill loop serve whatever the
+                // cap yields; the direct WebEmbed path covers kids playback
+                // outside 403 storms.
+                System.out.println("[SabrCache] " + videoId
+                        + " capped on both token shapes — server-side readahead "
+                        + "cap (kids-content signature), keeping partial cache");
             }
         }
         if (result == null)
@@ -149,7 +175,8 @@ public final class SabrCache {
     /// when the .part is LARGER than any existing .bin, so a storm-crippled
     /// attempt (or refill) can't overwrite a better earlier cache. Returns the
     /// session result, or null when the session threw before finishing.
-    private static SabrHandlers.SabrMedia attempt(String videoId, String family) {
+    private static SabrHandlers.SabrMedia attempt(String videoId, String family,
+                                                  boolean contentBoundToken, int clientMode) {
         final Map<Integer, Path> parts = new ConcurrentHashMap<>();
         final Map<Integer, OutputStream> opened = new ConcurrentHashMap<>();
         final SabrSession.Sink sink = itag -> {
@@ -162,7 +189,7 @@ public final class SabrCache {
         };
         SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink, family);
+            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, clientMode);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {
