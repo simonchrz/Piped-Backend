@@ -59,6 +59,63 @@ public class StreamHandlers {
     private static final java.util.Set<String> KNOWN_AUDIO_ZERO =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // ── Hebel A: Throttle-Signatur pro Video merken (2026-07-24) ────────────
+    // Gemessen: ein sauberer Resolve haelt einen der NUR ZWEI YT_RESOLVE_LIMITER-
+    // Slots 1,4s; ein gedrosseltes Made-for-Kids-Video 4,1-6,7s (ANDROID_VR-URLs
+    // 403 -> Probe -> egress-flip -> WebEmbed-Re-Resolve). Zwei parallele
+    // Kaskaden sperren damit beide Slots und der naechste Tap kriegt 503.
+    // Gegentest in derselben Sekunde: Nicht-Kids-Video 1375ms sauber via
+    // ANDROID_VR, Kids-Video 4116ms mit 403 auf demselben Pfad -> die Drosselung
+    // ist VIDEO-spezifisch (Made-for-Kids), nicht IP-weit.
+    // Also: 403-Signatur merken und den naechsten Resolve direkt auf WebEmbed
+    // schicken (der Client, der in diesen Fenstern haelt). TTL, weil die
+    // Drosselung transient ist (kommt/geht ueber Minuten) und ANDROID_VR der
+    // schnellere Happy-Path bleibt, sobald das Fenster durch ist.
+    private static final java.util.concurrent.ConcurrentHashMap<String, Long> KNOWN_THROTTLED =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long THROTTLE_MEMO_TTL_MS = 10 * 60_000L;
+
+    private static boolean isThrottleMemoized(String videoId) {
+        if ("0".equals(System.getenv("YT_THROTTLE_MEMO"))) return false;
+        final Long exp = KNOWN_THROTTLED.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { KNOWN_THROTTLED.remove(videoId); return false; }
+        return true;
+    }
+
+    // ── Hebel B: Egress-Flip-Back-off (2026-07-24) ─────────────────────────
+    // Der Flip hat am 2026-06-20 nachweislich geholfen (Kids-Content 403 auf v6,
+    // sauber auf v4) — bleibt also drin. ABER: Bilanz im heutigen Sturmfenster
+    // 13x versucht / 0x geholfen, und jeder Versuch ist ein VOLLER Extra-Resolve
+    // auf dem gehaltenen Limiter-Slot. Nach FAIL_STREAK erfolglosen Flips also
+    // fuer BACKOFF_MS pausieren; ein erfolgreicher Flip setzt sofort zurueck.
+    private static final java.util.concurrent.atomic.AtomicInteger FLIP_FAILS =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private static final java.util.concurrent.atomic.AtomicLong FLIP_BACKOFF_UNTIL =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final int FLIP_FAIL_STREAK = 3;
+    private static final long FLIP_BACKOFF_MS = 10 * 60_000L;
+
+    private static boolean flipAllowed() {
+        if ("0".equals(System.getenv("YT_FLIP_BACKOFF"))) return true;   // Back-off aus
+        return FLIP_BACKOFF_UNTIL.get() < System.currentTimeMillis();
+    }
+
+    private static void flipOutcome(String videoId, boolean helped) {
+        if (helped) {
+            FLIP_FAILS.set(0);
+            FLIP_BACKOFF_UNTIL.set(0);
+            return;
+        }
+        if (FLIP_FAILS.incrementAndGet() >= FLIP_FAIL_STREAK) {
+            FLIP_FAILS.set(0);
+            FLIP_BACKOFF_UNTIL.set(System.currentTimeMillis() + FLIP_BACKOFF_MS);
+            System.out.println("[StreamHandlers] egress-flip back-off aktiv ("
+                    + FLIP_FAIL_STREAK + " Fehlschlaege, " + (FLIP_BACKOFF_MS / 60_000)
+                    + "min) — ausgeloest von " + videoId);
+        }
+    }
+
     public static byte[] streamsResponse(String videoId) throws Exception {
         return streamsResponse(videoId, false, 1080, SynthHlsHandlers.DEFAULT_VIDEO_CODECS);
     }
@@ -126,6 +183,33 @@ public class StreamHandlers {
                         }
                     } catch (Exception e) {
                         KNOWN_AUDIO_ZERO.remove(videoId);
+                    } finally {
+                        YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
+                    }
+                }
+
+                // Hebel A: dieses Video war eben noch gedrosselt (ANDROID_VR-URLs 403)
+                // -> direkt WebEmbed, ohne VR-Versuch + Probe + egress-flip. Spart auf
+                // dem gehaltenen Limiter-Slot ~2,5-5s. Zusaetzlich wird die Probe unten
+                // uebersprungen (throttleChecked), denn WebEmbed IST hier bereits die
+                // Antwort auf die Drosselung — 403 auf WebEmbed faellt weiter in die
+                // TVHTML5/SABR-Kaskade wie bisher. Nicht-healthy -> Memo war stale.
+                boolean throttleFastPath = false;
+                if (info == null && isThrottleMemoized(videoId)) {
+                    YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
+                    try {
+                        StreamInfo we = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
+                        if (we != null && !we.getAudioStreams().isEmpty()
+                                && (!we.getVideoStreams().isEmpty() || !we.getVideoOnlyStreams().isEmpty())) {
+                            info = we;
+                            throttleFastPath = true;
+                            System.out.println("[StreamHandlers] " + videoId
+                                    + " known-throttled -> direct WebEmbed HIT (skipped ANDROID_VR+probe+flip)");
+                        } else {
+                            KNOWN_THROTTLED.remove(videoId);
+                        }
+                    } catch (Exception e) {
+                        KNOWN_THROTTLED.remove(videoId);
                     } finally {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
@@ -291,7 +375,16 @@ public class StreamHandlers {
                 // so audio0 videos skip the probe). Healthy videos: exactly this one
                 // probe, same as before; the final liveness gate below only re-probes
                 // when this is true, keeping the extra HEAD off the fast path.
-                boolean throttleSuspect = info != null && (degraded || isVideoStreamThrottled(info));
+                // Hebel A: auf dem known-throttled-Fast-Path ist WebEmbed bereits die
+                // Antwort auf die Drosselung — die Probe (und damit Flip + WebEmbed-
+                // Retry) waere hier reine Wiederholung. Die Liveness-Gate unten prueft
+                // trotzdem noch, ob DIESE URLs leben.
+                boolean throttleSuspect = !throttleFastPath
+                        && info != null && (degraded || isVideoStreamThrottled(info));
+                // Signatur merken (nicht bei degraded — dafuer gibt es KNOWN_AUDIO_ZERO).
+                if (throttleSuspect && !degraded) {
+                    KNOWN_THROTTLED.put(videoId, System.currentTimeMillis() + THROTTLE_MEMO_TTL_MS);
+                }
 
                 // EGRESS-FLIP FIRST (made-for-kids / content-specific throttle):
                 // googlevideo often 403s the media on only ONE egress family (e.g. the
@@ -306,7 +399,13 @@ public class StreamHandlers {
                 // families) leaves the global family untouched and falls through.
                 // Verified 2026-06-20: Jakobs kids content (LEGO/DFB-cards) 403d
                 // wholesale on v6, played on v4. Kill-switch EGRESS_FLIP_ON_THROTTLE=0.
-                if (throttleSuspect && !"0".equals(System.getenv("EGRESS_FLIP_ON_THROTTLE"))) {
+                // Hebel B: nach FLIP_FAIL_STREAK erfolglosen Flips fuer FLIP_BACKOFF_MS
+                // aussetzen — jeder Versuch kostet einen VOLLEN Extra-Resolve auf dem
+                // gehaltenen Limiter-Slot (Bilanz 2026-07-24: 13x versucht, 0x geholfen).
+                if (throttleSuspect && !flipAllowed()) {
+                    System.out.println("[StreamHandlers] " + videoId
+                        + " egress-flip uebersprungen (Back-off aktiv) -> WebEmbed path");
+                } else if (throttleSuspect && !"0".equals(System.getenv("EGRESS_FLIP_ON_THROTTLE"))) {
                     String before = me.kavin.piped.utils.EgressManager.activeEgress();
                     String other = me.kavin.piped.utils.EgressManager.otherFamily();
                     if (!other.equals(before)) {
@@ -337,6 +436,7 @@ public class StreamHandlers {
                             if (committed)
                                 me.kavin.piped.utils.EgressManager.commitFamily(other);
                         }
+                        flipOutcome(videoId, committed);
                         if (!committed)
                             System.out.println("[StreamHandlers] " + videoId
                                 + " egress-flip " + before + "->" + other
@@ -376,8 +476,15 @@ public class StreamHandlers {
                 // into the SABR storm-fallback (healthy video, fake storm).
                 boolean testForceSabrStorm = info != null
                         && videoId.equals(System.getenv("YT_TEST_FORCE_SABR_STORM"));
+                // throttleFastPath MUSS hier mitzaehlen: der Fast-Path setzt
+                // throttleSuspect=false (Flip/WebEmbed-Retry waeren Wiederholung),
+                // aber die Liveness-Kontrolle darf er NICHT umgehen — sonst reichen
+                // wir in einem harten Fenster (WebEmbed selbst tot) ein 200 mit toten
+                // URLs durch, statt in TVHTML5/SABR zu fallen. Kostet eine Probe
+                // (~200ms) — dieselbe, die der Normalpfad ohnehin bezahlt.
                 boolean stillThrottled = testForceThrottle || testForceSabrStorm
-                        || (throttleSuspect && info != null && isVideoStreamThrottled(info));
+                        || ((throttleSuspect || throttleFastPath)
+                            && info != null && isVideoStreamThrottled(info));
                 boolean servedViaSabr = false;
 
                 // Storm-fallback: WebEmbed segments are 403, so try the
@@ -503,6 +610,15 @@ public class StreamHandlers {
                     SabrCache.clearStorm(videoId);
                     System.out.println("[StreamHandlers] " + videoId
                             + " storm-mark cleared (healthy direct resolve — window recovered)");
+                }
+                // Hebel A, selbstheilend: ein NICHT-Fast-Path-Resolve, dessen URLs die
+                // Probe ueberlebt haben, heisst „Drosselungsfenster durch" -> Memo weg,
+                // naechster Resolve nimmt wieder den schnelleren ANDROID_VR-Happy-Path.
+                // (Nach dem Fast-Path selbst NICHT loeschen — dort wurde VR nie geprueft.)
+                if (!throttleFastPath && !throttleSuspect && !degraded
+                        && KNOWN_THROTTLED.remove(videoId) != null) {
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " throttle-memo cleared (URLs wieder sauber)");
                 }
                 logResolvePath(videoId, info);
                 System.out.println("[NPE-timing] " + videoId + " total-resolve "
