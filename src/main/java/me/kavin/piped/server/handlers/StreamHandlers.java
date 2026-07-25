@@ -74,6 +74,37 @@ public class StreamHandlers {
     // schicken (der Client, der in diesen Fenstern haelt). TTL, weil die
     // Drosselung transient ist (kommt/geht ueber Minuten) und ANDROID_VR der
     // schnellere Happy-Path bleibt, sobald das Fenster durch ist.
+    /// videoId -> channelId OHNE Resolve: die DB kennt die Zuordnung bereits
+    /// (Abo-Feed + ChannelHandlers tragen Videos beim Kanal-Aufruf ein).
+    /// Indizierter Primaerschluessel-Treffer, ~1ms. null = unbekannt (z.B. reiner
+    /// Such-Treffer) -> dann greift nur der Pro-Video-Merker wie bisher.
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> CHANNEL_OF =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile boolean channelLookupWarned = false;
+
+    private static String channelOf(String videoId) {
+        final String hit = CHANNEL_OF.get(videoId);
+        if (hit != null) return hit.isEmpty() ? null : hit;
+        String out = null;
+        // ⚠️ NICHT ueber getVideoFromId(..).getChannel() gehen: die @ManyToOne-
+        // Beziehung ist lazy und laesst sich in einer StatelessSession nicht
+        // nachladen -> immer null. Stattdessen die FK-Spalte direkt abfragen.
+        try (org.hibernate.StatelessSession st =
+                     me.kavin.piped.utils.DatabaseSessionFactory.createStatelessSession()) {
+            out = st.createQuery(
+                    "select v.channel.uploader_id from Video v where v.id = :id", String.class)
+                    .setParameter("id", videoId).uniqueResult();
+        } catch (Exception e) {
+            if (!channelLookupWarned) {
+                channelLookupWarned = true;
+                System.out.println("[StreamHandlers] Kanal-Lookup nicht verfuegbar: " + e);
+            }
+        }
+        CHANNEL_OF.put(videoId, out == null ? "" : out);
+        if (CHANNEL_OF.size() > 5000) CHANNEL_OF.clear();
+        return out;
+    }
+
     private static boolean isThrottleMemoized(String videoId) {
         if ("0".equals(System.getenv("YT_THROTTLE_MEMO"))) return false;
         return me.kavin.piped.utils.ResolveMemo.isThrottled(videoId);
@@ -191,7 +222,16 @@ public class StreamHandlers {
                 // Antwort auf die Drosselung — 403 auf WebEmbed faellt weiter in die
                 // TVHTML5/SABR-Kaskade wie bisher. Nicht-healthy -> Memo war stale.
                 boolean throttleFastPath = false;
-                if (info == null && isThrottleMemoized(videoId)) {
+                // Kanal-Urteil ergaenzt den Pro-Video-Merker: der hilft erst beim
+                // ZWEITEN Antippen desselben Videos, das Kanal-Wissen schon beim
+                // ersten eines NEUEN Videos.
+                final String channelId = channelOf(videoId);
+                final boolean channelSlow =
+                        me.kavin.piped.utils.ResolveMemo.channelPrefersSlowPath(channelId);
+                if (info == null && (isThrottleMemoized(videoId) || channelSlow)) {
+                    if (channelSlow && !isThrottleMemoized(videoId))
+                        System.out.println("[StreamHandlers] " + videoId
+                                + " Kanal-Urteil: direkt WebEmbed (Kanal " + channelId + ")");
                     YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
                     try {
                         StreamInfo we = StreamInfo.getInfo("https://www.youtube.com/watch?v=" + videoId);
@@ -386,6 +426,11 @@ public class StreamHandlers {
                 if (throttleSuspect && !degraded) {
                     me.kavin.piped.utils.ResolveMemo.markThrottled(videoId);
                 }
+                // Kanal-Statistik fuehren: brauchte dieses Video den langsamen Weg?
+                // (Fast-Path zaehlt als „langsam", denn er IST das Urteil selbst.)
+                if (!degraded)
+                    me.kavin.piped.utils.ResolveMemo.recordChannelOutcome(
+                            channelId, throttleSuspect || throttleFastPath);
 
                 // EGRESS-FLIP FIRST (made-for-kids / content-specific throttle):
                 // googlevideo often 403s the media on only ONE egress family (e.g. the
