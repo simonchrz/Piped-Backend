@@ -58,12 +58,26 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
     /** tryAcquire a resolve slot (500ms), false on saturation/interrupt.
      *  FOREGROUND path (tap / playback): may use any of the slots. */
     private static boolean ytResolveAcquire() {
+        return ytResolveAcquire("?");
+    }
+
+    /// `who` = Route, die abgelehnt wurde. Ohne diese Zuordnung sieht man nur DASS
+    /// gedrosselt wurde, nicht WEN es trifft — und ein 503 auf einem Playlist-/
+    /// Segment-Abruf killt die Wiedergabe, waehrend einer auf /streams nur einen
+    /// Retry kostet.
+    private static boolean ytResolveAcquire(String who) {
+        return ytResolveAcquire(who, 500);
+    }
+
+    /// AUSLIEFERUNGS-Routen (Playlist/Segment) warten deutlich laenger als
+    /// Resolves: ein 503 auf /streams kostet einen Retry, ein 503 auf einer
+    /// Playlist oder einem Segment BRICHT die laufende Wiedergabe ab
+    /// (app-seitig -1008/-16849, „Video nicht abspielbar"). Lieber 5s warten.
+    private static boolean ytResolveAcquire(String who, int timeoutMs) {
         try {
-            final boolean got = YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS);
-            // Saettigung SICHTBAR machen: ein 503 von hier ist app-seitig nur ein
-            // generisches „Video nicht abspielbar" (-1008/-16849) und war bisher
-            // im Log unsichtbar — man riet, statt zu messen.
-            if (!got) System.out.println("[Limiter] YT-Resolve-Slot belegt -> 503");
+            final boolean got = YT_RESOLVE_LIMITER.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS);
+            if (!got) System.out.println("[Limiter] YT-Resolve-Slot belegt -> 503 (" + who
+                    + ", " + timeoutMs + "ms)");
             return got;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -229,12 +243,17 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         else ytResolveReleaseBackground();
                     }
                 })).map(GET, "/synth-hls/:videoId/:filename", AsyncServlet.ofBlocking(executor, request -> {
-                    if (!ytResolveAcquire())
+                    // Aus dem Cache ausliefern ist KEIN Resolve → kein Slot. Sonst
+                    // verdraengen ein Hintergrund-Prefetch + ein Vordergrund-Resolve
+                    // den Playlist-Abruf desselben Taps (503 → -16849 in der App).
+                    final boolean needsSlot = !SynthHlsHandlers.canServeWithoutResolve(
+                            request.getPathParameter("videoId"));
+                    if (needsSlot && !ytResolveAcquire("synth-hls", 5000))
                         return io.activej.http.HttpResponse.ofCode(503);
                     // Der Playlist-Bau darf den Slot FRUEH zurueckgeben, sobald er nur
                     // noch auf lokale SABR-Daten wartet (s. SynthHlsHandlers.SLOT_RELEASE).
                     final java.util.concurrent.atomic.AtomicBoolean slotHeld =
-                            new java.util.concurrent.atomic.AtomicBoolean(true);
+                            new java.util.concurrent.atomic.AtomicBoolean(needsSlot);
                     SynthHlsHandlers.SLOT_RELEASE.set(() -> {
                         if (slotHeld.compareAndSet(true, false)) YT_RESOLVE_LIMITER.release();
                     });
@@ -286,7 +305,7 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     // beiden Playlist-Buildern, die während des Downloads beide Slots
                     // halten → 503 → AVPlayer -16849 direkt nach dem Start.
                     final boolean sabrCached = me.kavin.piped.utils.sabr.SabrCache.isCached(sabrVid, sabrItag);
-                    if (!sabrCached && !ytResolveAcquire())
+                    if (!sabrCached && !ytResolveAcquire("sabr-seg", 5000))
                         return io.activej.http.HttpResponse.ofCode(503);
                     try {
                         return me.kavin.piped.utils.sabr.SabrCache.handle(

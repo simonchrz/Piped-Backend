@@ -396,6 +396,20 @@ public class SynthHlsHandlers {
     /// resolve so the /streams tap can reuse what a prior /streams?light
     /// prefetch already resolved, instead of a full StreamInfo.getInfo
     /// re-resolve. Returns null on miss/stale/unverified.
+    /// Lässt sich die Playlist ohne YT-Resolve bauen (SABR-Modus oder servierbarer
+    /// Streams-Cache)? Dann braucht der Request KEINEN der nur zwei Resolve-Slots.
+    /// ⚠️ Load-bearing (2026-07-25, im Log belegt): der Limiter existiert gegen
+    /// Carrier-Pinning durch RESOLVES. Playlist-Abrufe mit darunter zu hängen
+    /// hiess: ein Hintergrund-Prefetch + ein Vordergrund-Resolve belegen beide
+    /// Slots, und der Playlist-Abruf desselben Taps bekommt 503 → app-seitig
+    /// „Video nicht abspielbar" (-1008/-16849). Ausliefern aus dem Cache darf nie
+    /// mit Resolven konkurrieren.
+    public static boolean canServeWithoutResolve(String videoId) {
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return true;
+        return getFreshVerifiedStreams(videoId) != null
+                || getStaleServableStreams(videoId) != null;
+    }
+
     public static Streams getFreshVerifiedStreams(String videoId) {
         CacheEntry e = streamsCache.get(videoId);
         return (e != null && e.fresh() && e.urlsVerified) ? e.streams : null;
