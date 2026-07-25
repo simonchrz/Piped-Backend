@@ -181,25 +181,42 @@ public class SynthHlsHandlers {
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 
+    /// ⚠️ NIE einen `#ERROR: …`-Text als 200-Playlist zurückgeben: AVPlayer wertet
+    /// das als kaputte Playlist und bricht SOFORT mit -12646 ab (kein Retry) —
+    /// genau das Bild „Video startet gar nicht". Bei nicht-nutzbarem Cache lieber
+    /// kurz auf die laufende SABR-Session warten und sonst eine Exception werfen
+    /// (Route → 5xx), damit der Client es erneut versuchen kann.
+    private static final int SABR_PLAYLIST_WAIT_MS = 8_000;
+
     private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
-        final java.nio.file.Path file = me.kavin.piped.utils.sabr.SabrCache.ensureFile(videoId, itag);
-        if (file == null) return "#ERROR: sabr download failed".getBytes(StandardCharsets.UTF_8);
-        final int[] box = scanSabrSidx(file);
-        if (box == null) {
-            // Cache so short it lacks even ftyp/moov/sidx — a storm killed the
-            // download before the first UMP media arrived. Kick a refill.
-            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
-            return "#ERROR: sabr sidx not found".getBytes(StandardCharsets.UTF_8);
+        final long deadline = System.currentTimeMillis() + SABR_PLAYLIST_WAIT_MS;
+        for (;;) {
+            final byte[] pl = trySabrStreamPlaylist(videoId, itag);
+            if (pl != null) return pl;
+            if (System.currentTimeMillis() >= deadline) {
+                me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+                throw new IllegalStateException("sabr cache not usable yet for "
+                        + videoId + "/" + itag + " (kein sidx / 0 Segmente)");
+            }
+            Thread.sleep(400);   // die Session schreibt fortlaufend — gleich nochmal
         }
+    }
+
+    /// Ein Bauversuch; null = Cache (noch) nicht nutzbar.
+    private static byte[] trySabrStreamPlaylist(String videoId, int itag) throws Exception {
+        final java.nio.file.Path file = me.kavin.piped.utils.sabr.SabrCache.ensureFile(videoId, itag);
+        if (file == null) return null;
+        final int[] box = scanSabrSidx(file);
+        if (box == null) return null;   // ftyp/moov/sidx noch nicht auf Platte
         final int sidxStart = box[0];
         final int sidxEnd = sidxStart + box[1] - 1;
         final String segUrl = "/sabr/" + videoId + "/" + itag;
-        final String fetchUrl = "http://localhost:" + me.kavin.piped.consts.Constants.PORT + "/sabr/" + videoId + "/" + itag;
-        final SidxParserJava.Data sidx = SidxParserJava.fetch(fetchUrl, sidxStart, sidxEnd, null);
-        if (sidx == null || sidx.entries.isEmpty()) {
-            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
-            return "#ERROR: sabr sidx parse failed".getBytes(StandardCharsets.UTF_8);
-        }
+        // sidx LOKAL aus der Cache-Datei lesen — NICHT per HTTP gegen den eigenen
+        // /sabr-Endpoint (der teilt sich den 2-Slot-Resolve-Limiter mit dieser
+        // Route → Selbstblockade bei parallelem Video-/Audio-Playlist-Abruf;
+        // s. SidxParserJava.fromFile).
+        final SidxParserJava.Data sidx = SidxParserJava.fromFile(file, sidxStart, sidxEnd);
+        if (sidx == null || sidx.entries.isEmpty()) return null;
 
         StringBuilder sb = new StringBuilder();
         sb.append("#EXTM3U\n#EXT-X-VERSION:7\n");
@@ -229,6 +246,10 @@ public class SynthHlsHandlers {
             cursor += e.byteSize;
             emitted++;
         }
+        // 0 Segmente = keine spielbare Playlist. Die ENDLIST-Variante unten würde
+        // daraus ein gültiges, aber LEERES VOD machen → AVPlayer -12646. Also
+        // null → der Aufrufer wartet auf die laufende Session.
+        if (emitted == 0) return null;
         if (emitted >= sidx.entries.size()) {
             sb.append("#EXT-X-ENDLIST");
         } else if (me.kavin.piped.utils.sabr.SabrCache.isPartialTerminal(videoId)) {

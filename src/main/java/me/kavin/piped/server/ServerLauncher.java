@@ -259,17 +259,30 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         return getErrorResponse(e, request.getPath());
                     }
                 })).map(GET, "/sabr/:videoId/:itag", AsyncServlet.ofBlocking(executor, request -> {
-                    if (!ytResolveAcquire())
+                    final String sabrVid = request.getPathParameter("videoId");
+                    final int sabrItag;
+                    try {
+                        sabrItag = Integer.parseInt(request.getPathParameter("itag"));
+                    } catch (NumberFormatException nfe) {
+                        return io.activej.http.HttpResponse.ofCode(400);
+                    }
+                    // Liegt die Datei schon da, ist das hier reines Range-Lesen — KEIN
+                    // Resolve-Slot. Sonst löst ensureFile eine SABR-Session aus (echte
+                    // YT-Arbeit) und wird wie bisher gedeckelt.
+                    // ⚠️ Ohne diese Ausnahme verhungern die Segment-Abrufe hinter den
+                    // beiden Playlist-Buildern, die während des Downloads beide Slots
+                    // halten → 503 → AVPlayer -16849 direkt nach dem Start.
+                    final boolean sabrCached = me.kavin.piped.utils.sabr.SabrCache.isCached(sabrVid, sabrItag);
+                    if (!sabrCached && !ytResolveAcquire())
                         return io.activej.http.HttpResponse.ofCode(503);
                     try {
-                        final int itag = Integer.parseInt(request.getPathParameter("itag"));
                         return me.kavin.piped.utils.sabr.SabrCache.handle(
-                                request.getPathParameter("videoId"), itag,
+                                sabrVid, sabrItag,
                                 request.getHeader(io.activej.http.HttpHeaders.RANGE), false);
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     } finally {
-                        YT_RESOLVE_LIMITER.release();
+                        if (!sabrCached) YT_RESOLVE_LIMITER.release();
                     }
                 })).map(HttpMethod.HEAD, "/sabr/:videoId/:itag", AsyncServlet.ofBlocking(executor, request -> {
                     try {

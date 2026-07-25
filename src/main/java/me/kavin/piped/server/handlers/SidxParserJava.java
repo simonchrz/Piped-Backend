@@ -87,6 +87,61 @@ public class SidxParserJava {
         return null;
     }
 
+    /// sidx aus einer LOKALEN Datei parsen (SABR-Cache) — ohne HTTP.
+    ///
+    /// ⚠️ SELBSTBLOCKADE (gefunden 2026-07-25): der frühere Weg holte den sidx per
+    /// HTTP gegen unseren EIGENEN `/sabr`-Endpoint. Der belegt aber denselben
+    /// 2-Slot-`YT_RESOLVE_LIMITER` wie `/synth-hls` — und AVPlayer fragt Video-
+    /// UND Audio-Playlist PARALLEL an. Beide Slots sind damit von den Playlist-
+    /// Buildern belegt, deren innere sidx-Holer keinen mehr bekommen:
+    /// `tryAcquire(500ms)` scheitert → 503 → `fetch` gibt null → der Aufrufer
+    /// lieferte `#ERROR: sabr sidx parse failed` als **200-Body** → AVPlayer sieht
+    /// keine gültige Playlist → **-12646**, sofortiger Abbruch ohne Retry.
+    /// Reproduziert mit echtem AVPlayer auf einem kalten Made-for-Kids-Video.
+    /// Die Datei liegt lokal vor — der Netz-Umweg war ohnehin sinnlos.
+    public static Data fromFile(java.nio.file.Path file, int start, int end) {
+        try (var ch = java.nio.channels.FileChannel.open(
+                file, java.nio.file.StandardOpenOption.READ)) {
+            return fromChannel(ch, start, end);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static Data fromChannel(java.nio.channels.FileChannel ch, int start, int end)
+            throws IOException {
+        final byte[] data = readRange(ch, start, end);
+        if (data == null) return null;
+        final RawBox top = parseSidx(data);
+        if (top == null) return null;
+        final List<Entry> flat = new ArrayList<>();
+        int cursor = end + 1 + top.firstOffset;
+        for (RawEntry e : top.entries) {
+            if (e.isIndex) {   // verschachtelter sidx — liegt in derselben Datei
+                final Data sub = fromChannel(ch, cursor, cursor + e.byteSize - 1);
+                if (sub != null) flat.addAll(sub.entries);
+            } else {
+                flat.add(new Entry(e.duration, e.byteSize));
+            }
+            cursor += e.byteSize;
+        }
+        return new Data(top.timescale, top.firstOffset, flat);
+    }
+
+    /// Exakter Range-Read; null wenn die Datei (noch) zu kurz ist — der Aufrufer
+    /// wartet dann auf mehr Bytes, statt eine halbe Box zu parsen.
+    private static byte[] readRange(java.nio.channels.FileChannel ch, int start, int end)
+            throws IOException {
+        final long size = ch.size();
+        if (start < 0 || end < start || start >= size) return null;
+        final int len = end - start + 1;
+        if (start + (long) len > size) return null;
+        final ByteBuffer buf = ByteBuffer.allocate(len);
+        ch.position(start);
+        while (buf.hasRemaining() && ch.read(buf) > 0) { /* fill */ }
+        return buf.hasRemaining() ? null : buf.array();
+    }
+
     /// One network attempt. Returns null on timeout / non-2xx / parse-fail so the
     /// caller retries. Nested index chains recurse through the public fetch (each
     /// gets its own retry + cache). Does NOT cache — the outer fetch does.

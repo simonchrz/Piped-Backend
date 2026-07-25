@@ -107,6 +107,21 @@ public final class SabrCache {
         return new int[]{140, 137};
     }
 
+    /// Liegt die Mediendatei schon auf Platte? Dann ist ein /sabr-Abruf reines
+    /// Range-Lesen (kein YouTube-Resolve) und braucht KEINEN Resolve-Slot.
+    /// ⚠️ Load-bearing (2026-07-25): die Playlist-Builder (/synth-hls) halten
+    /// während `ensureFile` einen der nur zwei Slots — bei einem kalten SABR-Video
+    /// belegen Video- + Audio-Playlist beide, und die anschliessenden Segment-
+    /// Abrufe bekamen keinen mehr → 503 → AVPlayer -16849 mitten im Start.
+    public static boolean isCached(String videoId, int itag) {
+        final Path f = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
+        try {
+            return Files.exists(f) && Files.size(f) > 0;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     private static boolean anyFileFor(String videoId) {
         try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
             return s.iterator().hasNext();
