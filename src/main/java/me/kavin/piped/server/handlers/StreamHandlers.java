@@ -324,6 +324,10 @@ public class StreamHandlers {
                 // Ergebnis bleibt audiolos. Der degraded-Pfad short-circuitet den
                 // HEAD-Probe (kein throttle-Check noetig wenn eh schon audio=0).
                 boolean degraded = info != null && info.getAudioStreams().isEmpty();
+                // Wurde TVHTML5 in diesem Resolve schon einmal befragt? Dann ist ein
+                // zweiter Anlauf im Storm-Fallback verschwendete Zeit — gemessen ~1s
+                // von 4s Gesamt-Resolve auf einem kalten Kids-Video.
+                boolean tvHtml5AlreadyTried = false;
 
                 // Kids/OER (audio=0) additive fast-path (2026-07-24): prefer the
                 // authenticated TVHTML5 ("tv") client for made-for-kids/OER content
@@ -355,6 +359,7 @@ public class StreamHandlers {
                                     && (a.getItagItem().id == 148 || a.getItagItem().id == 149));
                             info = tv;
                             degraded = false;
+                            tvHtml5AlreadyTried = true;   // s. Storm-Fallback weiter unten
                             System.out.println("[StreamHandlers] " + videoId
                                     + " TVHTML5-first HIT (audio=" + tv.getAudioStreams().size()
                                     + " video=" + tv.getVideoStreams().size()
@@ -491,7 +496,13 @@ public class StreamHandlers {
                 // authenticated TVHTML5 (TV) client. Its URLs carry ratebypass and
                 // survive googlevideo throttle storms that kill WebEmbed's. Only
                 // reached on the suspect path during an actual 403 (or the test env).
-                if (stillThrottled && !testForceSabrStorm) {
+                if (stillThrottled && !testForceSabrStorm && tvHtml5AlreadyTried) {
+                    // TVHTML5 lief in DIESEM Resolve bereits (audio=0-Fast-Path) und
+                    // seine URLs wurden vom Throttle-Check verworfen. Ein zweiter,
+                    // identischer Anlauf kostet ~1s und liefert dasselbe Ergebnis.
+                    System.out.println("[StreamHandlers] " + videoId
+                            + " TVHTML5 bereits geprueft (gedrosselt) -> zweiten Anlauf uebersprungen");
+                } else if (stillThrottled && !testForceSabrStorm) {
                     System.out.println("[StreamHandlers] " + videoId
                             + " WebEmbed still throttled -> trying authenticated TVHTML5");
                     // Defensive: clear any WebEmbed force (ThreadLocals persist on
