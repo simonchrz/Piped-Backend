@@ -591,6 +591,21 @@ public class StreamHandlers {
                 if (stillThrottled) {
                     System.out.println("[StreamHandlers] " + videoId
                             + " STILL throttled after WebEmbed + TVHTML5 + SABR (segments 403) -> 503 throttled");
+                    // Den Resolve NICHT wegwerfen: er hat gerade die volle Kaskade
+                    // gekostet (gemessen 5,7s auf einem kalten Kids-Video). Ohne
+                    // Seeding loest der folgende /synth-hls/master-Build ALLES NOCH
+                    // EINMAL auf (~1,9s) — reine Doppelarbeit auf dem kalten Tap.
+                    // urlsVerified=FALSE ist hier Pflicht: die Segment-URLs sind ja
+                    // gerade als 403 erkannt worden. Der Variant-/Audio-Pfad
+                    // verifiziert weiterhin selbst, bevor Segment-URLs rausgehen
+                    // (bzw. bedient bei Storm-Marke ohnehin aus /sabr).
+                    try {
+                        SynthHlsHandlers.cacheStreams(videoId,
+                                CollectionUtils.collectStreamInfo(info), false, light, maxH, codecs);
+                    } catch (Exception seedEx) {
+                        System.out.println("[StreamHandlers] " + videoId
+                                + " throttled-seed fehlgeschlagen: " + seedEx.getMessage());
+                    }
                     ExceptionHandler.throwErrorResponse(new ThrottledResponse(
                             "YouTube is rate-limiting playback for this video (segment URLs return "
                             + "403). Transient googlevideo throttle - try again shortly."));

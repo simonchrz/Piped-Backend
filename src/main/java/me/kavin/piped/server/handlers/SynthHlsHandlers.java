@@ -31,6 +31,14 @@ public class SynthHlsHandlers {
         // WebEmbed re-resolve. Skipping that keeps this (the dominant
         // FILE_LOADED cost) fast; the variant/audio fetches verify before any
         // segment URL is served.
+        // SABR-Kurzschluss (2026-07-25): ist das Video storm-markiert, bedienen wir
+        // ohnehin aus /sabr — dann ist JEDER Resolve hier verschwendete Zeit auf
+        // dem kalten Tap. Gemessen an einem frischen Kids-Video: /streams 5,74s
+        // (Kaskade, endet mit 503 -> Cache bleibt LEER), danach master 1,85s
+        // (resolveMs=1838) und variant 1,17s (Probe + WebEmbed-Retry) = ~3s
+        // reine Doppelarbeit. isSabrMode() prueft die Storm-Marke ohnehin als
+        // Erstes; wir ziehen die Pruefung nur VOR den Resolve.
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return sabrMaster(videoId);
         Streams streams = fetchStreams(videoId, false);
         if (isSabrMode(videoId, streams)) return sabrMaster(videoId);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
@@ -69,6 +77,10 @@ public class SynthHlsHandlers {
     }
 
     public static byte[] audioPlaylist(String videoId) throws Exception {
+        // s. masterPlaylist: storm-markiert -> direkt aus /sabr, kein Resolve.
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
+            return sabrStreamPlaylist(videoId,
+                    me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
         Streams streams = fetchStreams(videoId);
         if (isSabrMode(videoId, streams))
             return sabrStreamPlaylist(videoId,
@@ -83,6 +95,10 @@ public class SynthHlsHandlers {
     }
 
     public static byte[] videoPlaylist(String videoId, int idx, int maxH, String[] codecs) throws Exception {
+        // s. masterPlaylist: storm-markiert -> direkt aus /sabr, kein Resolve.
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
+            return sabrStreamPlaylist(videoId,
+                    me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
         Streams streams = fetchStreams(videoId);
         if (isSabrMode(videoId, streams))
             return sabrStreamPlaylist(videoId,
