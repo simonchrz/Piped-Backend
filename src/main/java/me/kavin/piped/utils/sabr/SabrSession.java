@@ -464,12 +464,15 @@ public final class SabrSession {
         for (FState s : states.values()) {
             if (!s.seen.isEmpty()) req.bytesField(3, bufferedRange(s));
         }
-        // preferred_*_format_ids: bevorzugten Pick zuerst, danach alle weiteren
-        // Kandidaten — so macht es der echte Web-Player.
+        // ⚠️ NUR den bevorzugten Pick nennen — NICHT alle Kandidaten wie der echte
+        // Web-Player (2026-07-25 versucht und wieder entfernt): der Server waehlte
+        // daraufhin ANDERE Formate (249/396 statt 140/137), waehrend unsere
+        // Buchhaltung (itags-Manifest, ensureFile, Playlist-Layer) weiter vom
+        // Wunschpaar ausging -> Cache-Dateien _249/_396, angefragt wurde _137
+        // -> Dauer-500 auf /synth-hls. Fuer das WEB-Experiment brachte die
+        // Kandidatenliste ohnehin nichts (unveraendert 11B-Antworten).
         req.bytesField(16, formatId(prefAudio));
-        for (Fmt f : allAudio) if (f.itag != prefAudio.itag || f.lmt != prefAudio.lmt) req.bytesField(16, formatId(f));
         req.bytesField(17, formatId(prefVideo));
-        for (Fmt f : allVideo) if (f.itag != prefVideo.itag || f.lmt != prefVideo.lmt) req.bytesField(17, formatId(f));
         req.varintField(4, playerTimeMs);
         req.bytesField(5, ustreamerConfig);
         // streamerContext: client_info(1), po_token(2), playback_cookie(3).

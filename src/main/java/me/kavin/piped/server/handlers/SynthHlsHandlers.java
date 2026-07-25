@@ -249,7 +249,18 @@ public class SynthHlsHandlers {
     /// Ein Bauversuch; null = Cache (noch) nicht nutzbar.
     private static byte[] trySabrStreamPlaylist(String videoId, int itag) throws Exception {
         final java.nio.file.Path file = me.kavin.piped.utils.sabr.SabrCache.ensureFile(videoId, itag);
-        if (file == null) return null;
+        if (file == null) {
+            // Buchhaltungs-Fehler sichtbar machen: es liegt SABR-Material zu diesem
+            // Video auf Platte, aber nicht unter dem angefragten itag. Genau das
+            // passierte 2026-07-25, als der Server andere Formate lieferte (249/396)
+            // als unser Wunschpaar (140/137) — Ergebnis war ein Dauer-500 ohne
+            // erkennbare Ursache. Lieber laut sein als raten lassen.
+            if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId))
+                System.out.println("[SynthHls] " + videoId + " itag-MISMATCH: angefragt "
+                        + itag + ", aber Cache enthaelt andere Formate "
+                        + me.kavin.piped.utils.sabr.SabrCache.cachedItags(videoId));
+            return null;
+        }
         final int[] box = scanSabrSidx(file);
         if (box == null) return null;   // ftyp/moov/sidx noch nicht auf Platte
         final int sidxStart = box[0];

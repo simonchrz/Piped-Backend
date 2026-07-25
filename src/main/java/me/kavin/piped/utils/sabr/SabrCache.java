@@ -129,6 +129,18 @@ public final class SabrCache {
         return anyFileFor(videoId);
     }
 
+    /// Welche itags liegen tatsaechlich auf Platte? Nur fuer Diagnose.
+    public static String cachedItags(String videoId) {
+        final List<String> out = new ArrayList<>();
+        try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
+            for (Path p : s) {
+                final String n = p.getFileName().toString();
+                out.add(n.substring(n.lastIndexOf('_') + 1).replace(".bin", ""));
+            }
+        } catch (IOException ignored) {}
+        return out.toString();
+    }
+
     private static boolean anyFileFor(String videoId) {
         try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
             return s.iterator().hasNext();
