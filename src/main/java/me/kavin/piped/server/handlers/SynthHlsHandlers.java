@@ -163,8 +163,19 @@ public class SynthHlsHandlers {
         // Storm-marked by StreamHandlers stage 4 (WebEmbed+TVHTML5 segments 403,
         // SABR viability probed) — serve from /sabr while the mark lives (30 min).
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return true;
-        // Auto: resolve yielded video formats but NONE has a usable URL.
-        if (streams == null || streams.videoStreams == null || streams.videoStreams.isEmpty()) return false;
+        // Resolve lieferte GAR NICHTS (Made-for-Kids-Bot-Gate: Player-Response ohne
+        // adaptiveFormats, „Melde dich an, damit wir sehen, dass du kein Bot bist"),
+        // aber die Bytes liegen schon bei uns → aus dem Cache ausliefern statt einen
+        // Fehler zu zeigen. Genau der Alltagsfall: dasselbe Video wird wiederholt
+        // geschaut, und beim zweiten Mal ist das Gate zu.
+        if (streams == null || streams.videoStreams == null || streams.videoStreams.isEmpty()) {
+            if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)) {
+                System.out.println("[ResolvePath] " + videoId
+                        + " -> SABR-CACHE (Resolve gesperrt, Cache vorhanden)");
+                return true;
+            }
+            return false;
+        }
         for (PipedStream v : streams.videoStreams) {
             if (v.url != null && !v.url.isEmpty()) return false;
         }

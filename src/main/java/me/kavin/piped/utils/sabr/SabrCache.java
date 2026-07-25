@@ -122,6 +122,13 @@ public final class SabrCache {
         }
     }
 
+    /// Liegt ueberhaupt SABR-Material zu diesem Video auf Platte? Erlaubt der
+    /// synth-hls-Schicht, bei gesperrtem Resolve trotzdem aus dem Cache zu
+    /// bedienen, statt „nicht abspielbar" zu zeigen.
+    public static boolean hasCache(String videoId) {
+        return anyFileFor(videoId);
+    }
+
     private static boolean anyFileFor(String videoId) {
         try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
             return s.iterator().hasNext();
