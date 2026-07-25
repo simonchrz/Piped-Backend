@@ -249,6 +249,27 @@ public final class SabrHandlers {
     /// Schluss". Unsere Session gab sich bisher als ANDROID (clientInfo 3/28)
     /// aus, präsentierte aber den WEB-BotGuard-Token — die Paarung passt nicht,
     /// deshalb kam ab Runde 1 prot=2 und nach dem Duldungsfenster prot=3.
+    /// `STS` (signatureTimestamp) aus der Watch-Page; wechselt nur mit der
+    /// Player-JS-Version, daher 6h gecacht. Fallback = zuletzt gesehener Wert.
+    private static volatile int STS_CACHE = 20655;
+    private static volatile long STS_AT = 0;
+    private static int signatureTimestamp() {
+        final long now = System.currentTimeMillis();
+        if (now - STS_AT < 6 * 3600_000L) return STS_CACHE;
+        try {
+            final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetch(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "GET", new byte[0],
+                    Map.of("User-Agent", WEB_UA)).get(15, java.util.concurrent.TimeUnit.SECONDS);
+            final var m = java.util.regex.Pattern.compile("\"STS\":(\\d+)")
+                    .matcher(new String(r.body(), StandardCharsets.UTF_8));
+            if (m.find()) { STS_CACHE = Integer.parseInt(m.group(1)); }
+        } catch (Exception e) {
+            System.out.println("[Sabr] STS-Abruf fehlgeschlagen, nutze " + STS_CACHE);
+        }
+        STS_AT = now;
+        return STS_CACHE;
+    }
+
     private static JsonNode webPlayer(String videoId, String visitorData, String family,
                                       String attestationPoToken) throws Exception {
         final Map<String, Object> client = new HashMap<>(Map.of(
@@ -257,7 +278,16 @@ public final class SabrHandlers {
         if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
         final Map<String, Object> req = new HashMap<>(Map.of(
                 "context", Map.of("client", client),
-                "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
+                "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true,
+                // ⚠️ OHNE signatureTimestamp antwortet der WEB-Client mit
+                // UNPLAYABLE/"Video unavailable" — und zwar für JEDES Video, auch
+                // ganz normale. Genau daran ist mein erster WEB-Versuch
+                // gescheitert (und ich hatte daraus faelschlich geschlossen,
+                // Made-for-Kids sperre den Web-Client). Mit sts: status=OK,
+                // serverAbrStreamingUrl + 26 Formate, auch fuer Kids-Videos.
+                "playbackContext", Map.of("contentPlaybackContext",
+                        Map.of("signatureTimestamp", signatureTimestamp(),
+                               "html5Preference", "HTML5_PREF_WANTS"))));
         if (attestationPoToken != null)
             req.put("serviceIntegrityDimensions", Map.of("poToken", attestationPoToken));
         final String body = Constants.mapper.writeValueAsString(req);

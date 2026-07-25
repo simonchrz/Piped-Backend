@@ -563,11 +563,19 @@ public final class SabrSession {
             url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
                     .encodeToString(poToken);
         }
+        // Browser-Identitaet: googlevideo weist den ABR-POST ohne Origin/Referer
+        // mit 403 ab (gemessen 2026-07-25, WEB-Client-Session). Fuer die
+        // App-Clients (Android/VR) bleibt der Header-Satz unveraendert.
+        final java.util.Map<String, String> headers = new java.util.HashMap<>(Map.of(
+                "Content-Type", "application/x-protobuf",
+                "Accept-Encoding", "identity",
+                "User-Agent", userAgent));
+        if (userAgent != null && userAgent.startsWith("Mozilla/")) {
+            headers.put("Origin", "https://www.youtube.com");
+            headers.put("Referer", "https://www.youtube.com/");
+        }
         final var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
-                url, "POST", body,
-                Map.of("Content-Type", "application/x-protobuf",
-                        "Accept-Encoding", "identity",
-                        "User-Agent", userAgent),
+                url, "POST", body, headers,
                 family).get(60, java.util.concurrent.TimeUnit.SECONDS);
         if (resp.status() / 100 != 2)
             throw new IOException("SABR POST HTTP " + resp.status() + " (egress=" + family + ")");
