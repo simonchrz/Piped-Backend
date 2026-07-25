@@ -310,9 +310,17 @@ public final class SabrCache {
             for (Map.Entry<Integer, Path> e : parts.entrySet())
                 publishIfLarger(videoId, e.getKey(), e.getValue(), false);
         };
+        // Protokoll-Probe (2026-07-25): erzwingt einen Client-Modus fuer die
+        // Session, um die Client<->Token-Konsistenz zu testen (0=ANDROID,
+        // 1=ANDROID_VR, 2=WEB_EMBEDDED). Unset = normales Verhalten.
+        final String probeClient = System.getenv("YT_SABR_PROBE_CLIENT");
+        final int effClientMode = probeClient != null
+                ? Integer.parseInt(probeClient.trim()) : clientMode;
+        if (probeClient != null)
+            System.out.println("[Sabr] PROBE clientMode=" + effClientMode + " (erzwungen)");
         SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, clientMode, paced, publishHook);
+            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, effClientMode, paced, publishHook);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {

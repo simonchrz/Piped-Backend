@@ -48,6 +48,15 @@ public class BgPoTokenProvider implements PoTokenProvider {
         return mintContentBoundPoToken(videoId);
     }
 
+    /// po_token mit BELIEBIGER content_binding minten (Protokoll-Analyse
+    /// 2026-07-25): die SABR-Session startet mit einem an `visitorData`
+    /// gebundenen Token und laeuft damit ~7 Runden; die Re-Attestierung mit einem
+    /// an die videoId gebundenen Token wird abgelehnt. Damit laesst sich testen,
+    /// ob die Bindung identisch zur Session-Bindung sein muss.
+    public @Nullable String sabrPoTokenForBinding(String binding) {
+        return mintContentBoundPoToken(binding);
+    }
+
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     private String getWebVisitorData() throws Exception {

@@ -165,9 +165,45 @@ public final class SabrHandlers {
         // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN
         // content-bound po_token minten und die Session damit fortsetzen
         // (s. SabrSession — das war die vermeintliche Kids-Readahead-Sperre).
+        // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
+        // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
+        // Attestierungs-Token. Nur einen Token nachzureichen genuegt nicht.
+        final String visitorForRenewal = visitorData;
+        session.setSessionRefresher(() -> {
+            try {
+                String attest = null;
+                if (bg != null) {
+                    final PoTokenResult p2 = bg.sabrSessionPoToken();
+                    if (p2 != null) attest = p2.playerRequestPoToken;
+                }
+                final JsonNode p = webClient
+                        ? webEmbedPlayer(videoId, visitorForRenewal, family, attest)
+                        : androidPlayer(videoId, visitorForRenewal, family, attest, vrClient);
+                final JsonNode sd2 = p.path("streamingData");
+                final String url2 = sd2.path("serverAbrStreamingUrl").asText(null);
+                final String ust2 = findFirst(p, "videoPlaybackUstreamerConfig");
+                if (ust2 == null) return null;
+                byte[] pot2 = null;
+                if (bg != null) {
+                    final String cb = bg.sabrContentBoundPoToken(videoId);
+                    if (cb != null) pot2 = b64(cb);
+                }
+                return new SabrSession.Renewal(url2, b64(ust2), pot2);
+            } catch (Exception e) {
+                System.out.println("[Sabr] " + videoId + " Session-Erneuerung fehlgeschlagen: " + e.getMessage());
+                return null;
+            }
+        });
+
+        final String reattestBinding = System.getenv("YT_SABR_REATTEST_BINDING");
+        final String sessionVisitor = visitorData;
         if (bg != null) session.setTokenRefresher(() -> {
             try {
-                final String cb = bg.sabrContentBoundPoToken(videoId);
+                // Bindung waehlbar: "visitor" = an dieselbe visitorData wie der
+                // Player-Call (Session-Identitaet), sonst an die videoId.
+                final String cb = "visitor".equals(reattestBinding) && sessionVisitor != null
+                        ? bg.sabrPoTokenForBinding(sessionVisitor)
+                        : bg.sabrContentBoundPoToken(videoId);
                 return cb != null ? b64(cb) : null;
             } catch (Exception e) {
                 System.out.println("[Sabr] " + videoId + " Re-Attest-Mint fehlgeschlagen: " + e.getMessage());

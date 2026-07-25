@@ -104,7 +104,7 @@ public final class SabrSession {
     }
 
     private String abrUrl;
-    private final byte[] ustreamerConfig;
+    private byte[] ustreamerConfig;   // bei Re-Attest aus neuem Player-Call ersetzt
     private final byte[] clientInfo;
     private final String userAgent;
     private final Fmt prefAudio;
@@ -115,6 +115,20 @@ public final class SabrSession {
     public interface TokenRefresher { byte[] fresh(); }
     private TokenRefresher tokenRefresher;
     public void setTokenRefresher(TokenRefresher r) { this.tokenRefresher = r; }
+
+    /// Vollstaendige Session-Erneuerung: NEUER Player-Call → frische abrUrl +
+    /// ustreamerConfig + po_token. Nur einen frischen Token nachzureichen genuegt
+    /// nachweislich NICHT (2026-07-25: videoId- UND visitorData-gebunden getestet,
+    /// beide abgelehnt, Server bleibt bei prot=3). Der Zustand (`states` mit
+    /// buffered_range/seen) bleibt erhalten, damit wir dort weitermachen, wo die
+    /// alte Session stehen geblieben ist.
+    public static final class Renewal {
+        public final String abrUrl; public final byte[] ustreamerConfig; public final byte[] poToken;
+        public Renewal(String u, byte[] c, byte[] p) { abrUrl = u; ustreamerConfig = c; poToken = p; }
+    }
+    public interface SessionRefresher { Renewal fresh(); }
+    private SessionRefresher sessionRefresher;
+    public void setSessionRefresher(SessionRefresher r) { this.sessionRefresher = r; }
     private final String egressFamily; // "v4"/"v6" — gvs URLs are IP-signed, so the
                                        // session MUST egress on the same family the
                                        // player resolve used. null = global ACTIVE.
@@ -156,6 +170,29 @@ public final class SabrSession {
     /// download runs at ~1x. publishHook (optional) runs once per round after the
     /// disk flush so the caller can republish the growing file for live serving.
     /// Re-Attest-Versuch: DEFAULT AUS (`YT_SABR_REATTEST=1` schaltet ihn an).
+    ///
+    /// ── Protokoll-Analyse 2026-07-25: FÜNF Hypothesen getestet, alle widerlegt ──
+    /// Der Server meldet `STREAM_PROTECTION_STATUS{1=3, 2=10}` („Attestierung
+    /// erforderlich", 10 Wiederholungen erlaubt) und liefert danach nichts mehr,
+    /// egal was wir tun:
+    ///   1. frischer content-bound po_token (videoId)        -> weiter prot=3
+    ///   2. frischer visitor-bound po_token (599B-Form)      -> weiter prot=3
+    ///   3. KOMPLETT neuer Player-Call (neue abrUrl +
+    ///      ustreamerConfig + Token)                          -> weiter prot=3
+    ///   4. dito + playbackCookie fallen gelassen             -> weiter prot=3
+    ///   5. Token zusätzlich als `pot=`-Query am ABR-POST     -> weiter prot=3
+    /// Der BotGuard-Helfer liefert nachweislich JEDES MAL einen anderen Token
+    /// (3x geprüft), Frische ist also nicht das Problem. WEB_EMBEDDED als
+    /// Session-Client scheidet aus (liefert gar keine serverAbrStreamingUrl).
+    /// Ebenfalls unbehandelt, aber unkritisch: UMP-Typen 47 (playback-start
+    /// policy), 49 (bandwidth-sampling hint), 51 (selectable formats).
+    /// OFFENE FÄDEN für den nächsten Anlauf: (a) der Token muss evtl. an einer
+    /// anderen Stelle der ABR-Anfrage stehen als streamerContext-Feld 2;
+    /// (b) unser BotGuard-Helfer erzeugt evtl. eine Token-ART, die der
+    /// gvs-STREAMING-Pfad grundsätzlich nicht akzeptiert (für Player-Calls und
+    /// Direkt-URL-`pot=` funktioniert sie); (c) ein echter Client-Mitschnitt
+    /// (Charles/mitmproxy gegen den YT-Web-Player) würde die Frage in Minuten
+    /// klären, statt sie weiter zu erraten.
     /// Der Mechanismus ist belegt (prot 2->3 ist das Stopp-Signal), aber ein
     /// frisch gemünzter content-bound po_token wird NICHT akzeptiert: der Server
     /// bleibt bei prot=3 und sendet nichts (40 Erneuerungen, 0 neue Segmente,
@@ -167,6 +204,7 @@ public final class SabrSession {
     /// Roundtrips für nichts.
     private static final int MAX_REATTESTS =
             "1".equals(System.getenv("YT_SABR_REATTEST")) ? 40 : 0;
+    private static final boolean POT_IN_URL = "1".equals(System.getenv("YT_SABR_POT_IN_URL"));
     private static final boolean TRACE = "1".equals(System.getenv("YT_SABR_TRACE"));
     private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
 
@@ -177,15 +215,25 @@ public final class SabrSession {
     /// wir stur weiter dasselbe Paket schicken, hoert er auf, Medien zu senden:
     /// exakt unser Bild „resp=808B new=0" bis zum stuck-Abbruch.
     private static int readProtectionStatus(byte[] payload) {
+        int status = -1;
+        final StringBuilder dump = TRACE ? new StringBuilder() : null;
         try {
             final ProtoReader r = new ProtoReader(payload);
             while (r.hasMore()) {
                 final int f = r.readTag();
-                if (f == 1 && r.wireType() == 0) return (int) r.readVarint();
-                r.skip();
+                if (r.wireType() == 0) {
+                    final long v = r.readVarint();
+                    if (f == 1) status = (int) v;
+                    if (dump != null) dump.append(' ').append(f).append('=').append(v);
+                } else {
+                    if (dump != null) dump.append(' ').append(f).append("=<len>");
+                    r.skip();
+                }
             }
         } catch (Exception ignored) { }
-        return -1;
+        if (dump != null && dump.length() > 0)
+            System.out.println("[Sabr] STREAM_PROTECTION_STATUS Felder:" + dump);
+        return status;
     }
 
     public Result fetchAll(int maxIterations, Sink sink, boolean paced, Runnable publishHook) throws Exception {
@@ -265,17 +313,36 @@ public final class SabrSession {
                 // das Feld bisher ignoriert und stur weitergefragt — daher sah es
                 // nach einem 60s-Fenster-Cap aus. Ein echter Client mintet dann
                 // einen frischen po_token und macht in DERSELBEN Session weiter.
-                if (protectionStatus[0] == 3 && tokenRefresher != null
-                        && reattests < MAX_REATTESTS) {
-                    final byte[] fresh = tokenRefresher.fresh();
-                    if (fresh != null && fresh.length > 0) {
-                        poToken = fresh;
-                        reattests++;
-                        System.out.println("[Sabr] Attestierung erneuert (#" + reattests
-                                + ", " + fresh.length + "B) nach prot=3");
-                        continue;   // Runde nicht als „stuck" werten
+                if (protectionStatus[0] == 3 && reattests < MAX_REATTESTS) {
+                    reattests++;
+                    if (sessionRefresher != null) {
+                        final Renewal rn = sessionRefresher.fresh();
+                        if (rn != null && rn.ustreamerConfig != null) {
+                            if (rn.abrUrl != null) abrUrl = rn.abrUrl;
+                            ustreamerConfig = rn.ustreamerConfig;
+                            if (rn.poToken != null) poToken = rn.poToken;
+                            // Das playbackCookie identifiziert die ALTE, vom Server als
+                            // un-attestiert verworfene Sitzung. Ein echter Client faengt
+                            // nach einem Reload eine NEUE an und setzt nur die Position
+                            // fort — also Cookie fallen lassen, `states` (buffered_range
+                            // + seen) aber behalten, damit wir bei Segment N weitermachen.
+                            playbackCookie = null;
+                            System.out.println("[Sabr] Session erneuert (#" + reattests
+                                    + ", ust=" + rn.ustreamerConfig.length + "B, pot="
+                                    + (rn.poToken != null ? rn.poToken.length + "B" : "-")
+                                    + ") nach prot=3");
+                            continue;
+                        }
+                        System.out.println("[Sabr] prot=3: Session-Erneuerung fehlgeschlagen");
+                    } else if (tokenRefresher != null) {
+                        final byte[] fresh = tokenRefresher.fresh();
+                        if (fresh != null && fresh.length > 0) {
+                            poToken = fresh;
+                            System.out.println("[Sabr] Attestierung erneuert (#" + reattests
+                                    + ", " + fresh.length + "B) nach prot=3");
+                            continue;
+                        }
                     }
-                    System.out.println("[Sabr] prot=3, aber Token-Mint fehlgeschlagen");
                 }
 
                 if (sabrError[0]) { stopReason = "SABR_ERROR"; break; }
@@ -487,8 +554,17 @@ public final class SabrSession {
         final String family = egressFamily != null
                 ? egressFamily
                 : me.kavin.piped.utils.EgressManager.activeEgress();
+        // Probe (YT_SABR_POT_IN_URL=1): den Attestierungs-Token ZUSAETZLICH als
+        // `pot=`-Query anhaengen — genau so autorisiert unser funktionierender
+        // Direktpfad die googlevideo-Range-GETs. Beim ABR-POST steckt er bisher
+        // nur im streamerContext.
+        String url = abrUrl;
+        if (POT_IN_URL && poToken != null && !url.contains("&pot=")) {
+            url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
+                    .encodeToString(poToken);
+        }
         final var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
-                abrUrl, "POST", body,
+                url, "POST", body,
                 Map.of("Content-Type", "application/x-protobuf",
                         "Accept-Encoding", "identity",
                         "User-Agent", userAgent),
