@@ -186,7 +186,9 @@ public class SynthHlsHandlers {
     /// genau das Bild „Video startet gar nicht". Bei nicht-nutzbarem Cache lieber
     /// kurz auf die laufende SABR-Session warten und sonst eine Exception werfen
     /// (Route → 5xx), damit der Client es erneut versuchen kann.
-    private static final int SABR_PLAYLIST_WAIT_MS = 8_000;
+    /// ⚠️ Diese Wartezeit haelt einen der nur ZWEI Resolve-Slots — kurz halten,
+    /// sonst hungern parallele Taps/Segmentabrufe aus (503 → -16849).
+    private static final int SABR_PLAYLIST_WAIT_MS = 3_000;
 
     private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
         final long deadline = System.currentTimeMillis() + SABR_PLAYLIST_WAIT_MS;

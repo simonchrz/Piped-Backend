@@ -59,7 +59,12 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
      *  FOREGROUND path (tap / playback): may use any of the slots. */
     private static boolean ytResolveAcquire() {
         try {
-            return YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS);
+            final boolean got = YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS);
+            // Saettigung SICHTBAR machen: ein 503 von hier ist app-seitig nur ein
+            // generisches „Video nicht abspielbar" (-1008/-16849) und war bisher
+            // im Log unsichtbar — man riet, statt zu messen.
+            if (!got) System.out.println("[Limiter] YT-Resolve-Slot belegt -> 503");
+            return got;
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
             return false;

@@ -181,7 +181,19 @@ public final class SabrCache {
         return true;
     }
 
-    private static void download(String videoId, boolean allowPaced) throws Exception {
+    /// Paced 1x-Refill: standardmässig AUS (`YT_SABR_PACED=1` schaltet ihn an).
+    /// Die Hypothese „der Kids-Cap haengt am zu schnell vorlaufenden player_time"
+    /// ist FALSIFIZIERT — jede gemessene paced Session (2026-07-24/25) endete mit
+    /// „no net gain". Der Lauf kostet aber echtes Geld: er laeuft minutenlang,
+    /// haelt den Per-Video-Lock, kopiert pro Runde die ganze Cache-Datei und
+    /// konkurriert mit den Auslieferungs-Requests um die nur zwei Resolve-Slots.
+    /// Code + Schalter bleiben als dokumentiertes Negativ-Ergebnis stehen.
+    private static boolean pacedEnabled() {
+        return "1".equals(System.getenv("YT_SABR_PACED"));
+    }
+
+    private static void download(String videoId, boolean allowPacedRequested) throws Exception {
+        final boolean allowPaced = allowPacedRequested && pacedEnabled();
         // Known capped (kids): burst rungs are wasted requests — refill goes
         // straight to the paced 1x session; the sync warm path keeps serving
         // the existing partial cache untouched.
@@ -374,7 +386,11 @@ public final class SabrCache {
 
     public static void requestRefill(String videoId) {
         if (isRefillExhausted(videoId)) return;          // paced verdict: nichts zu holen
-        if (REFILL_ACTIVE.contains(videoId)) return;     // paced Session läuft bereits (~Videolänge)
+        // Cap-markiert + paced aus = es gaebe nur eine weitere Burst-Session, die
+        // (gemessen) nichts holt. Spart Slots/IO auf genau den Videos, die die
+        // Kinder am haeufigsten antippen.
+        if (isCapMarked(videoId) && !pacedEnabled()) return;
+        if (REFILL_ACTIVE.contains(videoId)) return;     // Session läuft bereits
         final long now = System.currentTimeMillis();
         final boolean[] go = {false};
         REFILL_LAST.compute(videoId, (k, prev) -> {
