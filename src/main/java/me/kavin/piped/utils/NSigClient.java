@@ -52,6 +52,21 @@ public final class NSigClient {
         return url;
     }
 
+    /// EXPLIZITE n-Entschluesselung fuer URLs, die NICHT durch NewPipeExtractor
+    /// gelaufen sind — konkret die `serverAbrStreamingUrl` aus unserem eigenen
+    /// Player-Call in SabrHandlers. maybeRewriteN() ist bewusst ein No-Op, weil
+    /// NPE seine URLs schon entschluesselt; diese hier hat das noch NICHT.
+    /// Browser-Mitschnitt 2026-07-25: der echte Player schickt `n` entschluesselt
+    /// (Player-Antwort 16 Zeichen -> Request 14, verschieden).
+    public static String rewriteNUnprocessed(final String url) {
+        if (!isEnabled() || url == null) return url;
+        final Matcher m = Pattern.compile("([?&]n=)([A-Za-z0-9_-]+)").matcher(url);
+        if (!m.find()) return url;
+        final String dec = decryptN(m.group(2));
+        if (dec == null || dec.equals(m.group(2))) return url;
+        return url.substring(0, m.start(2)) + dec + url.substring(m.end(2));
+    }
+
     private static String decryptN(final String obfuscated) {
         final String cached = CACHE.get(obfuscated);
         if (cached != null) return cached;

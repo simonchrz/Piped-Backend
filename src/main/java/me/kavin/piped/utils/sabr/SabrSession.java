@@ -104,6 +104,7 @@ public final class SabrSession {
     }
 
     private String abrUrl;
+    private int requestNo = 0;
     private byte[] ustreamerConfig;   // bei Re-Attest aus neuem Player-Call ersetzt
     private final byte[] clientInfo;
     private final String userAgent;
@@ -346,7 +347,13 @@ public final class SabrSession {
                 }
 
                 if (sabrError[0]) { stopReason = "SABR_ERROR"; break; }
-                if (states.values().stream().allMatch(FState::complete)) { stopReason = "complete"; break; }
+                // ⚠️ NICHT bei leerer states-Map "complete" melden: allMatch() ist auf
+                // einer leeren Menge trivial wahr -> die Session brach nach Runde 1
+                // mit complete=true und 0 Segmenten ab, obwohl noch gar kein
+                // FORMAT_INIT angekommen war.
+                if (!states.isEmpty() && states.values().stream().allMatch(FState::complete)) {
+                    stopReason = "complete"; break;
+                }
                 if (newSegments[0] == 0) {
                     if (++stuckRounds > stuckLimit) { stopReason = "stuck(no new segments " + (stuckLimit + 1) + " rounds)"; break; }
                 } else {
@@ -366,7 +373,7 @@ public final class SabrSession {
                 }
             }
 
-            res.complete = states.values().stream().allMatch(FState::complete);
+            res.complete = !states.isEmpty() && states.values().stream().allMatch(FState::complete);
             for (FState s : states.values()) {
                 final Map<String, Object> info = new LinkedHashMap<>();
                 info.put("segments", s.seen.size());
@@ -558,7 +565,9 @@ public final class SabrSession {
         // `pot=`-Query anhaengen — genau so autorisiert unser funktionierender
         // Direktpfad die googlevideo-Range-GETs. Beim ABR-POST steckt er bisher
         // nur im streamerContext.
-        String url = abrUrl;
+        // `rn` (Request-Nummer, pro Anfrage hochgezaehlt) und `alr=yes` schickt der
+        // echte Web-Player mit — im Mitschnitt 2026-07-25 belegt.
+        String url = abrUrl + "&rn=" + (++requestNo) + (abrUrl.contains("&alr=") ? "" : "&alr=yes");
         if (POT_IN_URL && poToken != null && !url.contains("&pot=")) {
             url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
                     .encodeToString(poToken);

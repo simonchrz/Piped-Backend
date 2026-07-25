@@ -174,7 +174,15 @@ public final class SabrHandlers {
         // maxIterations bumped 500 -> 8000: a full-length video needs one round per
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
-        final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
+        // ⚠️ nsig auf die ABR-URL anwenden (Browser-Mitschnitt 2026-07-25): der echte
+        // Web-Player schickt den `n`-Parameter ENTSCHLUESSELT — in der Player-Antwort
+        // 16 Zeichen, im tatsaechlichen Request 14, nachweislich verschieden. Ohne
+        // diesen Schritt drosselt/403t googlevideo den ABR-POST. Dieselbe
+        // Behandlung bekommen unsere Direkt-URLs laengst (URLUtils.rewriteVideoURL).
+        final String abrUrlN = me.kavin.piped.utils.NSigClient.rewriteNUnprocessed(abrUrl);
+        if (!abrUrlN.equals(abrUrl))
+            System.out.println("[Sabr] " + videoId + " abrUrl: n-Parameter entschluesselt");
+        final SabrSession session = new SabrSession(abrUrlN, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
         // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN
         // content-bound po_token minten und die Session damit fortsetzen
         // (s. SabrSession — das war die vermeintliche Kids-Readahead-Sperre).
