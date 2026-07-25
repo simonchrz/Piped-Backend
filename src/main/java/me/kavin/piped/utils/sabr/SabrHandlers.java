@@ -27,6 +27,7 @@ public final class SabrHandlers {
     private static final String WEB_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     private static final String WEB_EMBEDDED_VERSION = "1.20260122.01.00";
+    private static final String WEB_VERSION = "2.20260122.01.00";
 
     /// Cheap viability probe for the storm fallback: ONE ANDROID player call.
     /// SABR is viable when it answers with a serverAbrStreamingUrl — the media
@@ -92,6 +93,7 @@ public final class SabrHandlers {
                                        int clientMode, boolean paced, Runnable publishHook) throws Exception {
         final boolean vrClient = clientMode == 1;
         final boolean webClient = clientMode == 2;
+        final boolean pureWeb = clientMode == 3;
         // A pooled visitorData-bound po_token authorizes the gvs streaming session.
         // Without it googlevideo caps the SABR readahead at ~60s (one buffer window)
         // then stops. visitorData goes into the player context; the po_token bytes
@@ -124,7 +126,13 @@ public final class SabrHandlers {
             final PoTokenResult pot2 = bg.sabrSessionPoToken();
             if (pot2 != null) attestationPoToken = pot2.playerRequestPoToken;
         }
-        final JsonNode player = webClient
+        if (pureWeb && attestationPoToken == null && bg != null) {
+            final PoTokenResult p3 = bg.sabrSessionPoToken();
+            if (p3 != null) attestationPoToken = p3.playerRequestPoToken;
+        }
+        final JsonNode player = pureWeb
+                ? webPlayer(videoId, visitorData, family, attestationPoToken)
+                : webClient
                 ? webEmbedPlayer(videoId, visitorData, family, attestationPoToken)
                 : androidPlayer(videoId, visitorData, family, attestationPoToken, vrClient);
         final JsonNode sd = player.path("streamingData");
@@ -138,7 +146,12 @@ public final class SabrHandlers {
         final JsonNode vid = pickFormat(sd, "video", 137);
         final byte[] clientInfo;
         final String ua;
-        if (webClient) {
+        if (pureWeb) {
+            clientInfo = new ProtoWriter()
+                    .varintField(16, 1).stringField(17, WEB_VERSION)
+                    .toByteArray();
+            ua = WEB_UA;
+        } else if (webClient) {
             clientInfo = new ProtoWriter()
                     .varintField(16, 56).stringField(17, WEB_EMBEDDED_VERSION)
                     .toByteArray();
@@ -227,6 +240,39 @@ public final class SabrHandlers {
             if (firstMatch == null && f.path("mimeType").asText("").startsWith(mimePrefix)) firstMatch = f;
         }
         return firstMatch;
+    }
+
+    /// Echter WEB-Client (Client 1) — der Client, FÜR DEN unser BotGuard-Token
+    /// gemünzt ist. Belegt (Protokoll-Analyse 2026-07-25 + öffentliche Doku):
+    /// STREAM_PROTECTION_STATUS 2 heißt bereits „Stream braucht einen PoToken,
+    /// wir dulden dich noch 1–2 MB", 3 heißt „Token fehlt/ungültig, sofort
+    /// Schluss". Unsere Session gab sich bisher als ANDROID (clientInfo 3/28)
+    /// aus, präsentierte aber den WEB-BotGuard-Token — die Paarung passt nicht,
+    /// deshalb kam ab Runde 1 prot=2 und nach dem Duldungsfenster prot=3.
+    private static JsonNode webPlayer(String videoId, String visitorData, String family,
+                                      String attestationPoToken) throws Exception {
+        final Map<String, Object> client = new HashMap<>(Map.of(
+                "clientName", "WEB", "clientVersion", WEB_VERSION,
+                "hl", "en", "gl", "US", "userAgent", WEB_UA));
+        if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
+        final Map<String, Object> req = new HashMap<>(Map.of(
+                "context", Map.of("client", client),
+                "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true));
+        if (attestationPoToken != null)
+            req.put("serviceIntegrityDimensions", Map.of("poToken", attestationPoToken));
+        final String body = Constants.mapper.writeValueAsString(req);
+        final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                "POST", body.getBytes(StandardCharsets.UTF_8),
+                Map.of("Content-Type", "application/json",
+                        "Accept-Encoding", "identity",
+                        "User-Agent", WEB_UA,
+                        "X-Youtube-Client-Name", "1",
+                        "X-Youtube-Client-Version", WEB_VERSION,
+                        "Origin", "https://www.youtube.com",
+                        "Referer", "https://www.youtube.com/"),
+                family).get(20, java.util.concurrent.TimeUnit.SECONDS);
+        return Constants.mapper.readTree(r.body());
     }
 
     private static JsonNode webEmbedPlayer(String videoId, String visitorData, String family,
