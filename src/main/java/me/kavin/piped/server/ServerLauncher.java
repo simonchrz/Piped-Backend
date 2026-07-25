@@ -52,8 +52,18 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
     // starves. Cap concurrent video-resolves (/streams, /synth-hls) BELOW the
     // carrier count so a YT-block can never take the whole backend down; excess
     // resolves fast-reject with 503 instead of piling up and pinning carriers.
-    private static final Semaphore YT_RESOLVE_LIMITER =
-            new Semaphore(Math.max(2, Runtime.getRuntime().availableProcessors() / 2));
+    // 2026-07-25 von /2 auf *3/4 angehoben (Pi5: 2 -> 3), Hintergrund damit 1 -> 2.
+    // Begruendung: der Deckel stammt aus der Zeit, als AUCH Playlist- und
+    // Segment-Abrufe an diesem Semaphor hingen — die sind inzwischen ausgeloest
+    // (canServeWithoutResolve + /sabr-Ausnahme). Uebrig bleiben echte Resolves.
+    // Gemessen: ein Kids-Resolve kostet 4-5s und der Prefetch lief seriell mit
+    // Hintergrund-Cap 1 -> ~ein vorgewaermtes Video pro 5s; scrollt das Kind
+    // ueber mehrere Kacheln, ist die getippte noch kalt und zahlt die vollen 5s.
+    // Weiterhin UNTER der Carrier-Zahl (4), und die Vordergrund-Reserve bleibt
+    // erhalten (BG = MAIN-1), damit ein Tap nie verhungert.
+    private static final int YT_RESOLVE_SLOTS =
+            Math.max(2, Runtime.getRuntime().availableProcessors() * 3 / 4);
+    private static final Semaphore YT_RESOLVE_LIMITER = new Semaphore(YT_RESOLVE_SLOTS);
 
     /** tryAcquire a resolve slot (500ms), false on saturation/interrupt.
      *  FOREGROUND path (tap / playback): may use any of the slots. */
@@ -89,17 +99,25 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
     // sized to leave ≥1 of the YT_RESOLVE_LIMITER slots ALWAYS free for a foreground
     // tap. Without this, a burst of ~4 prefetch-resolves/tap filled both slots and the
     // tap-resolve waited ~850ms median in the queue (app-dev correlation 2026-06-07).
-    private static final Semaphore YT_BG_LIMITER =
-            new Semaphore(Math.max(1, (Math.max(2, Runtime.getRuntime().availableProcessors() / 2)) - 1));
+    private static final Semaphore YT_BG_LIMITER = new Semaphore(Math.max(1, YT_RESOLVE_SLOTS - 1));
 
     /** Background prefetch resolve slot: hold the bg permit (caps bg concurrency so a
      *  foreground slot stays reserved) AND a main slot. 503 on saturation = fine for
      *  best-effort prefetch. */
     private static boolean ytResolveAcquireBackground() {
         try {
-            if (!YT_BG_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS)) return false;
+            // ⚠️ Diese Ablehnungen waren bis 2026-07-25 UNSICHTBAR (nur der
+            // Vordergrundpfad loggte) — dadurch sah eine Messung so aus, als sei
+            // der Limiter kein Engpass, obwohl 3 von 4 Prefetches hier nach exakt
+            // 500ms rausflogen. Blinde Flecken in der Diagnose kosten mehr Zeit
+            // als die Zeilen, die sie vermeiden.
+            if (!YT_BG_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS)) {
+                System.out.println("[Limiter] Hintergrund-Slot belegt -> 503 (prefetch)");
+                return false;
+            }
             if (!YT_RESOLVE_LIMITER.tryAcquire(500, TimeUnit.MILLISECONDS)) {
                 YT_BG_LIMITER.release();
+                System.out.println("[Limiter] Haupt-Slot belegt -> 503 (prefetch)");
                 return false;
             }
             return true;
