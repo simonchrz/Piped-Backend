@@ -208,6 +208,35 @@ public final class SabrSession {
     private static final boolean POT_IN_URL = "1".equals(System.getenv("YT_SABR_POT_IN_URL"));
     private static final boolean TRACE = "1".equals(System.getenv("YT_SABR_TRACE"));
     private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
+    private final java.util.Set<Integer> dumpedTypes = new java.util.HashSet<>();
+
+    /// SABR_CONTEXT_UPDATE (UMP-Typ 57). Struktur aus dem Hexdump 2026-07-25:
+    ///   1=type(varint) · 2=scope(varint) · 3=value(bytes) · 4=send_by_default · 5=write_policy
+    /// Bei `send_by_default=1` MUSS der Client den Kontext in jeder Folgeanfrage
+    /// zurückspiegeln (streamerContext, repeated sabr_contexts) — sonst liefert
+    /// der Server gar keine Medien mehr (gemessen: konstant 105B nur mit 57+67).
+    private static final int SABR_CONTEXT_UPDATE = 57;
+    private final java.util.Map<Integer, byte[]> sabrContexts = new java.util.LinkedHashMap<>();
+
+    private void handleContextUpdate(byte[] payload) {
+        int ctype = -1; byte[] value = null; boolean sendByDefault = false;
+        try {
+            final ProtoReader r = new ProtoReader(payload);
+            while (r.hasMore()) {
+                final int f = r.readTag();
+                if (f == 1 && r.wireType() == 0) ctype = (int) r.readVarint();
+                else if (f == 3 && r.wireType() == 2) value = r.readBytes();
+                else if (f == 4 && r.wireType() == 0) sendByDefault = r.readVarint() != 0;
+                else r.skip();
+            }
+        } catch (Exception ignored) { return; }
+        if (ctype >= 0 && value != null && sendByDefault) {
+            final byte[] prev = sabrContexts.put(ctype, value);
+            if (prev == null)
+                System.out.println("[Sabr] SabrContext übernommen: type=" + ctype
+                        + " value=" + value.length + "B");
+        }
+    }
 
     /// STREAM_PROTECTION_STATUS (UMP-Typ 58): Feld 1 = Status der Session-
     /// Attestierung. Bekannte Werte: 1=OK, 2=ausstehend, 3=Attestierung noetig.
@@ -273,13 +302,26 @@ public final class SabrSession {
                         case UmpReader.NEXT_REQUEST_POLICY: cookie[0] = extractCookie(payload); break;
                         case UmpReader.SABR_REDIRECT: { String u = extractRedirect(payload); if (u != null) { abrUrl = u; redirected[0] = true; } break; }
                         case UmpReader.SABR_ERROR: sabrError[0] = true; break;
+                        case SABR_CONTEXT_UPDATE: handleContextUpdate(payload); break;
                         case UmpReader.STREAM_PROTECTION_STATUS:
                             protectionStatus[0] = readProtectionStatus(payload); break;
                         default:
                             // DIAGNOSE (YT_SABR_TRACE=1): unbekannte UMP-Typen mitschreiben.
                             // Der Web-Player wertet mehr aus als wir; was wir ignorieren,
                             // kann genau die Anweisung sein, die die Session am Leben haelt.
-                            if (TRACE) unknownParts.merge(type, 1, Integer::sum);
+                            if (TRACE) {
+                                unknownParts.merge(type, 1, Integer::sum);
+                                // Beim ERSTEN Auftreten die Rohbytes hexdumpen, damit die
+                                // Protobuf-Struktur ablesbar ist (Feldnummern/Wire-Types)
+                                // statt geraten werden muss.
+                                if (dumpedTypes.add(type)) {
+                                    final StringBuilder hx = new StringBuilder();
+                                    for (int i = 0; i < Math.min(payload.length, 160); i++)
+                                        hx.append(String.format("%02x", payload[i]));
+                                    System.out.println("[Sabr] UMP-Typ " + type + " len=" + payload.length
+                                            + " hex=" + hx);
+                                }
+                            }
                             break;
                     }
                 });
@@ -421,6 +463,14 @@ public final class SabrSession {
         final ProtoWriter sc = new ProtoWriter().bytesField(1, clientInfo);
         if (poToken != null) sc.bytesField(2, poToken);
         if (cookie != null) sc.bytesField(3, cookie);
+        // repeated sabr_contexts = 5, je { 1=type, 2=value } — zurückgespiegelt
+        // aus SABR_CONTEXT_UPDATE (s. handleContextUpdate).
+        for (var e : sabrContexts.entrySet()) {
+            sc.bytesField(5, new ProtoWriter()
+                    .varintField(1, e.getKey())
+                    .bytesField(2, e.getValue())
+                    .toByteArray());
+        }
         req.bytesField(19, sc.toByteArray());
         return req.toByteArray();
     }
