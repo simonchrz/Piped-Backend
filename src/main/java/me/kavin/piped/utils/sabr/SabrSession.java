@@ -110,6 +110,17 @@ public final class SabrSession {
     private final String userAgent;
     private final Fmt prefAudio;
     private final Fmt prefVideo;
+    /// Alle vom Player angebotenen Formate. Der echte Web-Player nennt im
+    /// Mitschnitt 2026-07-25 VIER Audio- und ZWOELF Video-Kandidaten (Felder
+    /// 16/17), nicht je einen. Bei uns war es je EINER — und der wurde bei
+    /// doppelt vorkommendem itag (140 zweimal mit verschiedenem lmt) auch noch
+    /// geraten. Passt das format_id (itag+lmt) nicht, faengt der Server nichts an.
+    private java.util.List<Fmt> allAudio = new java.util.ArrayList<>();
+    private java.util.List<Fmt> allVideo = new java.util.ArrayList<>();
+    public void setFormatCandidates(java.util.List<Fmt> a, java.util.List<Fmt> v) {
+        if (a != null) allAudio = a;
+        if (v != null) allVideo = v;
+    }
     private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
     /// Liefert einen FRISCHEN content-bound po_token. Wird aufgerufen, wenn der
     /// Server STREAM_PROTECTION_STATUS=3 („Attestierung erforderlich") meldet.
@@ -453,8 +464,12 @@ public final class SabrSession {
         for (FState s : states.values()) {
             if (!s.seen.isEmpty()) req.bytesField(3, bufferedRange(s));
         }
-        req.bytesField(16, formatId(prefAudio)); // preferred_audio_format_ids -> force exact codecs
-        req.bytesField(17, formatId(prefVideo)); // preferred_video_format_ids
+        // preferred_*_format_ids: bevorzugten Pick zuerst, danach alle weiteren
+        // Kandidaten — so macht es der echte Web-Player.
+        req.bytesField(16, formatId(prefAudio));
+        for (Fmt f : allAudio) if (f.itag != prefAudio.itag || f.lmt != prefAudio.lmt) req.bytesField(16, formatId(f));
+        req.bytesField(17, formatId(prefVideo));
+        for (Fmt f : allVideo) if (f.itag != prefVideo.itag || f.lmt != prefVideo.lmt) req.bytesField(17, formatId(f));
         req.varintField(4, playerTimeMs);
         req.bytesField(5, ustreamerConfig);
         // streamerContext: client_info(1), po_token(2), playback_cookie(3).

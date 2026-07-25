@@ -171,6 +171,16 @@ public final class SabrHandlers {
         }
         final SabrSession.Fmt pa = new SabrSession.Fmt(aud.path("itag").asInt(), aud.path("lastModified").asLong());
         final SabrSession.Fmt pv = new SabrSession.Fmt(vid.path("itag").asInt(), vid.path("lastModified").asLong());
+        // Alle angebotenen Formate als Kandidaten sammeln (s. SabrSession).
+        final java.util.List<SabrSession.Fmt> candA = new java.util.ArrayList<>();
+        final java.util.List<SabrSession.Fmt> candV = new java.util.ArrayList<>();
+        for (JsonNode f : sd.path("adaptiveFormats")) {
+            final String mime = f.path("mimeType").asText("");
+            final SabrSession.Fmt fm = new SabrSession.Fmt(
+                    f.path("itag").asInt(), f.path("lastModified").asLong());
+            if (mime.startsWith("audio")) candA.add(fm);
+            else if (mime.startsWith("video")) candV.add(fm);
+        }
         // maxIterations bumped 500 -> 8000: a full-length video needs one round per
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
@@ -182,10 +192,13 @@ public final class SabrHandlers {
         final String abrUrlN = me.kavin.piped.utils.NSigClient.rewriteNUnprocessed(abrUrl);
         if (!abrUrlN.equals(abrUrl))
             System.out.println("[Sabr] " + videoId + " abrUrl: n-Parameter entschluesselt");
+        final SabrSession sessionTmp = null;
         final SabrSession session = new SabrSession(abrUrlN, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
         // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN
         // content-bound po_token minten und die Session damit fortsetzen
         // (s. SabrSession — das war die vermeintliche Kids-Readahead-Sperre).
+        session.setFormatCandidates(candA, candV);
+
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
         // Attestierungs-Token. Nur einen Token nachzureichen genuegt nicht.
