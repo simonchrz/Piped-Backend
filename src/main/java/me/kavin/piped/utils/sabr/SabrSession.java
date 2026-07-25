@@ -109,7 +109,12 @@ public final class SabrSession {
     private final String userAgent;
     private final Fmt prefAudio;
     private final Fmt prefVideo;
-    private final byte[] poToken;   // decoded gvs po_token bytes, or null
+    private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
+    /// Liefert einen FRISCHEN content-bound po_token. Wird aufgerufen, wenn der
+    /// Server STREAM_PROTECTION_STATUS=3 („Attestierung erforderlich") meldet.
+    public interface TokenRefresher { byte[] fresh(); }
+    private TokenRefresher tokenRefresher;
+    public void setTokenRefresher(TokenRefresher r) { this.tokenRefresher = r; }
     private final String egressFamily; // "v4"/"v6" — gvs URLs are IP-signed, so the
                                        // session MUST egress on the same family the
                                        // player resolve used. null = global ACTIVE.
@@ -150,12 +155,46 @@ public final class SabrSession {
     /// sleeps between rounds — the window slides like a real client and the
     /// download runs at ~1x. publishHook (optional) runs once per round after the
     /// disk flush so the caller can republish the growing file for live serving.
+    /// Re-Attest-Versuch: DEFAULT AUS (`YT_SABR_REATTEST=1` schaltet ihn an).
+    /// Der Mechanismus ist belegt (prot 2->3 ist das Stopp-Signal), aber ein
+    /// frisch gemünzter content-bound po_token wird NICHT akzeptiert: der Server
+    /// bleibt bei prot=3 und sendet nichts (40 Erneuerungen, 0 neue Segmente,
+    /// verifiziert 2026-07-25). Vermutete Ursache: die Bindung passt nicht — der
+    /// Streaming-Token muss vermutlich an die SESSION (visitorData/ustreamer-
+    /// Config des Player-Calls) gebunden sein, nicht nur an die videoId; oder
+    /// prot=3 verlangt einen komplett neuen Player-Call statt nur eines Tokens.
+    /// Bis das geklärt ist: aus, sonst kostet es pro Session ~40 Mints + ~40
+    /// Roundtrips für nichts.
+    private static final int MAX_REATTESTS =
+            "1".equals(System.getenv("YT_SABR_REATTEST")) ? 40 : 0;
+    private static final boolean TRACE = "1".equals(System.getenv("YT_SABR_TRACE"));
+    private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
+
+    /// STREAM_PROTECTION_STATUS (UMP-Typ 58): Feld 1 = Status der Session-
+    /// Attestierung. Bekannte Werte: 1=OK, 2=ausstehend, 3=Attestierung noetig.
+    /// ⚠️ Wir haben diesen Typ bisher DEKLARIERT, aber nie ausgewertet — er lief
+    /// in den default-Zweig. Wenn der Server hier „Attestierung noetig" meldet und
+    /// wir stur weiter dasselbe Paket schicken, hoert er auf, Medien zu senden:
+    /// exakt unser Bild „resp=808B new=0" bis zum stuck-Abbruch.
+    private static int readProtectionStatus(byte[] payload) {
+        try {
+            final ProtoReader r = new ProtoReader(payload);
+            while (r.hasMore()) {
+                final int f = r.readTag();
+                if (f == 1 && r.wireType() == 0) return (int) r.readVarint();
+                r.skip();
+            }
+        } catch (Exception ignored) { }
+        return -1;
+    }
+
     public Result fetchAll(int maxIterations, Sink sink, boolean paced, Runnable publishHook) throws Exception {
         this.sink = sink;
         final Map<Integer, FState> states = new LinkedHashMap<>();
         byte[] playbackCookie = null;
         long playerTimeMs = 0;
         int stuckRounds = 0;
+        int reattests = 0;
         final int stuckLimit = paced ? 24 : 3;   // paced: ~2 min quiet before giving up
         final long wallStart = System.currentTimeMillis();
         final Result res = new Result();
@@ -174,6 +213,7 @@ public final class SabrSession {
                 final byte[][] cookie = {playbackCookie};
                 final boolean[] sabrError = {false};
                 final boolean[] redirected = {false};
+                final int[] protectionStatus = {-1};
 
                 UmpReader.parse(resp, (type, payload) -> {
                     switch (type) {
@@ -184,7 +224,14 @@ public final class SabrSession {
                         case UmpReader.NEXT_REQUEST_POLICY: cookie[0] = extractCookie(payload); break;
                         case UmpReader.SABR_REDIRECT: { String u = extractRedirect(payload); if (u != null) { abrUrl = u; redirected[0] = true; } break; }
                         case UmpReader.SABR_ERROR: sabrError[0] = true; break;
-                        default: break;
+                        case UmpReader.STREAM_PROTECTION_STATUS:
+                            protectionStatus[0] = readProtectionStatus(payload); break;
+                        default:
+                            // DIAGNOSE (YT_SABR_TRACE=1): unbekannte UMP-Typen mitschreiben.
+                            // Der Web-Player wertet mehr aus als wir; was wir ignorieren,
+                            // kann genau die Anweisung sein, die die Session am Leben haelt.
+                            if (TRACE) unknownParts.merge(type, 1, Integer::sum);
+                            break;
                     }
                 });
                 // sweep any segment whose MEDIA_END we didn't see, then flush this
@@ -202,10 +249,35 @@ public final class SabrSession {
                           .append('/').append(s.totalSegments).append(",disk").append(s.bytesWritten >> 20).append("MB");
                     System.out.println("[Sabr] iter=" + res.iterations + " resp=" + resp.length + "B new=" + newSegments[0]
                             + " ptMs=" + playerTimeMs + (sabrError[0] ? " SABR_ERROR" : "")
+                            + (protectionStatus[0] >= 0 ? " prot=" + protectionStatus[0] : "")
+                            + (TRACE && !unknownParts.isEmpty() ? " unhandled=" + unknownParts : "")
                             + (redirected[0] ? " REDIRECT" : "") + sb);
                 }
 
                 playbackCookie = cookie[0];
+
+                // ── Re-Attest (2026-07-25) ─────────────────────────────────────
+                // DER eigentliche Grund für die vermeintliche „Made-for-Kids-
+                // Readahead-Sperre": der Server meldet per STREAM_PROTECTION_STATUS
+                // 2 (ausstehend) -> 3 (Attestierung ERFORDERLICH) und stellt das
+                // Senden ein. Belegt im Trace: prot=2 solange Medien fliessen, ab
+                // der ersten prot=3-Runde nur noch resp≈1KB mit new=0. Wir haben
+                // das Feld bisher ignoriert und stur weitergefragt — daher sah es
+                // nach einem 60s-Fenster-Cap aus. Ein echter Client mintet dann
+                // einen frischen po_token und macht in DERSELBEN Session weiter.
+                if (protectionStatus[0] == 3 && tokenRefresher != null
+                        && reattests < MAX_REATTESTS) {
+                    final byte[] fresh = tokenRefresher.fresh();
+                    if (fresh != null && fresh.length > 0) {
+                        poToken = fresh;
+                        reattests++;
+                        System.out.println("[Sabr] Attestierung erneuert (#" + reattests
+                                + ", " + fresh.length + "B) nach prot=3");
+                        continue;   // Runde nicht als „stuck" werten
+                    }
+                    System.out.println("[Sabr] prot=3, aber Token-Mint fehlgeschlagen");
+                }
+
                 if (sabrError[0]) { stopReason = "SABR_ERROR"; break; }
                 if (states.values().stream().allMatch(FState::complete)) { stopReason = "complete"; break; }
                 if (newSegments[0] == 0) {

@@ -162,6 +162,18 @@ public final class SabrHandlers {
         // buffer window (~5-10s), so ~55min = several hundred rounds. The loop still
         // breaks early on complete()/stuck; 8000 is just a runaway ceiling.
         final SabrSession session = new SabrSession(abrUrl, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
+        // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN
+        // content-bound po_token minten und die Session damit fortsetzen
+        // (s. SabrSession — das war die vermeintliche Kids-Readahead-Sperre).
+        if (bg != null) session.setTokenRefresher(() -> {
+            try {
+                final String cb = bg.sabrContentBoundPoToken(videoId);
+                return cb != null ? b64(cb) : null;
+            } catch (Exception e) {
+                System.out.println("[Sabr] " + videoId + " Re-Attest-Mint fehlgeschlagen: " + e.getMessage());
+                return null;
+            }
+        });
         final SabrSession.Result res = session.fetchAll(8000, sink, paced, publishHook);
         long segs = 0;
         for (var info : res.perFormat.values()) {
