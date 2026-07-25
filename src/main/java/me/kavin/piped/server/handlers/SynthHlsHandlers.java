@@ -245,8 +245,28 @@ public class SynthHlsHandlers {
         // s. SidxParserJava.fromFile).
         final SidxParserJava.Data sidx = SidxParserJava.fromFile(file, sidxStart, sidxEnd);
         if (sidx == null || sidx.entries.isEmpty()) return null;
+        final long fileLen = java.nio.file.Files.size(file);
+        final String pl = buildSabrVariantPlaylist(sidx, sidxStart, sidxEnd, fileLen, segUrl,
+                me.kavin.piped.utils.sabr.SabrCache.isPartialTerminal(videoId), videoId, itag);
+        return pl == null ? null : pl.getBytes(StandardCharsets.UTF_8);
+    }
 
-        StringBuilder sb = new StringBuilder();
+    /// REINE Playlist-Erzeugung (kein IO) — dadurch unit-testbar. Verträge, die
+    /// hier hart gelten (jeder Bruch war 2026-07-24/25 ein echter Ausfall):
+    ///  · Rückgabe `null` = noch nichts Spielbares. NIEMALS ein „#ERROR"-Text als
+    ///    Playlist-Body: AVPlayer wertet das als kaputte Playlist → -12646.
+    ///  · NIEMALS `#EXT-X-ENDLIST` mit 0 Segmenten (gültiges, aber LEERES VOD →
+    ///    ebenfalls -12646).
+    ///  · Nur Segmente ausweisen, deren Bytes VOLLSTÄNDIG auf Platte liegen —
+    ///    sonst antwortet /sabr mit 416 und der Player verwirft das Video.
+    ///  · ENDLIST genau dann, wenn alle sidx-Einträge da sind ODER der Teil-Cache
+    ///    terminal ist (Kids-Cap); sonst EVENT-artig ohne ENDLIST, damit der
+    ///    Player weiterpollt, während der Cache wächst.
+    static String buildSabrVariantPlaylist(SidxParserJava.Data sidx, int sidxStart, int sidxEnd,
+                                           long fileLen, String segUrl, boolean partialTerminal,
+                                           String videoId, int itag) {
+        if (sidx == null || sidx.entries.isEmpty()) return null;
+        final StringBuilder sb = new StringBuilder();
         sb.append("#EXTM3U\n#EXT-X-VERSION:7\n");
         int maxSegDur = 0;
         for (SidxParserJava.Entry e : sidx.entries) {
@@ -257,13 +277,6 @@ public class SynthHlsHandlers {
         sb.append("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-INDEPENDENT-SEGMENTS\n");
         // init segment = everything before the sidx box (ftyp + moov) = [0, sidxStart-1]
         sb.append(String.format("#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%d@%d\"\n", segUrl, sidxStart, 0));
-        // HONEST playlist (2026-07-23): the sidx indexes the WHOLE video, but a
-        // storm-truncated SABR download leaves the cache file short — advertising
-        // segments beyond the file made /sabr answer 416 and AVPlayer refuse the
-        // video outright. Emit only segments whose bytes are fully on disk; while
-        // truncated, serve EVENT-style (no ENDLIST -> the player polls and the
-        // playlist grows as the refill fills the cache).
-        final long fileLen = java.nio.file.Files.size(file);
         long cursor = sidxEnd + 1L + sidx.firstOffset;
         int emitted = 0;
         for (SidxParserJava.Entry e : sidx.entries) {
@@ -274,13 +287,10 @@ public class SynthHlsHandlers {
             cursor += e.byteSize;
             emitted++;
         }
-        // 0 Segmente = keine spielbare Playlist. Die ENDLIST-Variante unten würde
-        // daraus ein gültiges, aber LEERES VOD machen → AVPlayer -12646. Also
-        // null → der Aufrufer wartet auf die laufende Session.
         if (emitted == 0) return null;
         if (emitted >= sidx.entries.size()) {
             sb.append("#EXT-X-ENDLIST");
-        } else if (me.kavin.piped.utils.sabr.SabrCache.isPartialTerminal(videoId)) {
+        } else if (partialTerminal) {
             // Kids-Readahead-Cap (ab Verdict) bzw. Paced-Refill erschöpft — die
             // Teil-Playlist EHRLICH als VOD BEENDEN: der Player spielt die
             // vorhandenen Segmente sauber durch, statt an einer (fast sicher)
@@ -290,14 +300,14 @@ public class SynthHlsHandlers {
             System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated + cap/exhausted: "
                     + emitted + "/" + sidx.entries.size() + " -> partial ENDLIST");
             sb.append("#EXT-X-ENDLIST");
-            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+            if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         } else {
             System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated: "
                     + emitted + "/" + sidx.entries.size() + " segments on disk ("
                     + fileLen + "B) -> EVENT playlist + refill");
-            me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+            if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         }
-        return sb.toString().getBytes(StandardCharsets.UTF_8);
+        return sb.toString();
     }
 
     /// Scans the SABR fmp4's top-level boxes for the sidx box; returns {offset, size}.
