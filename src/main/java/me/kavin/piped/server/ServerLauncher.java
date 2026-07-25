@@ -231,6 +231,13 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                 })).map(GET, "/synth-hls/:videoId/:filename", AsyncServlet.ofBlocking(executor, request -> {
                     if (!ytResolveAcquire())
                         return io.activej.http.HttpResponse.ofCode(503);
+                    // Der Playlist-Bau darf den Slot FRUEH zurueckgeben, sobald er nur
+                    // noch auf lokale SABR-Daten wartet (s. SynthHlsHandlers.SLOT_RELEASE).
+                    final java.util.concurrent.atomic.AtomicBoolean slotHeld =
+                            new java.util.concurrent.atomic.AtomicBoolean(true);
+                    SynthHlsHandlers.SLOT_RELEASE.set(() -> {
+                        if (slotHeld.compareAndSet(true, false)) YT_RESOLVE_LIMITER.release();
+                    });
                     try {
                         String videoId = request.getPathParameter("videoId");
                         String filename = request.getPathParameter("filename");
@@ -253,7 +260,8 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     } catch (Exception e) {
                         return getErrorResponse(e, request.getPath());
                     } finally {
-                        YT_RESOLVE_LIMITER.release();
+                        SynthHlsHandlers.SLOT_RELEASE.remove();
+                        if (slotHeld.compareAndSet(true, false)) YT_RESOLVE_LIMITER.release();
                     }
                 })).map(GET, "/yt-proxy/*",
                         request -> YtProxyHandlers.handleAsync(request, executor)

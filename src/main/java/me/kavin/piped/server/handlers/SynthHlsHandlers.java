@@ -190,7 +190,22 @@ public class SynthHlsHandlers {
     /// sonst hungern parallele Taps/Segmentabrufe aus (503 → -16849).
     private static final int SABR_PLAYLIST_WAIT_MS = 3_000;
 
+    /// Vom Route-Layer gesetzt: gibt den YT-Resolve-Slot FRÜH frei, sobald der
+    /// Request nur noch auf LOKALE SABR-Daten wartet.
+    /// ⚠️ Load-bearing (2026-07-25, im Log nachgewiesen): `ensureFile` blockiert
+    /// auf dem Per-Video-Lock, solange die SABR-Session laeuft — und tat das mit
+    /// gehaltenem Slot. AVPlayer holt Video- UND Audio-Playlist parallel, also
+    /// waren beide der nur zwei Slots weg, und der naechste Request (Segment oder
+    /// zweiter Tap) bekam 503 → app-seitig „Video startet nicht".
+    /// Belegte Sequenz: 06:45:39 Session start · 06:45:42 Playlist-Request ·
+    /// 06:45:43 „[Limiter] YT-Resolve-Slot belegt -> 503".
+    /// Warten auf einen lokalen Download ist KEIN YT-Resolve — der Slot gehoert
+    /// hier nicht mehr uns.
+    public static final ThreadLocal<Runnable> SLOT_RELEASE = new ThreadLocal<>();
+
     private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
+        final Runnable releaseSlot = SLOT_RELEASE.get();
+        if (releaseSlot != null) releaseSlot.run();
         final long deadline = System.currentTimeMillis() + SABR_PLAYLIST_WAIT_MS;
         for (;;) {
             final byte[] pl = trySabrStreamPlaylist(videoId, itag);
