@@ -56,8 +56,11 @@ public class StreamHandlers {
     // NOTE: keyed by videoId, not channel — channelId is only known AFTER a resolve,
     // and /streams carries only the videoId, so this helps re-resolves/re-prefetches
     // of the SAME video, not first-resolves of new videos from a known-OER channel.
-    private static final java.util.Set<String> KNOWN_AUDIO_ZERO =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // ⚠️ Frueher zwei In-Memory-Sets/Maps hier. Beide liegen jetzt in
+    // ResolveMemo (persistent im sabr-cache-Volume): der stuendliche
+    // Cookie-Refresh startet den Container neu, sobald ein Auth-Cookie rotiert —
+    // danach war alles Gelernte weg und jedes Kids-Video zahlte wieder die volle
+    // Kaskade (4-5s statt ~1,5s).
 
     // ── Hebel A: Throttle-Signatur pro Video merken (2026-07-24) ────────────
     // Gemessen: ein sauberer Resolve haelt einen der NUR ZWEI YT_RESOLVE_LIMITER-
@@ -71,16 +74,9 @@ public class StreamHandlers {
     // schicken (der Client, der in diesen Fenstern haelt). TTL, weil die
     // Drosselung transient ist (kommt/geht ueber Minuten) und ANDROID_VR der
     // schnellere Happy-Path bleibt, sobald das Fenster durch ist.
-    private static final java.util.concurrent.ConcurrentHashMap<String, Long> KNOWN_THROTTLED =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private static final long THROTTLE_MEMO_TTL_MS = 10 * 60_000L;
-
     private static boolean isThrottleMemoized(String videoId) {
         if ("0".equals(System.getenv("YT_THROTTLE_MEMO"))) return false;
-        final Long exp = KNOWN_THROTTLED.get(videoId);
-        if (exp == null) return false;
-        if (exp < System.currentTimeMillis()) { KNOWN_THROTTLED.remove(videoId); return false; }
-        return true;
+        return me.kavin.piped.utils.ResolveMemo.isThrottled(videoId);
     }
 
     // ── Hebel B: Egress-Flip-Back-off (2026-07-24) ─────────────────────────
@@ -163,7 +159,7 @@ public class StreamHandlers {
                 // C: known-audio=0 (OER) videoId from a prior resolve → skip the ANDROID
                 // detection attempt and resolve directly via WebEmbed (~1s saved). If it
                 // doesn't come back healthy, the marker is stale → drop it + fall through.
-                if (KNOWN_AUDIO_ZERO.contains(videoId)) {
+                if (me.kavin.piped.utils.ResolveMemo.isAudioZero(videoId)) {
                     // audio0 fallback: WEB_EMBEDDED is the ONLY client that serves
                     // audio for these videos (iOS/WEB/TVHTML5 return audio=0/"only
                     // images"; verified 2026-06-09). The June-09 segment-403s were a
@@ -179,10 +175,10 @@ public class StreamHandlers {
                             System.out.println("[StreamHandlers] " + videoId
                                     + " known-audio0 -> direct WebEmbed HIT (skipped ANDROID)");
                         } else {
-                            KNOWN_AUDIO_ZERO.remove(videoId);
+                            me.kavin.piped.utils.ResolveMemo.clearAudioZero(videoId);
                         }
                     } catch (Exception e) {
-                        KNOWN_AUDIO_ZERO.remove(videoId);
+                        me.kavin.piped.utils.ResolveMemo.clearAudioZero(videoId);
                     } finally {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
@@ -206,10 +202,10 @@ public class StreamHandlers {
                             System.out.println("[StreamHandlers] " + videoId
                                     + " known-throttled -> direct WebEmbed HIT (skipped ANDROID_VR+probe+flip)");
                         } else {
-                            KNOWN_THROTTLED.remove(videoId);
+                            me.kavin.piped.utils.ResolveMemo.clearThrottled(videoId);
                         }
                     } catch (Exception e) {
-                        KNOWN_THROTTLED.remove(videoId);
+                        me.kavin.piped.utils.ResolveMemo.clearThrottled(videoId);
                     } finally {
                         YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.remove();
                     }
@@ -386,9 +382,9 @@ public class StreamHandlers {
                 // trotzdem noch, ob DIESE URLs leben.
                 boolean throttleSuspect = !throttleFastPath
                         && info != null && (degraded || isVideoStreamThrottled(info));
-                // Signatur merken (nicht bei degraded — dafuer gibt es KNOWN_AUDIO_ZERO).
+                // Signatur merken (nicht bei degraded — dafuer gibt es das audioZero-Memo).
                 if (throttleSuspect && !degraded) {
-                    KNOWN_THROTTLED.put(videoId, System.currentTimeMillis() + THROTTLE_MEMO_TTL_MS);
+                    me.kavin.piped.utils.ResolveMemo.markThrottled(videoId);
                 }
 
                 // EGRESS-FLIP FIRST (made-for-kids / content-specific throttle):
@@ -461,7 +457,7 @@ public class StreamHandlers {
                                 && (!retryInfo.getVideoStreams().isEmpty()
                                     || !retryInfo.getVideoOnlyStreams().isEmpty())) {
                             info = retryInfo;
-                            if (degraded) KNOWN_AUDIO_ZERO.add(videoId); // remember for next re-resolve
+                            if (degraded) me.kavin.piped.utils.ResolveMemo.markAudioZero(videoId); // remember for next re-resolve
                             System.out.println("[StreamHandlers] " + videoId + " WebEmbed-retry success (audio="
                                 + info.getAudioStreams().size() + " video="
                                 + info.getVideoStreams().size() + " videoOnly="
@@ -635,7 +631,8 @@ public class StreamHandlers {
                 // naechster Resolve nimmt wieder den schnelleren ANDROID_VR-Happy-Path.
                 // (Nach dem Fast-Path selbst NICHT loeschen — dort wurde VR nie geprueft.)
                 if (!throttleFastPath && !throttleSuspect && !degraded
-                        && KNOWN_THROTTLED.remove(videoId) != null) {
+                        && me.kavin.piped.utils.ResolveMemo.isThrottled(videoId)) {
+                    me.kavin.piped.utils.ResolveMemo.clearThrottled(videoId);
                     System.out.println("[StreamHandlers] " + videoId
                             + " throttle-memo cleared (URLs wieder sauber)");
                 }
