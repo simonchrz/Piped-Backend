@@ -86,14 +86,42 @@ public final class ResolveMemo {
         ensureLoaded();
         final ChannelStat st = CHANNELS.get(channelId);
         if (st == null) return false;
-        if (System.currentTimeMillis() - st.updated > CHANNEL_TTL_MS) return false;
-        if (st.slow < CHANNEL_MIN_SLOW || st.slow <= st.fast * 2) return false;
-        if (CHANNEL_CALLS.incrementAndGet() % CHANNEL_PROBE_EVERY == 0) {
+        final int callNo = CHANNEL_CALLS.incrementAndGet();
+        final boolean slow = shouldPreferSlowPath(
+                st.slow, st.fast, st.updated, System.currentTimeMillis(), callNo);
+        if (!slow && isSelfCheck(st.slow, st.fast, st.updated, System.currentTimeMillis(), callNo))
             System.out.println("[ResolveMemo] Kanal " + channelId
                     + ": Selbstpruefung — schneller Weg wird trotz Urteil probiert");
-            return false;
-        }
-        return true;
+        return slow;
+    }
+
+    /// REINE Entscheidungsregel (kein IO, keine Zeitquelle) — dadurch
+    /// unit-testbar. Verträge, die hier gelten:
+    ///  · unter `CHANNEL_MIN_SLOW` langsamen Resolves: KEIN Urteil (zu wenig Evidenz)
+    ///  · nur bei klarer Dominanz (`slow > 2*fast`) — ein einzelner Ausreißer
+    ///    darf einen gesunden Kanal nicht auf den langsamen Weg zwingen
+    ///  · älter als `CHANNEL_TTL_MS`: verfallen (Drosselung ist transient)
+    ///  · jeder `CHANNEL_PROBE_EVERY`-te Aufruf sagt bewusst NEIN, damit sich das
+    ///    Urteil selbst widerlegen kann — sonst hielte es uns für immer fest
+    static boolean shouldPreferSlowPath(long slow, long fast, long updatedAt, long now, int callNo) {
+        if (now - updatedAt > CHANNEL_TTL_MS) return false;
+        if (slow < CHANNEL_MIN_SLOW) return false;
+        if (slow <= fast * 2) return false;
+        return callNo % CHANNEL_PROBE_EVERY != 0;
+    }
+
+    /// Wurde NUR wegen der Selbstprüfung „nein" gesagt (Urteil läge sonst vor)?
+    static boolean isSelfCheck(long slow, long fast, long updatedAt, long now, int callNo) {
+        return now - updatedAt <= CHANNEL_TTL_MS && slow >= CHANNEL_MIN_SLOW
+                && slow > fast * 2 && callNo % CHANNEL_PROBE_EVERY == 0;
+    }
+
+    /// REINE Buchung eines Ergebnisses auf eine Kanal-Statistik (kein IO).
+    /// Deckelt die Historie, damit altes Verhalten neues nicht ewig überstimmt.
+    static void applyOutcome(ChannelStat st, boolean slowPathNeeded, long now) {
+        if (slowPathNeeded) st.slow++; else st.fast++;
+        if (st.slow + st.fast > 40) { st.slow /= 2; st.fast /= 2; }
+        st.updated = now;
     }
 
     /// Ergebnis eines Resolves auf den Kanal buchen.
@@ -102,11 +130,7 @@ public final class ResolveMemo {
         ensureLoaded();
         final ChannelStat st = CHANNELS.computeIfAbsent(channelId, k -> new ChannelStat());
         synchronized (st) {
-            if (slowPathNeeded) st.slow++; else st.fast++;
-            // Beide Zähler beschränken, damit alte Historie ein neues Verhalten
-            // nicht ewig überstimmt.
-            if (st.slow + st.fast > 40) { st.slow /= 2; st.fast /= 2; }
-            st.updated = System.currentTimeMillis();
+            applyOutcome(st, slowPathNeeded, System.currentTimeMillis());
         }
         saveThrottled();
     }
