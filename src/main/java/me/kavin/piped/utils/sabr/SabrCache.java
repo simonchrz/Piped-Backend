@@ -300,6 +300,23 @@ public final class SabrCache {
         // abends), in denen der WEB-Pfad auf BEIDEN Familien hart 403te, waehrend
         // ANDROID noch seine ~13 MB holte. Ein Teil-Cache ist besser als keiner,
         // also die alte Stufe nachziehen, wenn WEB gar nichts gebracht hat.
+        // Stufe 1b: WEB mit CONTENT-BOUND Token. Fuer Made-for-Kids ist das die
+        // Stufe, die tatsaechlich liefert: mit visitor-bound Token bleibt die
+        // WEB-Session bei ~20 Segmenten stehen, mit content-bound holt sie das
+        // Video KOMPLETT (2026-07-30: 735/735, 662 MB, 195 Runden). Die
+        // content-bound-Stufe weiter unten lief bisher nur im `stuck`-Fall —
+        // bei 403/0 Segmenten sprangen wir direkt auf ANDROID und liessen die
+        // wirksamste Stufe aus.
+        if (!skipWeb && DEFAULT_CLIENT != 0 && (result == null || result.segments() == 0)) {
+            System.out.println("[SabrCache] " + videoId
+                    + " WEB visitor-bound brachte nichts -> WEB content-bound");
+            final SabrHandlers.SabrMedia rc = attempt(videoId, fam1, true, DEFAULT_CLIENT);
+            if (rc != null && (result == null || rc.segments() > result.segments())) {
+                result = rc;
+                System.out.println("[SabrCache] " + videoId + " WEB content-bound gewann (segs="
+                        + rc.segments() + " complete=" + rc.complete() + ")");
+            }
+        }
         if (!skipWeb && DEFAULT_CLIENT != 0 && (result == null || result.segments() == 0)) {
             // Beide Familien ohne ein einziges Segment = Fenster zu, nicht
             // video-spezifisch -> Memo setzen, damit die naechsten Taps direkt
@@ -518,21 +535,39 @@ public final class SabrCache {
         });
     }
 
+    /// Obergrenze fuer EINE Antwort. Der Handler ist blockierend
+    /// (`AsyncServlet.ofBlocking`) und baut den Body als byte[] — ohne Deckel
+    /// zieht ein einziger Abruf die ganze Datei in den Heap. Das war folgenlos,
+    /// solange SABR nur 13–20 MB Teilcaches erzeugte; seit der WEB-Pfad
+    /// KOMPLETTE Videos holt (gemessen: 662 MB), killt genau ein solcher Abruf
+    /// den 2-GiB-Container (OutOfMemoryError + 713-MB-Heapdump, 2026-07-30).
+    /// 16 MB liegen weit ueber jedem echten Segment-Range (~1–9 MB laut den
+    /// FORMAT_INIT-Daten), der Auslieferungspfad merkt den Deckel also nicht.
+    private static final long MAX_RESPONSE_BYTES = 16L * 1024 * 1024;
+
     private static HttpResponse serveFile(Path file, int itag, String range, boolean head) throws IOException {
         final long total = Files.size(file);
         final String ct = itag == 140 ? "audio/mp4" : "video/mp4";
         final boolean noRange = range == null || range.isEmpty();
-        if (noRange) {
+        if (noRange && (head || total <= MAX_RESPONSE_BYTES)) {
             final HttpResponse r = HttpResponse.ofCode(200)
                     .withHeader(HttpHeaders.CONTENT_TYPE, HttpHeaderValue.of(ct))
                     .withHeader(HttpHeaders.CONTENT_LENGTH, HttpHeaderValue.of(String.valueOf(total)))
                     .withHeader(HttpHeaders.ACCEPT_RANGES, HttpHeaderValue.of("bytes"));
             return head ? r : r.withBody(Files.readAllBytes(file));
         }
-        final long[] se = parseRange(range, total);
+        // Range-los auf einer grossen Datei: als 206 mit dem ersten Fenster
+        // beantworten statt den Heap zu sprengen. Die Auslieferung laeuft
+        // ohnehin ueber EXT-X-BYTERANGE, also immer mit Range; range-los
+        // kommen praktisch nur Werkzeuge (curl) — die sehen jetzt eine
+        // Teilantwort statt eines toten Backends.
+        final long[] se = noRange ? new long[]{0, total - 1} : parseRange(range, total);
         if (se == null) return HttpResponse.ofCode(416);
         final long start = se[0];
-        final long end = se[1];
+        // Mehr als MAX_RESPONSE_BYTES am Stueck wird gekuerzt — der Client holt
+        // den Rest per Folge-Range (zulaessig: der Server darf weniger liefern
+        // als angefragt, solange Content-Range das ausweist).
+        final long end = Math.min(se[1], start + MAX_RESPONSE_BYTES - 1);
         final HttpResponse r = HttpResponse.ofCode(206)
                 .withHeader(HttpHeaders.CONTENT_TYPE, HttpHeaderValue.of(ct))
                 .withHeader(HttpHeaders.CONTENT_RANGE, HttpHeaderValue.of("bytes " + start + "-" + end + "/" + total))
