@@ -210,6 +210,22 @@ public final class SabrHandlers {
         final String abrUrlN = me.kavin.piped.utils.NSigClient.rewriteNUnprocessed(abrUrl);
         if (!abrUrlN.equals(abrUrl))
             System.out.println("[Sabr] " + videoId + " abrUrl: n-Parameter entschluesselt");
+        // ⚠️ Die Referenz-Implementierung (LuanRT/googlevideo) ruft auf die
+        // serverAbrStreamingUrl `player.decipher()` — also die VOLLE Signatur-
+        // Behandlung (s->sig UND n), nicht nur nsig. Fehlt die Signatur, nimmt
+        // googlevideo den POST an und schickt trotzdem nichts (genau unser
+        // WEB-Bild: 105B -> 11B, kein FORMAT_INIT, kein Fehler). Deshalb hier
+        // die Parameternamen zeigen — `s=` vorhanden oder `sig=` fehlend ist
+        // der Beleg.
+        if ("1".equals(System.getenv("YT_SABR_TRACE"))) {
+            final int q = abrUrlN.indexOf('?');
+            final StringBuilder names = new StringBuilder();
+            if (q >= 0) for (String kv : abrUrlN.substring(q + 1).split("&")) {
+                final int eq = kv.indexOf('=');
+                names.append(' ').append(eq > 0 ? kv.substring(0, eq) : kv);
+            }
+            System.out.println("[Sabr] " + videoId + " abrUrl-Params:" + names);
+        }
         final SabrSession sessionTmp = null;
         final SabrSession session = new SabrSession(abrUrlN, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
         // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN

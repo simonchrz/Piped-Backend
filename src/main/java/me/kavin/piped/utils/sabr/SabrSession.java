@@ -452,6 +452,21 @@ public final class SabrSession {
     /// Wann die Session begann — fuer elapsed_wall_time_ms (Feld 36).
     private final long sessionStartMs = System.currentTimeMillis();
 
+    /// Wiedergabe-Nonce dieser Session (s. post()). Pro Session EINMAL erzeugt.
+    /// Bewusst lokal statt aus SynthHlsHandlers importiert — die sabr-Schicht
+    /// soll nicht auf die Handler-Schicht zeigen. Alphabet identisch (16
+    /// URL-sichere Zeichen, wie der Browser sie erzeugt).
+    private static final char[] CPN_CHARS =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
+    private static String freshCpn() {
+        final char[] c = new char[16];
+        final java.util.concurrent.ThreadLocalRandom r =
+                java.util.concurrent.ThreadLocalRandom.current();
+        for (int i = 0; i < 16; i++) c[i] = CPN_CHARS[r.nextInt(CPN_CHARS.length)];
+        return new String(c);
+    }
+    private final String cpn = freshCpn();
+
     /// `client_abr_state` (Feld 1 der ABR-Anfrage).
     ///
     /// Feldnamen aus der Referenz-Implementierung LuanRT/googlevideo
@@ -694,7 +709,17 @@ public final class SabrSession {
         // nur im streamerContext.
         // `rn` (Request-Nummer, pro Anfrage hochgezaehlt) und `alr=yes` schickt der
         // echte Web-Player mit — im Mitschnitt 2026-07-25 belegt.
+        // `cpn` (client playback nonce, 16 URL-sichere Zeichen) identifiziert die
+        // WIEDERGABE. Der Browser schickt ihn an jeder Medien-Anfrage mit, unser
+        // Direktpfad auch (SynthHlsHandlers.swapCpn) — nur der ABR-POST bisher
+        // nicht. Im Mitschnitt 2026-07-25 steht er in der Browser-Parameterliste
+        // (`alr,c,cpn,cps,cver,…`). Ohne ihn nimmt googlevideo den POST an und
+        // schickt trotzdem nichts (unser WEB-Bild: 105B -> 11B, kein
+        // FORMAT_INIT, kein Fehler). EINMAL pro Session erzeugt und konstant
+        // gehalten: ein wechselnder cpn waere eine neue Wiedergabe pro Runde,
+        // und ein wiederverwendeter cpn hat 2026-05-29 die Drossel ausgeloest.
         String url = abrUrl + "&rn=" + (++requestNo) + (abrUrl.contains("&alr=") ? "" : "&alr=yes");
+        if (!url.contains("&cpn=") && !url.contains("?cpn=")) url = url + "&cpn=" + cpn;
         if (POT_IN_URL && poToken != null && !url.contains("&pot=")) {
             url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
                     .encodeToString(poToken);
