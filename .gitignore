@@ -31,3 +31,4 @@ hs_err_pid*
 VERSION
 libs/*.jar.bak-*
 !libs/reqwest4j-egress.jar
+piped-prebuilt.jar

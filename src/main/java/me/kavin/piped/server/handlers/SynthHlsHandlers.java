@@ -22,10 +22,27 @@ import java.util.List;
 public class SynthHlsHandlers {
 
     public static byte[] masterPlaylist(String videoId) throws Exception {
-        return masterPlaylist(videoId, 1080, DEFAULT_VIDEO_CODECS);
+        return masterPlaylist(videoId, 1080, DEFAULT_VIDEO_CODECS, false);
     }
 
     public static byte[] masterPlaylist(String videoId, int maxH, String[] codecs) throws Exception {
+        return masterPlaylist(videoId, maxH, codecs, false);
+    }
+
+    /// Start-Variante (`?ladder=1`, opt-in vom App-Tap-Pfad): zusaetzlich zur
+    /// Voll-Rendition eine kleine (<=START_MAX_H) ZUERST listen. AVPlayer beginnt
+    /// mit der ersten Variante der Master-Playlist — das erste Bild kommt dann aus
+    /// einem ~150-250KB-Segment statt 1,3-1,6MB (gemessen 2026-07-30: das erste
+    /// Voll-Segment ist mit ~1,3-1,5s bei ~1MB/s durch /yt-proxy der dominante
+    /// Posten des Serve-Pfads), hochgeschaltet wird nach wenigen Sekunden.
+    /// Kein neues Bookkeeping: die Start-Variante ist dieselbe video0.m3u8-Route
+    /// mit eigenem ?maxh= — pickedVideoStreams waehlt dort die kleine Rendition
+    /// aus DEMSELBEN Resolve (kein zweiter YouTube-Call). Der Prefetch bleibt
+    /// single-variant (waermt weiter genau die Voll-Rendition); die kalte
+    /// Start-Variante ist bewusst der billige Teil.
+    public static final int START_MAX_H = 480;
+
+    public static byte[] masterPlaylist(String videoId, int maxH, String[] codecs, boolean ladder) throws Exception {
         // requireVerified=false: the master only lists variant playlist names,
         // never segment URLs, so it doesn't need the throttle HEAD-probe /
         // WebEmbed re-resolve. Skipping that keeps this (the dominant
@@ -50,6 +67,40 @@ public class SynthHlsHandlers {
         // rendition must be re-encoded into the variant URI — else video0.m3u8
         // would serve the default 1080/avc and mismatch this master's CODECS.
         final String q = "?maxh=" + maxH + "&codecs=" + String.join(",", codecs);
+        List<PipedStream> variants = new ArrayList<>();
+        List<String> uris = new ArrayList<>();
+        if (ladder) {
+            // Start-Variante = dieselbe video0-Route mit eigenem ?maxh= — die
+            // Variant-Playlist waehlt ihre Rendition selbst per Query, das
+            // Bookkeeping (sidx/Byte-Ranges) bleibt pro Rendition unveraendert.
+            List<PipedStream> start = pickedVideoStreams(streams, START_MAX_H, codecs);
+            PipedStream s = start.isEmpty() ? null : start.get(0);
+            if (shouldPrependStart(s, videos.get(0))) {
+                variants.add(s);
+                uris.add("video0.m3u8?maxh=" + START_MAX_H + "&codecs=" + String.join(",", codecs));
+            }
+        }
+        for (int i = 0; i < videos.size(); i++) {
+            variants.add(videos.get(i));
+            uris.add("video" + i + ".m3u8" + q);
+        }
+        return buildMasterPlaylist(audio, variants, uris);
+    }
+
+    /// Pure: lohnt eine Start-Variante? Nur wenn sie eine ECHT kleinere Rendition
+    /// ist — sonst staenden zwei identische Varianten im Master (Quelle hat z.B.
+    /// nur <=480p) und AVPlayer wuerde sinnlos zwischen ihnen wechseln.
+    static boolean shouldPrependStart(PipedStream start, PipedStream main) {
+        if (start == null || main == null) return false;
+        if (start.height <= 0 || main.height <= 0) return false;
+        return start.height < main.height;
+    }
+
+    /// Pure: baut den Master-Text aus fertig gewaehlten Renditionen. uris.get(i)
+    /// gehoert zu videos.get(i); die Reihenfolge IST das Verhalten — AVPlayer
+    /// beginnt mit der ERSTEN Variante (deshalb steht die Start-Variante vorn).
+    /// Ohne I/O, damit die Regeln testbar sind (SabrPlaylistTest).
+    static byte[] buildMasterPlaylist(PipedStream audio, List<PipedStream> videos, List<String> uris) {
         StringBuilder sb = new StringBuilder();
         sb.append("#EXTM3U\n");
         sb.append("#EXT-X-VERSION:7\n");
@@ -71,7 +122,7 @@ public class SynthHlsHandlers {
             String vrAttr = vr.equals("SDR") ? "" : ("VIDEO-RANGE=" + vr + ",");
             sb.append(String.format("#EXT-X-STREAM-INF:BANDWIDTH=%d,AVERAGE-BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d,%sCODECS=\"%s,%s\",AUDIO=\"audio\"\n",
                     bw, bw, w, h, fps, vrAttr, vCodec, audioCodec));
-            sb.append("video").append(i).append(".m3u8").append(q).append("\n");
+            sb.append(uris.get(i)).append("\n");
         }
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }

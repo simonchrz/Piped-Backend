@@ -2,6 +2,7 @@
 build
 bin
 Dockerfile*
+!piped-prebuilt.jar
 docker-compose.yml
 *.bat
 LICENSE

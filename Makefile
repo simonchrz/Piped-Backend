@@ -4,7 +4,15 @@
 # temurin container. Manual multi-step before; now `make deploy`.
 #
 #   make jar      - compile the NewPipe fork -> libs/NewPipeExtractor-patched.jar
-#   make backend  - rebuild the piped-backend image (gradle shadowJar)
+#   make backend  - rebuild the piped-backend image. Jar via `docker run --dns
+#                   1.1.1.1` + Image via Dockerfile.prebuilt (2026-07-30): die
+#                   Pi-hole-Regex (\.|^)cloudflare\.net$ (VPN-Blockpaket) nullt
+#                   per CNAME-Inspection auth.docker.io + repo.maven.apache.org;
+#                   Build-Container haengen am Daemon-DNS (= Pi-hole) und
+#                   `docker build` kennt kein --dns. `docker run` schon -> Jar
+#                   dort bauen. Base-Image-Pulls brauchen ggf. temporaere
+#                   /etc/hosts-Eintraege (eclipse-temurin:21-jdk/-jre liegen
+#                   inzwischen lokal, also normalerweise nicht mehr).
 #   make restart  - recreate the running container with the fresh image
 #   make deploy   - jar + backend + restart (the full chain)
 #   make logs     - follow backend logs
@@ -28,7 +36,11 @@ jar:
 	@echo "-> $(LIBS_JAR) updated ($$(stat -c %s $(LIBS_JAR)) bytes)"
 
 backend:
-	docker build -t piped-local:latest .
+	@mkdir -p $(HOME)/.gradle-docker-cache
+	docker run --rm --dns 1.1.1.1 -v "$$PWD":/app -w /app -v $(HOME)/.gradle-docker-cache:/root/.gradle eclipse-temurin:21-jdk \
+		./gradlew shadowJar --console=plain --no-daemon --no-configuration-cache
+	cp build/libs/piped-1.0-all.jar piped-prebuilt.jar
+	docker build -f Dockerfile.prebuilt -t piped-local:latest .
 
 restart:
 	cd $(COMPOSE_DIR) && docker compose up -d piped-backend

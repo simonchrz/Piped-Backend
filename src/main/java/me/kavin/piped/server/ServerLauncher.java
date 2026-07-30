@@ -282,9 +282,13 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                         // these onto the variant URIs so video<i>.m3u8 serves the same pick.
                         final int maxH = SynthHlsHandlers.parseMaxH(request.getQueryParameter("maxh"));
                         final String[] codecs = SynthHlsHandlers.parseCodecs(request.getQueryParameter("codecs"));
+                        // ?ladder=1 (opt-in, App-Tap-Pfad): Start-Variante voranstellen
+                        // (s. SynthHlsHandlers.START_MAX_H). Nur der Master aendert sich —
+                        // die Variant-Routen waehlen ihre Rendition ohnehin per ?maxh=.
+                        final boolean ladder = "1".equals(request.getQueryParameter("ladder"));
                         byte[] body;
                         if (filename.equals("master.m3u8")) {
-                            body = withResolveBudget(() -> SynthHlsHandlers.masterPlaylist(videoId, maxH, codecs));
+                            body = withResolveBudget(() -> SynthHlsHandlers.masterPlaylist(videoId, maxH, codecs, ladder));
                         } else if (filename.equals("audio.m3u8")) {
                             body = withResolveBudget(() -> SynthHlsHandlers.audioPlaylist(videoId));
                         } else if (filename.startsWith("video") && filename.endsWith(".m3u8")) {

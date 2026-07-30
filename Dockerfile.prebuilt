@@ -1,0 +1,21 @@
+# Wie Dockerfile, aber OHNE die Gradle-Build-Stage: das Jar wird vorab per
+# docker run --dns 1.1.1.1 gebaut (s. Makefile backend-prebuilt). Noetig, weil
+# die Pi-hole-Regex (\.|^)cloudflare\.net$ (VPN-Blockpaket) per CNAME-Inspection
+# auth.docker.io + repo.maven.apache.org nullt — Build-Container haengen am
+# Daemon-DNS (= Pi-hole), docker build kennt kein --dns.
+FROM eclipse-temurin:21-jre
+
+RUN --mount=type=cache,target=/var/cache/apt/  apt-get update &&  apt-get install -y --no-install-recommends   curl   &&  apt-get clean &&  rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/
+
+COPY hotspot-entrypoint.sh docker-healthcheck.sh /
+
+COPY piped-prebuilt.jar /app/piped.jar
+
+COPY VERSION .
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD /docker-healthcheck.sh
+ENTRYPOINT ["/hotspot-entrypoint.sh"]
