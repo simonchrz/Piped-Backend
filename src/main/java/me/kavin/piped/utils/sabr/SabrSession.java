@@ -773,7 +773,14 @@ public final class SabrSession {
                 "Accept-Encoding", "identity",
                 "Accept", "application/vnd.yt-ump",
                 "User-Agent", userAgent));
-        if (userAgent != null && userAgent.startsWith("Mozilla/")) {
+        // ⚠️ Origin/Referer kamen 2026-07-25 dazu („ohne sie 403"). Mit dem seither
+        // fehlenden `Accept: application/vnd.yt-ump` war das aber eine Messung
+        // unter falscher Voraussetzung. Die Referenz-Implementierung, die Medien
+        // bekommt, schickt WEDER Origin NOCH Referer NOCH einen Browser-UA —
+        // nur content-type, accept-encoding und accept. `YT_SABR_NO_ORIGIN=1`
+        // testet das (eine Variable).
+        if (userAgent != null && userAgent.startsWith("Mozilla/")
+                && !"1".equals(System.getenv("YT_SABR_NO_ORIGIN"))) {
             headers.put("Origin", "https://www.youtube.com");
             headers.put("Referer", "https://www.youtube.com/");
         }
