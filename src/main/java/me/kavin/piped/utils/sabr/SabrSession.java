@@ -578,7 +578,12 @@ public final class SabrSession {
         // caps the readahead at ~one buffer window (~60s) then stops sending.
         final ProtoWriter sc = new ProtoWriter().bytesField(1, clientInfo);
         if (poToken != null) sc.bytesField(2, poToken);
-        if (cookie != null) sc.bytesField(3, cookie);
+        // ⚠️ NUR bei INHALT senden. Ein LEERES playback_cookie (Feld 3, 0 Byte)
+        // ist nicht dasselbe wie „kein Cookie": der Server bekommt damit einen
+        // ungueltigen Wiedergabe-Zeiger. Runde-2-Diff gegen die Referenz
+        // (2026-07-30) zeigte genau diesen einen Unterschied — alles andere,
+        // inkl. sabr_contexts (86B), war byte-identisch.
+        if (cookie != null && cookie.length > 0) sc.bytesField(3, cookie);
         // repeated sabr_contexts = 5, je { 1=type, 2=value } — zurückgespiegelt
         // aus SABR_CONTEXT_UPDATE (s. handleContextUpdate).
         for (var e : sabrContexts.entrySet()) {
@@ -596,10 +601,13 @@ public final class SabrSession {
         // VOLLER Request-Koerper beim ersten Request — Vergleichsgrundlage gegen
         // die Referenz-Implementierung, die mit denselben Eingaben Medien
         // bekommt. Ohne diesen Diff bleibt jede Aenderung Raterei.
-        if (requestNo == 0 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
+        // Die ERSTEN ZWEI Runden dumpen. Runde 0 ist auf beiden Seiten unauffaellig
+        // (belegt 2026-07-30: die Bytes der Referenz geben per curl ebenfalls nur
+        // 104B) — die Referenz gewinnt erst in Runde 2. Genau die braucht der Diff.
+        if (requestNo <= 1 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
             final StringBuilder fh = new StringBuilder();
             for (byte b : out) fh.append(String.format("%02x", b));
-            System.out.println("[Sabr] REQ-HEX len=" + out.length + " " + fh);
+            System.out.println("[Sabr] REQ-HEX#" + requestNo + " len=" + out.length + " " + fh);
         }
         return out;
     }
