@@ -449,8 +449,64 @@ public final class SabrSession {
     }
 
     // ---- request building ----
+    /// Wann die Session begann — fuer elapsed_wall_time_ms (Feld 36).
+    private final long sessionStartMs = System.currentTimeMillis();
+
+    /// `client_abr_state` (Feld 1 der ABR-Anfrage).
+    ///
+    /// Feldnamen aus der Referenz-Implementierung LuanRT/googlevideo
+    /// (protos/video_streaming/client_abr_state.proto); die WERTE stammen aus dem
+    /// Browser-Mitschnitt des echten Web-Players (2026-07-25).
+    ///
+    /// Bisher schickten wir ZWEI Felder (~5 B), der Browser ~20 (105 B). Der
+    /// Server bekam damit keine Wiedergabe-Absicht: keine Viewport-Groesse, keine
+    /// Bandbreitenschaetzung, keinen Sitzungsfortschritt. `YT_SABR_CAS_FULL=1`
+    /// schaltet den vollen Zustand ein.
+    ///
+    /// ⚠️ Feld 40 (`enabled_track_types_bitfield`) schickt der Browser NICHT —
+    /// im vollen Modus lassen wir es entsprechend weg. Ebenso Feld 4 der
+    /// Aussenanfrage (Spielzeit steckt im client_abr_state).
+    /// ⚠️ Nicht rekonstruierbar: Feld 79 `playback_authorization` (18 B, Inhalt
+    /// nicht mitgeschnitten) sowie die undokumentierten Felder 71/72/85.
+    private byte[] clientAbrState(long playerTimeMs, Map<Integer, FState> states) {
+        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL")))
+            return new ProtoWriter().varintField(28, playerTimeMs).varintField(40, 7).toByteArray();
+        final long wall = Math.max(0, System.currentTimeMillis() - sessionStartMs);
+        // Gepufferte Dauer = was wir wirklich schon haben (der Browser meldet hier
+        // seinen Pufferstand; eine erfundene Zahl waere genau die Sorte Rauschen,
+        // die uns beim Kids-Cap schon einmal fehlgeleitet hat).
+        long buffered = 0;
+        for (FState s : states.values()) buffered = Math.max(buffered, s.bufferedMs);
+        return new ProtoWriter()
+                .varintField(18, 2072)          // client_viewport_width
+                .varintField(19, 1166)          // client_viewport_height
+                .varintField(21, 0)             // sticky_resolution
+                .varintField(23, 13335011)      // bandwidth_estimate (B/s)
+                .varintField(28, playerTimeMs)  // player_time_ms
+                .varintField(29, buffered)      // time_since_last_seek
+                .varintField(34, 0)             // visibility
+                .varintField(36, wall)          // elapsed_wall_time_ms
+                .varintField(39, wall)          // time_since_last_action_ms
+                .varintField(46, 1)             // drc_enabled
+                .varintField(57, 78)            // field57
+                .varintField(58, 0)             // prefer_vp9
+                .varintField(59, 8192)          // av1_quality_threshold
+                .varintField(68, 2383)          // sabr_force_max_network_interruption_duration_ms
+                .varintField(76, 0)             // enable_voice_boost
+                .toByteArray();
+    }
+
     private byte[] buildRequest(Map<Integer, FState> states, long playerTimeMs, byte[] cookie) {
-        final byte[] cas = new ProtoWriter().varintField(28, playerTimeMs).varintField(40, 7).toByteArray();
+        final byte[] cas = clientAbrState(playerTimeMs, states);
+        // Beim ERSTEN Request den gesendeten client_abr_state zeigen — ohne diesen
+        // Beleg waere ein Negativbefund wertlos (man wuesste nicht, ob der volle
+        // Zustand ueberhaupt rausging).
+        if (requestNo == 0 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
+            final StringBuilder h = new StringBuilder();
+            for (byte b : cas) h.append(String.format("%02x", b));
+            System.out.println("[Sabr] client_abr_state len=" + cas.length
+                    + " full=" + "1".equals(System.getenv("YT_SABR_CAS_FULL")) + " hex=" + h);
+        }
         final ProtoWriter req = new ProtoWriter();
         req.bytesField(1, cas);
         // selected_format_ids: ONLY formats already initialized (FORMAT_INIT
@@ -473,7 +529,10 @@ public final class SabrSession {
         // Kandidatenliste ohnehin nichts (unveraendert 11B-Antworten).
         req.bytesField(16, formatId(prefAudio));
         req.bytesField(17, formatId(prefVideo));
-        req.varintField(4, playerTimeMs);
+        // Feld 4 schickt der echte Web-Player NICHT (die Spielzeit steht im
+        // client_abr_state, Feld 28). Im vollen Modus lassen wir es weg, damit
+        // die Anfrage der mitgeschnittenen Form entspricht.
+        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL"))) req.varintField(4, playerTimeMs);
         req.bytesField(5, ustreamerConfig);
         // streamerContext: client_info(1), po_token(2), playback_cookie(3).
         // po_token authorizes the gvs streaming session — without it googlevideo
