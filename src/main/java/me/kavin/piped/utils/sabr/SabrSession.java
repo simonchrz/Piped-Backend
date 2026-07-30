@@ -254,6 +254,62 @@ public final class SabrSession {
         }
     }
 
+    /// NEXT_REQUEST_POLICY (UMP-Typ 35): der Server steuert damit die TAKTUNG der
+    /// Folgerunden — das ist die „bedarfsgesteuerte Taktung", die der Referenz-
+    /// Implementierung ihre Medien beschert und uns fehlte. Proto (LuanRT/
+    /// googlevideo, protos/video_streaming/next_request_policy.proto):
+    ///   1=target_audio_readahead_ms · 2=target_video_readahead_ms
+    ///   3=max_time_since_last_request_ms · 4=backoff_time_ms · 7=playback_cookie
+    /// Die Referenz wartet vor JEDER Folgerunde `backoff_time_ms` (SabrStream.
+    /// executeWithRetry) — wir lasen bisher NUR das Cookie (Feld 7) und feuerten
+    /// sofort weiter. Befund 2026-07-30: sofortiges Feuern quittiert der Server
+    /// mit leeren UMP-Rahmen (105 B → 11 B, kein Fehler); mit Rundenabstand
+    /// (YT_SABR_GAP_MS-Probe: 4000/2000/1000 ms) lieferte er komplette Videos.
+    /// Kill-Switch: YT_SABR_IGNORE_BACKOFF=1 stellt das alte Verhalten her.
+    private long policyBackoffMs = 0;
+    private long policyTargetAudioMs = 0;
+    private long policyTargetVideoMs = 0;
+    private long policyMaxIdleMs = 0;
+
+    /// Parst die volle Policy in die policy*-Felder; Rueckgabe = playback_cookie
+    /// (Feld 7) oder null, wenn keins enthalten war (dann altes Cookie behalten —
+    /// ein fehlendes Feld ist keine Anweisung, das Cookie zu verwerfen).
+    private byte[] handleNextRequestPolicy(byte[] p) {
+        byte[] ck = null;
+        long backoff = 0, ta = 0, tv = 0, maxIdle = 0;
+        try {
+            final ProtoReader r = new ProtoReader(p);
+            while (r.hasMore()) {
+                final int f = r.readTag();
+                if (r.wireType() == 0) {
+                    final long v = r.readVarint();
+                    switch (f) {
+                        case 1: ta = v; break;
+                        case 2: tv = v; break;
+                        case 3: maxIdle = v; break;
+                        case 4: backoff = v; break;
+                        default: break;
+                    }
+                } else if (f == 7 && r.wireType() == 2) {
+                    ck = r.readBytes();
+                } else {
+                    r.skip();
+                }
+            }
+        } catch (Exception ignored) { return null; }
+        final boolean changed = backoff != policyBackoffMs || ta != policyTargetAudioMs
+                || tv != policyTargetVideoMs || maxIdle != policyMaxIdleMs;
+        policyBackoffMs = backoff;
+        policyTargetAudioMs = ta;
+        policyTargetVideoMs = tv;
+        policyMaxIdleMs = maxIdle;
+        if (TRACE && changed)
+            System.out.println("[Sabr] NextRequestPolicy backoff=" + backoff
+                    + "ms targetA=" + ta + "ms targetV=" + tv
+                    + "ms maxIdle=" + maxIdle + "ms cookie=" + (ck != null ? ck.length + "B" : "-"));
+        return ck;
+    }
+
     /// STREAM_PROTECTION_STATUS (UMP-Typ 58): Feld 1 = Status der Session-
     /// Attestierung. Bekannte Werte: 1=OK, 2=ausstehend, 3=Attestierung noetig.
     /// ⚠️ Wir haben diesen Typ bisher DEKLARIERT, aber nie ausgewertet — er lief
@@ -300,15 +356,32 @@ public final class SabrSession {
         try {
             for (int iter = 0; iter < maxIterations; iter++) {
                 res.iterations = iter + 1;
-                // TIMING-PROBE (YT_SABR_GAP_MS): vor jeder Folgerunde warten. Grund:
-                // ein curl-Replay UNSERER EIGENEN Bytes liefert Medien (6825272B),
-                // der Live-Lauf mit denselben Bytes nicht — der Replay lief aber
-                // jedes Mal MINUTEN spaeter. Einzige verbliebene Erklaerung nach
-                // Ausschluss von Inhalt, Headern, Egress, Verbindung und Client.
-                final String gap = System.getenv("YT_SABR_GAP_MS");
-                if (iter > 0 && gap != null && !gap.isEmpty()) {
-                    try { Thread.sleep(Long.parseLong(gap.trim())); }
-                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                // BEDARFSGESTEUERTE TAKTUNG: vor jeder Folgerunde die vom Server
+                // per NEXT_REQUEST_POLICY (Feld 4, backoff_time_ms) angeordnete
+                // Wartezeit einhalten — exakt wie die Referenz-Implementierung
+                // (SabrStream.executeWithRetry). Beleg 2026-07-30: sofortiges
+                // Feuern → leere UMP-Rahmen (105 B → 11 B); mit Rundenabstand
+                // (GAP-Probe 1000–4000 ms) → komplette Videos inkl. itag 140.
+                // Die Policy bleibt gueltig, bis der Server eine neue schickt.
+                // YT_SABR_GAP_MS wirkt zusaetzlich als manueller Mindestabstand
+                // (Experiment-Schalter); es gilt das Maximum aus beidem.
+                // Sicherheitsdeckel 60 s gegen absurde Server-Werte.
+                if (iter > 0) {
+                    long waitMs = "1".equals(System.getenv("YT_SABR_IGNORE_BACKOFF"))
+                            ? 0 : policyBackoffMs;
+                    final String gap = System.getenv("YT_SABR_GAP_MS");
+                    if (gap != null && !gap.isEmpty()) {
+                        try { waitMs = Math.max(waitMs, Long.parseLong(gap.trim())); }
+                        catch (NumberFormatException ignored) { }
+                    }
+                    if (waitMs > 60_000) {
+                        System.out.println("[Sabr] backoff " + waitMs + "ms auf 60s gedeckelt");
+                        waitMs = 60_000;
+                    }
+                    if (waitMs > 0) {
+                        try { Thread.sleep(waitMs); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    }
                 }
                 final byte[] resp = post(buildRequest(states, playerTimeMs, playbackCookie));
 
@@ -325,7 +398,11 @@ public final class SabrSession {
                         case UmpReader.MEDIA_HEADER: handleHeader(payload, pend); break;
                         case UmpReader.MEDIA: handleMedia(payload, pend); break;
                         case UmpReader.MEDIA_END: finalizeOne(payload, pend, states, newSegments); break;
-                        case UmpReader.NEXT_REQUEST_POLICY: cookie[0] = extractCookie(payload); break;
+                        case UmpReader.NEXT_REQUEST_POLICY: {
+                            final byte[] ck = handleNextRequestPolicy(payload);
+                            if (ck != null) cookie[0] = ck;
+                            break;
+                        }
                         case UmpReader.SABR_REDIRECT: { String u = extractRedirect(payload); if (u != null) { abrUrl = u; redirected[0] = true; } break; }
                         case UmpReader.SABR_ERROR: sabrError[0] = true; break;
                         case SABR_CONTEXT_UPDATE: handleContextUpdate(payload); break;
@@ -750,15 +827,6 @@ public final class SabrSession {
         final ProtoReader r = new ProtoReader(p);
         while (r.hasMore()) {
             if (r.readTag() == 1 && r.wireType() == 2) return new String(r.readBytes());
-            r.skip();
-        }
-        return null;
-    }
-
-    private byte[] extractCookie(byte[] p) {
-        final ProtoReader r = new ProtoReader(p);
-        while (r.hasMore()) {
-            if (r.readTag() == 7 && r.wireType() == 2) return r.readBytes();
             r.skip();
         }
         return null;
