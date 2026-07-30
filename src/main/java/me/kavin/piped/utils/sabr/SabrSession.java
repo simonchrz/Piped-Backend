@@ -242,6 +242,11 @@ public final class SabrSession {
             }
         } catch (Exception ignored) { return; }
         if (ctype >= 0 && value != null && sendByDefault) {
+            // ⚠️ NICHT die rohe SabrContextUpdate spiegeln (2026-07-30 probiert →
+            // SABR_ERROR): Feld 5 erwartet `SabrContext {1=type, 2=value}`, der
+            // Server sendet aber `SabrContextUpdate {1=type, 2=scope, 3=value,
+            // 4=send_by_default, 5=write_policy}`. Die Umsetzung value(3)→(2) ist
+            // richtig; genau das macht die Referenz-Implementierung auch.
             final byte[] prev = sabrContexts.put(ctype, value);
             if (prev == null)
                 System.out.println("[Sabr] SabrContext übernommen: type=" + ctype
@@ -582,6 +587,10 @@ public final class SabrSession {
                     .bytesField(2, e.getValue())
                     .toByteArray());
         }
+        // `unsent_sabr_contexts` (Feld 6) schickt die Referenz immer mit — leer,
+        // wenn alle bekannten Kontexte aktiv sind. Ohne das Feld fehlt dem Server
+        // die Aussage „ich kenne keine weiteren".
+        sc.bytesField(6, new byte[0]);
         req.bytesField(19, sc.toByteArray());
         final byte[] out = req.toByteArray();
         // VOLLER Request-Koerper beim ersten Request — Vergleichsgrundlage gegen
