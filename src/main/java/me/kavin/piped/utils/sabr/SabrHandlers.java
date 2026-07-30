@@ -171,6 +171,24 @@ public final class SabrHandlers {
         }
         final SabrSession.Fmt pa = new SabrSession.Fmt(aud.path("itag").asInt(), aud.path("lastModified").asLong());
         final SabrSession.Fmt pv = new SabrSession.Fmt(vid.path("itag").asInt(), vid.path("lastModified").asLong());
+        // Was bietet DIESER Client an, und was haben wir daraus gewaehlt? Der
+        // WEB-Pfad lieferte 105B->11B ohne Medien und ohne Fehler — genau das
+        // Bild, das entsteht, wenn die format_id (itag+lmt) nicht zu etwas passt,
+        // das der Server hat. `lastModified` fehlt in manchen Antworten; ein
+        // lmt=0 macht die format_id unauffindbar, ohne dass jemand meckert.
+        if ("1".equals(System.getenv("YT_SABR_TRACE"))) {
+            final StringBuilder fl = new StringBuilder();
+            int n = 0;
+            for (JsonNode f : sd.path("adaptiveFormats")) {
+                if (n++ < 8) fl.append(' ').append(f.path("itag").asInt())
+                        .append('/').append(f.path("lastModified").asLong(-1))
+                        .append(f.has("url") ? "u" : "-");
+            }
+            System.out.println("[Sabr] " + videoId + " client=" + (pureWeb ? "WEB" : webClient
+                    ? "WEB_EMBEDDED" : vrClient ? "ANDROID_VR" : "ANDROID")
+                    + " formate=" + n + " gewaehlt a=" + pa.itag + "/" + pa.lmt
+                    + " v=" + pv.itag + "/" + pv.lmt + " ersten:" + fl);
+        }
         // Alle angebotenen Formate als Kandidaten sammeln (s. SabrSession).
         final java.util.List<SabrSession.Fmt> candA = new java.util.ArrayList<>();
         final java.util.List<SabrSession.Fmt> candV = new java.util.ArrayList<>();
