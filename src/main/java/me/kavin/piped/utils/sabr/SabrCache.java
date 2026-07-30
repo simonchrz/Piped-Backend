@@ -330,9 +330,19 @@ public final class SabrCache {
                 ? Integer.parseInt(probeClient.trim()) : clientMode;
         if (probeClient != null)
             System.out.println("[Sabr] PROBE clientMode=" + effClientMode + " (erzwungen)");
+        // Token-Bindung erzwingen. Der Browser benutzt fuer GVS einen
+        // VIDEO-gebundenen Token (yt-dlp-Wiki: "Most PO Tokens (such as for web
+        // GVS/Player) are bound to the video ID"), wir im ersten Versuch einen
+        // visitorData-gebundenen. Client UND Bindung muessen zusammenpassen —
+        // deshalb getrennt schaltbar, sonst testet man immer nur eine Haelfte.
+        final String probeBind = System.getenv("YT_SABR_PROBE_CONTENT_BOUND");
+        final boolean effContentBound = probeBind != null
+                ? "1".equals(probeBind.trim()) : contentBoundToken;
+        if (probeBind != null)
+            System.out.println("[Sabr] PROBE contentBound=" + effContentBound + " (erzwungen)");
         SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink, family, contentBoundToken, effClientMode, paced, publishHook);
+            result = SabrHandlers.runSession(videoId, sink, family, effContentBound, effClientMode, paced, publishHook);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {
