@@ -300,6 +300,16 @@ public final class SabrSession {
         try {
             for (int iter = 0; iter < maxIterations; iter++) {
                 res.iterations = iter + 1;
+                // TIMING-PROBE (YT_SABR_GAP_MS): vor jeder Folgerunde warten. Grund:
+                // ein curl-Replay UNSERER EIGENEN Bytes liefert Medien (6825272B),
+                // der Live-Lauf mit denselben Bytes nicht — der Replay lief aber
+                // jedes Mal MINUTEN spaeter. Einzige verbliebene Erklaerung nach
+                // Ausschluss von Inhalt, Headern, Egress, Verbindung und Client.
+                final String gap = System.getenv("YT_SABR_GAP_MS");
+                if (iter > 0 && gap != null && !gap.isEmpty()) {
+                    try { Thread.sleep(Long.parseLong(gap.trim())); }
+                    catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                }
                 final byte[] resp = post(buildRequest(states, playerTimeMs, playbackCookie));
 
                 final Map<Long, Pending> pend = new HashMap<>();
