@@ -457,6 +457,13 @@ public final class SabrSession {
     /// Wann die Session begann — fuer elapsed_wall_time_ms (Feld 36).
     private final long sessionStartMs = System.currentTimeMillis();
 
+    /// Transport fuer den ABR-POST (s. post()). Eine Instanz pro JVM; HttpClient
+    /// ist thread-sicher und haelt Verbindungen selbst warm.
+    private static final java.net.http.HttpClient HTTP = java.net.http.HttpClient.newBuilder()
+            .connectTimeout(java.time.Duration.ofSeconds(20))
+            .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+            .build();
+
     /// Wiedergabe-Nonce dieser Session (s. post()). Pro Session EINMAL erzeugt.
     /// Bewusst lokal statt aus SynthHlsHandlers importiert — die sabr-Schicht
     /// soll nicht auf die Handler-Schicht zeigen. Alphabet identisch (16
@@ -807,11 +814,35 @@ public final class SabrSession {
             headers.put("Origin", "https://www.youtube.com");
             headers.put("Referer", "https://www.youtube.com/");
         }
-        final var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
-                url, "POST", body, headers,
-                family).get(60, java.util.concurrent.TimeUnit.SECONDS);
-        if (resp.status() / 100 != 2)
-            throw new IOException("SABR POST HTTP " + resp.status() + " (egress=" + family + ")");
-        return resp.body();
+        // TRANSPORT (2026-07-30): ueber reqwest4j bekamen wir auf einen byte-gleichen
+        // Request nur einen leeren UMP-Rahmen (11B), waehrend curl mit EXAKT
+        // denselben Bytes, denselben Headern, auf BEIDEN Egress-Familien und in
+        // beiden Verbindungsmodi 6825272B Medien bekam. Der Request war also nie
+        // das Problem — der Client war es. Java-HttpClient verhaelt sich wie curl.
+        // Die Egress-Bindung entfaellt dabei bewusst: beide Familien liefern.
+        // Schalter YT_SABR_REQWEST=1 stellt den alten Weg wieder her.
+        if ("1".equals(System.getenv("YT_SABR_REQWEST"))) {
+            final var resp = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                    url, "POST", body, headers,
+                    family).get(60, java.util.concurrent.TimeUnit.SECONDS);
+            if (resp.status() / 100 != 2)
+                throw new IOException("SABR POST HTTP " + resp.status() + " (egress=" + family + ")");
+            return resp.body();
+        }
+        final var reqB = java.net.http.HttpRequest.newBuilder()
+                .uri(java.net.URI.create(url))
+                .timeout(java.time.Duration.ofSeconds(60))
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofByteArray(body));
+        for (var h : headers.entrySet()) reqB.header(h.getKey(), h.getValue());
+        final java.net.http.HttpResponse<byte[]> r2;
+        try {
+            r2 = HTTP.send(reqB.build(), java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new IOException("SABR POST unterbrochen", ie);
+        }
+        if (r2.statusCode() / 100 != 2)
+            throw new IOException("SABR POST HTTP " + r2.statusCode() + " (egress=" + family + ")");
+        return r2.body();
     }
 }
