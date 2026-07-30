@@ -43,7 +43,11 @@ fi
 # 4. variant playlist -> must carry EXT-X-MAP + a segment URL
 variant=$(printf '%s' "$master" | grep -oE '(video[0-9]+|audio)\.m3u8' | head -1)
 vpl=$(curl -s -m 15 "$BASE/synth-hls/$VID/$variant")
-segurl=$(printf '%s' "$vpl" | grep -oE 'https?://[^"]+' | head -1)
+# Segmente laufen regulaer als RELATIVE /yt-proxy/-URIs (rewriteToYtProxy,
+# cachender Proxy); absolute piped-proxy-URLs erscheinen nur im Fallback.
+# Beide Formen akzeptieren; relative fuer den Range-Check auf BASE aufloesen.
+segurl=$(printf '%s' "$vpl" | grep -oE '(https?://|/yt-proxy/)[^"]+' | head -1)
+case "$segurl" in /*) segurl="$BASE$segurl";; esac
 if printf '%s' "$vpl" | grep -q 'EXT-X-MAP' && [ -n "$segurl" ]; then
   say "synth-hls $variant" "OK (EXT-X-MAP + segment URL)"
 else
