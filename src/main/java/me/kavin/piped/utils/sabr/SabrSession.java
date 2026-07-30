@@ -49,6 +49,10 @@ public final class SabrSession {
         boolean initWritten;
         final TreeMap<Integer, byte[]> buf = new TreeMap<>();  // received, not yet flushed
         final Set<Integer> seen = new HashSet<>();             // dedup + segment count
+        /// seq -> {startMs, durationMs} JEDES empfangenen Segments. Grundlage der
+        /// ehrlichen buffered_ranges: nur damit lassen sich zusammenhaengende
+        /// Laeufe (und damit LOECHER) korrekt an den Server melden.
+        final TreeMap<Integer, long[]> segTimes = new TreeMap<>();
         int writeCursor = Integer.MIN_VALUE;                   // next seq to flush
         int maxSeq = 0;
         long bytesWritten = 0;
@@ -58,6 +62,29 @@ public final class SabrSession {
         FState(Fmt f) { fmt = f; }
         long perSegMs() { return totalSegments > 0 ? totalDurationMs / totalSegments : 0; }
         long frontierMs() { return perSegMs() * maxSeq; }
+        /// Ende des ERSTEN zusammenhaengenden Laufs — bis hierhin koennte ein
+        /// echter Player tatsaechlich spielen. Der Play-Head darf NIE dahinter
+        /// vorruecken: ein SABR-Server bedient die Abspielposition und fuellt
+        /// keine Loecher HINTER dem Play-Head nach (2026-07-30 gemessen: Loch
+        /// bei seg 23, player_time am Frontier bei 2333 s -> der Server
+        /// antwortete nur noch 94 B und lieferte seg 23 nie; ein echter Player
+        /// wuerde vor dem Loch stehen bleiben bzw. dorthin seeken).
+        /// ⚠️ ANDROID-MediaHeader tragen KEINE startMs/durationMs (Felder 11/12
+        /// leer — 2026-07-30 gemessen: buffered=0ms, ptMs klemmte auf 0, der
+        /// Server schickte in Schleife dieselben 3,1 MB). Fallback auf die
+        /// FORMAT_INIT-Schaetzung perSegMs(), wie der alte frontierMs()-Weg.
+        long estStartMs(int seq, long raw) { return raw > 0 ? raw : perSegMs() * Math.max(0, seq - 1); }
+        long estDurMs(long raw) { return raw > 0 ? raw : perSegMs(); }
+
+        long contiguousEndMs() {
+            long end = 0; int prev = Integer.MIN_VALUE;
+            for (var e : segTimes.entrySet()) {
+                if (prev != Integer.MIN_VALUE && e.getKey() != prev + 1) break;
+                end = estStartMs(e.getKey(), e.getValue()[0]) + estDurMs(e.getValue()[1]);
+                prev = e.getKey();
+            }
+            return end;
+        }
         boolean complete() { return totalSegments > 0 && seen.size() >= totalSegments && initWritten; }
 
         /// Flush init (once) + any now-contiguous buffered segments to disk. Called
@@ -438,9 +465,20 @@ public final class SabrSession {
                 // server might stop. This is what pins down the SABR cap mechanism.
                 if (iter < 8 || newSegments[0] == 0 || sabrError[0] || redirected[0] || (iter % 25 == 0)) {
                     final StringBuilder sb = new StringBuilder();
-                    for (FState s : states.values())
+                    for (FState s : states.values()) {
                         sb.append(' ').append(s.fmt.itag).append(":seg").append(s.seen.size())
                           .append('/').append(s.totalSegments).append(",disk").append(s.bytesWritten >> 20).append("MB");
+                        // Loch-Diagnose: erstes fehlendes Segment innerhalb der
+                        // empfangenen Folge. Genau dieser Fall blockierte am
+                        // 2026-07-30 den writeCursor (RAM-Stau + stuck-Abbruch).
+                        int prevSeq = Integer.MIN_VALUE, firstGap = -1;
+                        for (int seq : s.segTimes.keySet()) {
+                            if (prevSeq != Integer.MIN_VALUE && seq != prevSeq + 1 && firstGap < 0)
+                                firstGap = prevSeq + 1;
+                            prevSeq = seq;
+                        }
+                        if (firstGap >= 0) sb.append(",LOCH@").append(firstGap);
+                    }
                     System.out.println("[Sabr] iter=" + res.iterations + " resp=" + resp.length + "B new=" + newSegments[0]
                             + " ptMs=" + playerTimeMs + (sabrError[0] ? " SABR_ERROR" : "")
                             + (protectionStatus[0] >= 0 ? " prot=" + protectionStatus[0] : "")
@@ -504,9 +542,15 @@ public final class SabrSession {
                 } else {
                     stuckRounds = 0;
                 }
-                // advance the playback head to the buffered frontier (min across
-                // formats, so audio+video march together) to pull the next window.
-                final long frontier = states.values().stream().mapToLong(FState::frontierMs).min().orElse(playerTimeMs);
+                // advance the playback head to the CONTIGUOUS buffered frontier
+                // (min across formats, so audio+video march together) to pull the
+                // next window. Bewusst NICHT frontierMs() (= maxSeq-basiert): bei
+                // einem Loch in der Segmentfolge muss der Play-Head VOR dem Loch
+                // stehen bleiben, sonst backfillt der Server es nie (s.
+                // contiguousEndMs). Mit ehrlichen buffered_ranges sieht der
+                // Server das Loch UND einen Play-Head davor -> er liefert nach,
+                // der Lauf verschmilzt, der Frontier rueckt weiter.
+                final long frontier = states.values().stream().mapToLong(FState::contiguousEndMs).min().orElse(playerTimeMs);
                 if (!paced) {
                     playerTimeMs = frontier;
                 } else {
@@ -650,7 +694,7 @@ public final class SabrSession {
             if (s.totalSegments > 0) req.bytesField(2, formatId(s.fmt));
         }
         for (FState s : states.values()) {
-            if (!s.seen.isEmpty()) req.bytesField(3, bufferedRange(s));
+            for (byte[] br : bufferedRanges(s)) req.bytesField(3, br);
         }
         // ⚠️ NUR den bevorzugten Pick nennen — NICHT alle Kandidaten wie der echte
         // Web-Player (2026-07-25 versucht und wieder entfernt): der Server waehlte
@@ -716,13 +760,41 @@ public final class SabrSession {
         return new ProtoWriter().varintField(1, f.itag).varintField(2, f.lmt).toByteArray();
     }
 
-    private byte[] bufferedRange(FState s) {
+    /// EHRLICHE buffered_ranges: ein Range pro ZUSAMMENHAENGENDEM Lauf empfangener
+    /// Segmente, mit echten Zeitfeldern aus den MediaHeadern. Vorher meldeten wir
+    /// pauschal `start=1..end=maxSeq` — bei einem Loch in der Segmentfolge
+    /// BEHAUPTETEN wir damit, das fehlende Segment zu haben, der Server lieferte
+    /// es nie nach, der writeCursor blockierte und die Session endete stuck
+    /// (2026-07-30, Kids-Session: disk fror bei Runde 8 ein, seen wuchs bis 432,
+    /// ab Runde ~172 schickte der Server in Schleife dieselben 1,78 MB).
+    /// Mehrere Ranges pro Format sind legitim: der echte Web-Player schickte im
+    /// Mitschnitt 2026-07-25 DREI buffered_ranges.
+    private java.util.List<byte[]> bufferedRanges(FState s) {
+        final java.util.List<byte[]> out = new java.util.ArrayList<>();
+        int runStart = -1, prev = -2;
+        long runStartMs = 0, runDur = 0;
+        for (var e : s.segTimes.entrySet()) {
+            final int seq = e.getKey();
+            if (runStart < 0) {
+                runStart = seq; runStartMs = s.estStartMs(seq, e.getValue()[0]);
+            } else if (seq != prev + 1) {
+                out.add(rangeBytes(s, runStart, prev, runStartMs, runDur));
+                runStart = seq; runStartMs = s.estStartMs(seq, e.getValue()[0]); runDur = 0;
+            }
+            runDur += s.estDurMs(e.getValue()[1]);
+            prev = seq;
+        }
+        if (runStart >= 0) out.add(rangeBytes(s, runStart, prev, runStartMs, runDur));
+        return out;
+    }
+
+    private byte[] rangeBytes(FState s, int startSeq, int endSeq, long startMs, long durMs) {
         return new ProtoWriter()
                 .bytesField(1, formatId(s.fmt))   // format_id
-                .varintField(2, 0)                // start_time_ms
-                .varintField(3, s.bufferedMs)     // duration_ms
-                .varintField(4, 1)                // start_segment_index (1-based)
-                .varintField(5, s.maxSeq)         // end_segment_index
+                .varintField(2, startMs)          // start_time_ms
+                .varintField(3, durMs)            // duration_ms
+                .varintField(4, startSeq)         // start_segment_index
+                .varintField(5, endSeq)           // end_segment_index
                 .toByteArray();
     }
 
@@ -818,6 +890,7 @@ public final class SabrSession {
         } else if (s.seen.add(pg.seq)) {
             if (pg.seq > s.maxSeq) s.maxSeq = pg.seq;
             s.bufferedMs += pg.durationMs;
+            s.segTimes.put(pg.seq, new long[]{pg.startMs, pg.durationMs});
             s.buf.put(pg.seq, pg.data.toByteArray());
             newSegments[0]++;
         }
