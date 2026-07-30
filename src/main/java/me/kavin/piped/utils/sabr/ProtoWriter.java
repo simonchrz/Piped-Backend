@@ -47,6 +47,19 @@ public final class ProtoWriter {
         return bytesField(field, s.getBytes(StandardCharsets.UTF_8));
     }
 
+    /// proto2 `float` = wire type 5 (fixed32), little-endian IEEE-754.
+    /// Gebraucht fuer `client_abr_state.playback_rate` (Feld 35) — die
+    /// Referenz-Implementierung schickt es in JEDER ABR-Anfrage.
+    public ProtoWriter floatField(int field, float value) {
+        writeTag(field, 5);
+        final int bits = Float.floatToRawIntBits(value);
+        out.write(bits & 0xff);
+        out.write((bits >>> 8) & 0xff);
+        out.write((bits >>> 16) & 0xff);
+        out.write((bits >>> 24) & 0xff);
+        return this;
+    }
+
     public byte[] toByteArray() {
         return out.toByteArray();
     }

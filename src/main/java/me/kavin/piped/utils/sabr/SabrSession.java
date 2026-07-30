@@ -484,6 +484,24 @@ public final class SabrSession {
     /// ⚠️ Nicht rekonstruierbar: Feld 79 `playback_authorization` (18 B, Inhalt
     /// nicht mitgeschnitten) sowie die undokumentierten Felder 71/72/85.
     private byte[] clientAbrState(long playerTimeMs, Map<Integer, FState> states) {
+        // REFERENZ-FORM (`YT_SABR_CAS_REF=1`). Direkt aus den Request-Bytes der
+        // Referenz-Implementierung abgelesen, die mit UNSEREN Session-Daten
+        // nachweislich Medien bekommt (2026-07-30: 1,85 MB Video + 182 KB Audio,
+        // wo unsere Form 11 B bekam). Sie schickt im ersten Request GENAU DREI
+        // Felder — und `player_time_ms` ist NICHT dabei:
+        //   21 sticky_resolution = 1080
+        //   34 visibility        = 1        (wir: nie gesetzt)
+        //   35 playback_rate     = 1.0f     (wir: nie gesetzt, brauchte fixed32)
+        // Unsere bisherige Form (28 + 40) enthaelt dagegen zwei Felder, die die
+        // Referenz gar nicht sendet. Ab Runde 2 kommt die Spielzeit dazu.
+        if ("1".equals(System.getenv("YT_SABR_CAS_REF"))) {
+            final ProtoWriter w = new ProtoWriter()
+                    .varintField(21, 1080)
+                    .varintField(34, 1);
+            w.floatField(35, 1.0f);
+            if (playerTimeMs > 0) w.varintField(28, playerTimeMs);
+            return w.toByteArray();
+        }
         if (!"1".equals(System.getenv("YT_SABR_CAS_FULL")))
             return new ProtoWriter().varintField(28, playerTimeMs).varintField(40, 7).toByteArray();
         final long wall = Math.max(0, System.currentTimeMillis() - sessionStartMs);
@@ -547,7 +565,8 @@ public final class SabrSession {
         // Feld 4 schickt der echte Web-Player NICHT (die Spielzeit steht im
         // client_abr_state, Feld 28). Im vollen Modus lassen wir es weg, damit
         // die Anfrage der mitgeschnittenen Form entspricht.
-        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL"))) req.varintField(4, playerTimeMs);
+        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL"))
+                && !"1".equals(System.getenv("YT_SABR_CAS_REF"))) req.varintField(4, playerTimeMs);
         req.bytesField(5, ustreamerConfig);
         // streamerContext: client_info(1), po_token(2), playback_cookie(3).
         // po_token authorizes the gvs streaming session — without it googlevideo
@@ -564,7 +583,16 @@ public final class SabrSession {
                     .toByteArray());
         }
         req.bytesField(19, sc.toByteArray());
-        return req.toByteArray();
+        final byte[] out = req.toByteArray();
+        // VOLLER Request-Koerper beim ersten Request — Vergleichsgrundlage gegen
+        // die Referenz-Implementierung, die mit denselben Eingaben Medien
+        // bekommt. Ohne diesen Diff bleibt jede Aenderung Raterei.
+        if (requestNo == 0 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
+            final StringBuilder fh = new StringBuilder();
+            for (byte b : out) fh.append(String.format("%02x", b));
+            System.out.println("[Sabr] REQ-HEX len=" + out.length + " " + fh);
+        }
+        return out;
     }
 
     private static byte[] formatId(Fmt f) {
@@ -718,8 +746,17 @@ public final class SabrSession {
         // FORMAT_INIT, kein Fehler). EINMAL pro Session erzeugt und konstant
         // gehalten: ein wechselnder cpn waere eine neue Wiedergabe pro Runde,
         // und ein wiederverwendeter cpn hat 2026-05-29 die Drossel ausgeloest.
-        String url = abrUrl + "&rn=" + (++requestNo) + (abrUrl.contains("&alr=") ? "" : "&alr=yes");
-        if (!url.contains("&cpn=") && !url.contains("?cpn=")) url = url + "&cpn=" + cpn;
+        // NUR `rn` anhaengen — so macht es die Referenz-Implementierung, die mit
+        // denselben Session-Daten Medien bekommt (Parameter-Mitschnitt 2026-07-30:
+        // "… c n sparams sig lsparams lsig rn", sonst nichts).
+        //
+        // ⚠️ `alr=yes` haben wir am 2026-07-25 aus einem Browser-Mitschnitt
+        // uebernommen — es steht dort aber an den MEDIEN-Requests, nicht am
+        // ABR-POST. `alr` = "adaptive live redirect": der Server antwortet dann
+        // mit einer Weiterleitung statt mit Medien. Genau unser Fehlerbild
+        // (Antwort kommt an, enthaelt aber nichts). `cpn` gehoert ebenfalls an
+        // die Medien-URLs, nicht hierher.
+        String url = abrUrl + "&rn=" + (++requestNo);
         if (POT_IN_URL && poToken != null && !url.contains("&pot=")) {
             url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
                     .encodeToString(poToken);
@@ -727,9 +764,14 @@ public final class SabrSession {
         // Browser-Identitaet: googlevideo weist den ABR-POST ohne Origin/Referer
         // mit 403 ab (gemessen 2026-07-25, WEB-Client-Session). Fuer die
         // App-Clients (Android/VR) bleibt der Header-Satz unveraendert.
+        // ⚠️ `Accept: application/vnd.yt-ump` — DEN Header schickt die Referenz-
+        // Implementierung an jedem ABR-POST, wir bisher nicht. Ohne ihn nimmt
+        // googlevideo die Anfrage an und antwortet mit einem leeren UMP-Rahmen
+        // (unser Bild: 105B -> 11B, kein FORMAT_INIT, kein Fehler).
         final java.util.Map<String, String> headers = new java.util.HashMap<>(Map.of(
                 "Content-Type", "application/x-protobuf",
                 "Accept-Encoding", "identity",
+                "Accept", "application/vnd.yt-ump",
                 "User-Agent", userAgent));
         if (userAgent != null && userAgent.startsWith("Mozilla/")) {
             headers.put("Origin", "https://www.youtube.com");
