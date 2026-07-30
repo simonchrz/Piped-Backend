@@ -148,6 +148,14 @@ public final class SabrSession {
         if (a != null) allAudio = a;
         if (v != null) allVideo = v;
     }
+    /// Laeuft diese Session als reiner WEB-Client (clientMode 3)? Entscheidet die
+    /// DEFAULT-Form des client_abr_state: WEB braucht die Referenz-Form (drei
+    /// Felder, s. clientAbrState) — mit der alten Zwei-Feld-Form antwortet
+    /// googlevideo dem WEB-Client mit 403 bzw. leeren Rahmen (2026-07-30 beim
+    /// Umstellen auf WEB-Default reproduziert). ANDROID laeuft unveraendert mit
+    /// der alten Form, die dort nachweislich komplette Downloads liefert.
+    private boolean webClient;
+    public void setWebClient(boolean w) { this.webClient = w; }
     private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
     /// Liefert einen FRISCHEN content-bound po_token. Wird aufgerufen, wenn der
     /// Server STREAM_PROTECTION_STATUS=3 („Attestierung erforderlich") meldet.
@@ -626,6 +634,14 @@ public final class SabrSession {
     /// Aussenanfrage (Spielzeit steckt im client_abr_state).
     /// ⚠️ Nicht rekonstruierbar: Feld 79 `playback_authorization` (18 B, Inhalt
     /// nicht mitgeschnitten) sowie die undokumentierten Felder 71/72/85.
+    /// Referenz-Form des client_abr_state: DEFAULT fuer den WEB-Client, aus fuer
+    /// die App-Clients. `YT_SABR_CAS_REF=1`/`=0` ueberschreibt beides.
+    private boolean useCasRef() {
+        final String v = System.getenv("YT_SABR_CAS_REF");
+        if (v != null && !v.isBlank()) return "1".equals(v.trim());
+        return webClient;
+    }
+
     private byte[] clientAbrState(long playerTimeMs, Map<Integer, FState> states) {
         // REFERENZ-FORM (`YT_SABR_CAS_REF=1`). Direkt aus den Request-Bytes der
         // Referenz-Implementierung abgelesen, die mit UNSEREN Session-Daten
@@ -637,7 +653,7 @@ public final class SabrSession {
         //   35 playback_rate     = 1.0f     (wir: nie gesetzt, brauchte fixed32)
         // Unsere bisherige Form (28 + 40) enthaelt dagegen zwei Felder, die die
         // Referenz gar nicht sendet. Ab Runde 2 kommt die Spielzeit dazu.
-        if ("1".equals(System.getenv("YT_SABR_CAS_REF"))) {
+        if (useCasRef()) {
             final ProtoWriter w = new ProtoWriter()
                     .varintField(21, 1080)
                     .varintField(34, 1);
@@ -677,11 +693,13 @@ public final class SabrSession {
         // Beim ERSTEN Request den gesendeten client_abr_state zeigen — ohne diesen
         // Beleg waere ein Negativbefund wertlos (man wuesste nicht, ob der volle
         // Zustand ueberhaupt rausging).
-        if (requestNo == 0 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
+        if (requestNo == 0 && TRACE) {
             final StringBuilder h = new StringBuilder();
             for (byte b : cas) h.append(String.format("%02x", b));
             System.out.println("[Sabr] client_abr_state len=" + cas.length
-                    + " full=" + "1".equals(System.getenv("YT_SABR_CAS_FULL")) + " hex=" + h);
+                    + " form=" + (useCasRef() ? "ref"
+                    : "1".equals(System.getenv("YT_SABR_CAS_FULL")) ? "full" : "legacy")
+                    + " hex=" + h);
         }
         final ProtoWriter req = new ProtoWriter();
         req.bytesField(1, cas);
@@ -707,8 +725,8 @@ public final class SabrSession {
         // Feld 4 schickt der echte Web-Player NICHT (die Spielzeit steht im
         // client_abr_state, Feld 28). Im vollen Modus lassen wir es weg, damit
         // die Anfrage der mitgeschnittenen Form entspricht.
-        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL"))
-                && !"1".equals(System.getenv("YT_SABR_CAS_REF"))) req.varintField(4, playerTimeMs);
+        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL")) && !useCasRef())
+            req.varintField(4, playerTimeMs);
         // ⚠️ Feld-Reihenfolge AUFSTEIGEND (1,2,3,5,16,17,19) — so serialisiert die
         // Referenz-Implementierung. Wir schickten 16/17 VOR 5. Semantisch ist die
         // Reihenfolge in protobuf egal, auf dem Draht aber nicht: nach dem
@@ -748,7 +766,9 @@ public final class SabrSession {
         // Die ERSTEN ZWEI Runden dumpen. Runde 0 ist auf beiden Seiten unauffaellig
         // (belegt 2026-07-30: die Bytes der Referenz geben per curl ebenfalls nur
         // 104B) — die Referenz gewinnt erst in Runde 2. Genau die braucht der Diff.
-        if (requestNo <= 1 && "1".equals(System.getenv("YT_SABR_TRACE"))) {
+        // ⚠️ EIGENER Schalter, nicht YT_SABR_TRACE: seit der WEB-Pfad Default ist,
+        // liefe sonst pro Session zweimal ein ~2 KB-Hexdump ins Produktionslog.
+        if (requestNo <= 1 && "1".equals(System.getenv("YT_SABR_REQHEX"))) {
             final StringBuilder fh = new StringBuilder();
             for (byte b : out) fh.append(String.format("%02x", b));
             System.out.println("[Sabr] REQ-HEX#" + requestNo + " len=" + out.length + " " + fh);
@@ -954,14 +974,17 @@ public final class SabrSession {
                 "Accept-Encoding", "identity",
                 "Accept", "application/vnd.yt-ump",
                 "User-Agent", userAgent));
-        // ⚠️ Origin/Referer kamen 2026-07-25 dazu („ohne sie 403"). Mit dem seither
-        // fehlenden `Accept: application/vnd.yt-ump` war das aber eine Messung
-        // unter falscher Voraussetzung. Die Referenz-Implementierung, die Medien
-        // bekommt, schickt WEDER Origin NOCH Referer NOCH einen Browser-UA —
-        // nur content-type, accept-encoding und accept. `YT_SABR_NO_ORIGIN=1`
-        // testet das (eine Variable).
+        // ⚠️ KEIN Origin/Referer — das ist die Voraussetzung dafuer, dass der
+        // WEB-Pfad ueberhaupt laeuft. Sie kamen 2026-07-25 dazu („ohne sie 403"),
+        // aber das war eine Messung ohne den damals fehlenden
+        // `Accept: application/vnd.yt-ump`. Umgekehrt belegt: MIT Origin/Referer
+        // antwortet googlevideo dem WEB-Client auf BEIDEN Egress-Familien mit
+        // 403 (zuletzt reproduziert 2026-07-30 beim Umstellen auf WEB-Default),
+        // ohne sie liefert er Medien — jeder erfolgreiche WEB-Lauf des Tages
+        // lief ohne. Die Referenz-Implementierung schickt sie ebenfalls nicht.
+        // `YT_SABR_ORIGIN=1` stellt sie fuer Vergleichsmessungen wieder her.
         if (userAgent != null && userAgent.startsWith("Mozilla/")
-                && !"1".equals(System.getenv("YT_SABR_NO_ORIGIN"))) {
+                && "1".equals(System.getenv("YT_SABR_ORIGIN"))) {
             headers.put("Origin", "https://www.youtube.com");
             headers.put("Referer", "https://www.youtube.com/");
         }

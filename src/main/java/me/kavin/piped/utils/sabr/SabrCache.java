@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /// SABR serving layer (Baustein 4). Backs /sabr/<videoId>/<itag>: on first hit
 /// for a videoId it runs ONE SabrSession (download-once), writes the reassembled
@@ -211,6 +212,67 @@ public final class SabrCache {
         return "1".equals(System.getenv("YT_SABR_PACED"));
     }
 
+    /// Client-Stufe der SABR-Leiter. DEFAULT = 3 (WEB) seit 2026-07-30.
+    ///
+    /// Begruendung (belegt, nicht vermutet): fuer den WEB-Client liefert YouTube
+    /// zu Made-for-Kids-Videos GAR KEINE direkten Segment-URLs mehr (gemessen:
+    /// 30 adaptiveFormats, 0 davon mit `url`, nur `serverAbrStreamingUrl`) — der
+    /// Browser spielt sie ausschliesslich ueber SABR. Unsere Direkt-URLs kommen
+    /// aus ANDROID_VR/WebEmbed, und genau die sterben im Drosselfenster mit 403.
+    /// Der ANDROID-SABR-Pfad wiederum laeuft nach ~67 s in die Attestierung
+    /// (STREAM_PROTECTION_STATUS 2->3, ~13 MB). Der WEB-Pfad laeuft seit den
+    /// Fixes „Policy-Taktung" + „ehrliche buffered_ranges" durch: erster
+    /// KOMPLETT-Download eines Kids-Videos (735/735 Segmente, 662 MB, prot=1).
+    /// `YT_SABR_CLIENT=0` stellt den alten ANDROID-Default wieder her.
+    private static final int DEFAULT_CLIENT = defaultClient();
+
+    private static int defaultClient() {
+        final String v = System.getenv("YT_SABR_CLIENT");
+        if (v == null || v.isBlank()) return 3;
+        try { return Integer.parseInt(v.trim()); }
+        catch (NumberFormatException e) { return 3; }
+    }
+
+    /// WEB-Sperr-Memo (analog `KNOWN_THROTTLED` im Direktpfad). Wenn der
+    /// WEB-Rung auf BEIDEN Egress-Familien hart 403t, ist das googlevideos
+    /// Tagesfenster-Zustand und gilt fuer ALLE Videos — gemessen 2026-07-30:
+    /// dasselbe Kontrollvideo lief 25 min vorher ueber WEB komplett durch.
+    /// Ohne Memo kostet jeder Tap in einem geschlossenen Fenster zwei
+    /// vergebliche Sessions inklusive Player-Call und Resolve-Slot (die
+    /// Slot-Oekonomie hat nur zwei Plaetze — s. 503-Schleife). Selbstheilend
+    /// per TTL. Kill-Switch `YT_SABR_WEB_MEMO=0`.
+    private static final AtomicLong WEB_BLOCKED_UNTIL = new AtomicLong(0);
+    private static final long WEB_MEMO_TTL_MS = 10 * 60 * 1000L;
+
+    private static boolean webBlocked() {
+        return !"0".equals(System.getenv("YT_SABR_WEB_MEMO"))
+                && WEB_BLOCKED_UNTIL.get() > System.currentTimeMillis();
+    }
+
+    /// EINE Client-Stufe ueber beide Egress-Familien: Versuch auf der aktiven
+    /// Familie, bei Fehlschlag/0 Segmenten einmal auf der anderen (resolve +
+    /// Session sind familien-gepinnt, gvs-URLs sind IP-signiert). Es gewinnt der
+    /// Versuch mit mehr Segmenten; keep-larger-publish sorgt dafuer, dass ein
+    /// schwaecherer Versuch einen besseren Cache nie ueberschreibt.
+    private static SabrHandlers.SabrMedia attemptBothFamilies(String videoId, String fam1, int clientMode) {
+        SabrHandlers.SabrMedia r = attempt(videoId, fam1, false, clientMode);
+        if (r != null && !(!r.complete()
+                && ("SABR_ERROR".equals(r.stopReason()) || r.segments() == 0)))
+            return r;
+        final String fam2 = me.kavin.piped.utils.EgressManager.otherFamily();
+        if (fam2.equals(fam1)) return r;
+        System.out.println("[SabrCache] " + videoId + " attempt on " + fam1
+                + (r == null ? " threw" : " " + r.stopReason() + " (segs=" + r.segments() + ")")
+                + " -> family-retry on " + fam2);
+        final SabrHandlers.SabrMedia r2 = attempt(videoId, fam2, false, clientMode);
+        if (r2 != null && (r == null || r2.segments() > r.segments())) {
+            System.out.println("[SabrCache] " + videoId + " family-retry " + fam2
+                    + " won (segs=" + r2.segments() + " complete=" + r2.complete() + ")");
+            return r2;
+        }
+        return r;
+    }
+
     private static void download(String videoId, boolean allowPacedRequested) throws Exception {
         final boolean allowPaced = allowPacedRequested && pacedEnabled();
         // Known capped (kids): burst rungs are wasted requests — refill goes
@@ -221,34 +283,39 @@ public final class SabrCache {
             final String fam = me.kavin.piped.utils.EgressManager.activeEgress();
             System.out.println("[SabrCache] " + videoId + " cap-marked -> paced 1x refill on " + fam);
             final long before = cachedBytes(videoId);
-            final SabrHandlers.SabrMedia rp = attempt(videoId, fam, true, 0, true);
+            final SabrHandlers.SabrMedia rp = attempt(videoId, fam, true, DEFAULT_CLIENT, true);
             finishPaced(videoId, rp, before);
             return;
         }
-        // Attempt 1 on the global ACTIVE egress family. If the session dies with
-        // SABR_ERROR or produced nothing (googlevideo hard-403 on that family —
-        // seen 2026-07-23 on made-for-kids content during a storm), retry ONCE on
-        // the other family: resolve + session are family-pinned together (gvs
-        // URLs are IP-signed). Whichever attempt wrote more survives (keep-larger
-        // publish), so a refill can never regress an existing partial cache.
+        // Stufe 1: der Default-Client (WEB) ueber beide Egress-Familien —
+        // uebersprungen, solange das WEB-Memo steht (s. WEB_BLOCKED_UNTIL).
         final String fam1 = me.kavin.piped.utils.EgressManager.activeEgress();
-        SabrHandlers.SabrMedia result = attempt(videoId, fam1, false, 0);
-        if (result == null || (!result.complete()
-                && ("SABR_ERROR".equals(result.stopReason()) || result.segments() == 0))) {
-            final String fam2 = me.kavin.piped.utils.EgressManager.otherFamily();
-            if (!fam2.equals(fam1)) {
-                System.out.println("[SabrCache] " + videoId + " attempt on " + fam1
-                        + (result == null ? " threw" : " " + result.stopReason()
-                        + " (segs=" + result.segments() + ")")
-                        + " -> family-retry on " + fam2);
-                final SabrHandlers.SabrMedia r2 = attempt(videoId, fam2, false, 0);
-                if (r2 != null && (result == null || r2.segments() > result.segments())) {
-                    result = r2;
-                    System.out.println("[SabrCache] " + videoId + " family-retry " + fam2
-                            + " won (segs=" + r2.segments() + " complete=" + r2.complete() + ")");
-                }
+        final boolean skipWeb = DEFAULT_CLIENT != 0 && webBlocked();
+        if (skipWeb)
+            System.out.println("[SabrCache] " + videoId
+                    + " WEB-Memo aktiv -> direkt ANDROID (spart 2 Fehlversuche)");
+        int usedClient = skipWeb ? 0 : DEFAULT_CLIENT;
+        SabrHandlers.SabrMedia result = attemptBothFamilies(videoId, fam1, usedClient);
+        // Stufe 2: Client-Rueckfall auf ANDROID. Es gab Fenster (2026-07-30
+        // abends), in denen der WEB-Pfad auf BEIDEN Familien hart 403te, waehrend
+        // ANDROID noch seine ~13 MB holte. Ein Teil-Cache ist besser als keiner,
+        // also die alte Stufe nachziehen, wenn WEB gar nichts gebracht hat.
+        if (!skipWeb && DEFAULT_CLIENT != 0 && (result == null || result.segments() == 0)) {
+            // Beide Familien ohne ein einziges Segment = Fenster zu, nicht
+            // video-spezifisch -> Memo setzen, damit die naechsten Taps direkt
+            // auf ANDROID gehen.
+            WEB_BLOCKED_UNTIL.set(System.currentTimeMillis() + WEB_MEMO_TTL_MS);
+            System.out.println("[SabrCache] " + videoId + " client=" + DEFAULT_CLIENT
+                    + " brachte nichts -> Rueckfall auf ANDROID (WEB-Memo 10min gesetzt)");
+            final SabrHandlers.SabrMedia rA = attemptBothFamilies(videoId, fam1, 0);
+            if (rA != null && (result == null || rA.segments() > result.segments())) {
+                result = rA;
+                usedClient = 0;
+                System.out.println("[SabrCache] " + videoId + " ANDROID-Rueckfall gewann (segs="
+                        + rA.segments() + " complete=" + rA.complete() + ")");
             }
-        } else if (!result.complete() && result.stopReason() != null
+        }
+        if (result != null && !result.complete() && result.stopReason() != null
                 && result.stopReason().startsWith("stuck")) {
             // Readahead-cap signature: data flowed, then the server stopped
             // sending despite advancing player_time — the visitorData-bound
@@ -256,7 +323,7 @@ public final class SabrCache {
             // this). Retry with a videoId-CONTENT-BOUND token, same family.
             System.out.println("[SabrCache] " + videoId + " capped at segs="
                     + result.segments() + " -> content-bound-token retry");
-            final SabrHandlers.SabrMedia r3 = attempt(videoId, fam1, true, 0);
+            final SabrHandlers.SabrMedia r3 = attempt(videoId, fam1, true, usedClient);
             if (r3 != null && r3.segments() > result.segments()) {
                 result = r3;
                 System.out.println("[SabrCache] " + videoId + " content-bound retry won"
@@ -277,7 +344,7 @@ public final class SabrCache {
                 CAPPED_MARKS.put(videoId, System.currentTimeMillis() + CAP_MARK_TTL_MS);
                 if (allowPaced) {
                     final long before = cachedBytes(videoId);
-                    final SabrHandlers.SabrMedia rp = attempt(videoId, fam1, true, 0, true);
+                    final SabrHandlers.SabrMedia rp = attempt(videoId, fam1, true, usedClient, true);
                     if (rp != null && rp.segments() > result.segments()) result = rp;
                     finishPaced(videoId, rp, before);
                 }

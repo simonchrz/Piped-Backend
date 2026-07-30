@@ -264,6 +264,8 @@ public final class SabrHandlers {
         // content-bound po_token minten und die Session damit fortsetzen
         // (s. SabrSession — das war die vermeintliche Kids-Readahead-Sperre).
         session.setFormatCandidates(candA, candV);
+        // WEB braucht die Referenz-Form des client_abr_state (s. SabrSession).
+        session.setWebClient(pureWeb);
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
@@ -276,7 +278,12 @@ public final class SabrHandlers {
                     final PoTokenResult p2 = bg.sabrSessionPoToken();
                     if (p2 != null) attest = p2.playerRequestPoToken;
                 }
-                final JsonNode p = webClient
+                // ⚠️ Derselbe Client wie die laufende Session — eine Erneuerung
+                // mit einem ANDEREN Client waere genau die Client<->Token-
+                // Zwickmuehle, die uns Tage gekostet hat. `pureWeb` fehlte hier.
+                final JsonNode p = pureWeb
+                        ? webPlayer(videoId, visitorForRenewal, family, attest)
+                        : webClient
                         ? webEmbedPlayer(videoId, visitorForRenewal, family, attest)
                         : androidPlayer(videoId, visitorForRenewal, family, attest, vrClient);
                 final JsonNode sd2 = p.path("streamingData");
