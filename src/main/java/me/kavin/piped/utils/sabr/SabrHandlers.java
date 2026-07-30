@@ -226,6 +226,38 @@ public final class SabrHandlers {
             }
             System.out.println("[Sabr] " + videoId + " abrUrl-Params:" + names);
         }
+        // YT_SABR_DUMP=<pfad>: die Session-EINGABEN als JSON ablegen. Damit laesst
+        // sich EXAKT dieselbe Session von der Referenz-Implementierung
+        // (LuanRT/googlevideo) fahren — gleiche abrUrl, gleicher ustreamerConfig,
+        // gleicher Token, gleiche Formate. Liefert die Referenz Medien und wir
+        // nicht, liegt der Unterschied nachweislich in UNSEREM Request-Aufbau;
+        // liefert sie ebenfalls nichts, liegt er in den Eingaben. Das ist der
+        // Diff, den fuenf geratene Hypothesen nicht ersetzen konnten.
+        final String dumpPath = System.getenv("YT_SABR_DUMP");
+        if (dumpPath != null && !dumpPath.isEmpty()) {
+            try {
+                final var on = Constants.mapper.createObjectNode();
+                on.put("videoId", videoId);
+                on.put("abrUrl", abrUrlN);
+                on.put("ustreamerConfig", ustB64);
+                on.put("poToken", poToken == null ? null
+                        : java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(poToken));
+                on.put("clientName", pureWeb ? 1 : webClient ? 56 : vrClient ? 28 : 3);
+                on.put("clientVersion", pureWeb ? WEB_VERSION
+                        : webClient ? WEB_EMBEDDED_VERSION : vrClient ? "1.62.27" : "20.10.38");
+                on.put("userAgent", ua);
+                on.put("audioItag", pa.itag); on.put("audioLmt", pa.lmt);
+                on.put("videoItag", pv.itag); on.put("videoLmt", pv.lmt);
+                // Die vollstaendigen adaptiveFormats mitgeben — die Formatwahl der
+                // Referenz braucht Breite/Hoehe/Bitrate/qualityLabel, nicht nur itag.
+                on.set("adaptiveFormats", sd.path("adaptiveFormats").deepCopy());
+                java.nio.file.Files.writeString(java.nio.file.Path.of(dumpPath),
+                        Constants.mapper.writerWithDefaultPrettyPrinter().writeValueAsString(on));
+                System.out.println("[Sabr] " + videoId + " Session-Eingaben -> " + dumpPath);
+            } catch (Exception e) {
+                System.out.println("[Sabr] dump fehlgeschlagen: " + e);
+            }
+        }
         final SabrSession sessionTmp = null;
         final SabrSession session = new SabrSession(abrUrlN, b64(ustB64), pa, pv, clientInfo, ua, poToken, family);
         // Re-Attest-Hook: bei STREAM_PROTECTION_STATUS=3 einen FRISCHEN
