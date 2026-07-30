@@ -565,14 +565,20 @@ public final class SabrSession {
         // Wunschpaar ausging -> Cache-Dateien _249/_396, angefragt wurde _137
         // -> Dauer-500 auf /synth-hls. Fuer das WEB-Experiment brachte die
         // Kandidatenliste ohnehin nichts (unveraendert 11B-Antworten).
-        req.bytesField(16, formatId(prefAudio));
-        req.bytesField(17, formatId(prefVideo));
+
         // Feld 4 schickt der echte Web-Player NICHT (die Spielzeit steht im
         // client_abr_state, Feld 28). Im vollen Modus lassen wir es weg, damit
         // die Anfrage der mitgeschnittenen Form entspricht.
         if (!"1".equals(System.getenv("YT_SABR_CAS_FULL"))
                 && !"1".equals(System.getenv("YT_SABR_CAS_REF"))) req.varintField(4, playerTimeMs);
+        // ⚠️ Feld-Reihenfolge AUFSTEIGEND (1,2,3,5,16,17,19) — so serialisiert die
+        // Referenz-Implementierung. Wir schickten 16/17 VOR 5. Semantisch ist die
+        // Reihenfolge in protobuf egal, auf dem Draht aber nicht: nach dem
+        // Runde-2-Diff (2026-07-30) war das bei identischer Gesamtlaenge (2004 B)
+        // der EINZIGE verbleibende Unterschied zur Referenz.
         req.bytesField(5, ustreamerConfig);
+        req.bytesField(16, formatId(prefAudio));
+        req.bytesField(17, formatId(prefVideo));
         // streamerContext: client_info(1), po_token(2), playback_cookie(3).
         // po_token authorizes the gvs streaming session — without it googlevideo
         // caps the readahead at ~one buffer window (~60s) then stops sending.
