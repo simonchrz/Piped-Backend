@@ -214,6 +214,12 @@ public final class SparseStore {
 
     private static final Map<String, Long> TOTAL_LEN = new ConcurrentHashMap<>();
     private static final Map<String, Integer> TOTAL_SEGS = new ConcurrentHashMap<>();
+    private static final Map<String, Long> TOTAL_DUR_MS = new ConcurrentHashMap<>();
+
+    /// Gesamtdauer laut sidx in Millisekunden; 0 = unbekannt.
+    public static long cachedDurationMs(String videoId, int itag) {
+        return TOTAL_DUR_MS.getOrDefault(key(videoId, itag), 0L);
+    }
 
     /// Byte-Position eines Segments; -1 wenn (noch) unbekannt.
     public static long offsetOf(String videoId, int itag, int seq) {
@@ -275,6 +281,9 @@ public final class SparseStore {
         OFFSETS.put(key(videoId, itag), offs);
         TOTAL_LEN.put(key(videoId, itag), cursor);
         TOTAL_SEGS.put(key(videoId, itag), entries.size());
+        long ticks = 0;
+        for (long[] e : entries) ticks += e[1];
+        TOTAL_DUR_MS.put(key(videoId, itag), ticks * 1000L / Math.max(1, lastTimescale));
         // ⚠️ HIER NICHT persistieren: persist() liest present(), und present()
         // ruft (bei fehlender Karte) die Ableitung, die wieder hierher fuehrt.
         // ConcurrentHashMap bricht so eine rekursive Aktualisierung ab, der
@@ -285,12 +294,18 @@ public final class SparseStore {
     }
 
     /// {groesse, dauerTicks} je Eintrag aus dem sidx.
+    /// Zeitskala des zuletzt gelesenen sidx (Ticks pro Sekunde).
+    private static long lastTimescale = 1000;
+
     private static List<long[]> parseSidxEntries(byte[] b, int sidxStart, int sidxSize) {
         final List<long[]> out = new ArrayList<>();
         try {
             int p = sidxStart + 8;                       // size+type
             final int version = b[p] & 0xff;
             p += 4;                                      // version+flags
+            final long timescale = ((b[p + 4] & 0xffL) << 24) | ((b[p + 5] & 0xffL) << 16)
+                    | ((b[p + 6] & 0xffL) << 8) | (b[p + 7] & 0xffL);
+            lastTimescale = timescale > 0 ? timescale : 1000;
             p += 8;                                      // reference_ID + timescale
             p += version == 0 ? 8 : 16;                  // earliest_pts + first_offset
             p += 2;                                      // reserved

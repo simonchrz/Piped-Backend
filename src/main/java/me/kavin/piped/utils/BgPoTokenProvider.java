@@ -98,6 +98,21 @@ public class BgPoTokenProvider implements PoTokenProvider {
             matcher = Pattern.compile("visitorData\":\"([\\w%-]+)\"").matcher(anon);
         }
 
+        // Konto-Kennung mitlesen: bei ANGEMELDETEN Sitzungen bindet YouTube den
+        // Player-Token daran, nicht an die Besucherkennung (yt-dlp-Wiki:
+        // "If logged in, use datasync ID for player tokens"). Format
+        // "ID1||ID2" — gebunden wird an ID1.
+        final java.util.regex.Matcher dsm =
+                Pattern.compile("\"(?:DATASYNC_ID|datasyncId)\"\\s*:\\s*\"([^\"|]+)").matcher(html);
+        if (dsm.find()) {
+            final String ds = dsm.group(1);
+            if (!ds.equals(datasyncId)) {
+                datasyncId = ds;
+                System.out.println("[Piped/Bg] Konto-Kennung (datasyncId) erkannt: "
+                        + ds.substring(0, Math.min(8, ds.length())) + "…");
+            }
+        }
+
         if (matcher.find()) {
             final String vd = matcher.group(1);
             if (!visitorLogged) {
@@ -113,6 +128,10 @@ public class BgPoTokenProvider implements PoTokenProvider {
     }
 
     private volatile boolean visitorLogged = false;
+
+    /// Konto-Kennung der angemeldeten Sitzung (leer = anonym).
+    private volatile String datasyncId = null;
+    public @Nullable String datasyncId() { return datasyncId; }
 
     /// Login-Cookies als Header-Zeile (Netscape-Format wie yt-dlp sie schreibt).
     private static String loadCookieHeader() {
@@ -236,10 +255,22 @@ public class BgPoTokenProvider implements PoTokenProvider {
 
     private PoTokenResult createWebClientPoToken() throws Exception {
         String visitorDate = getWebVisitorData();
-        System.out.println("[Piped/Bg] /get_pot POST content_binding length=" + visitorDate.length());
+        // ⚠️ ANGEMELDET wird an die KONTO-Kennung gebunden, nicht an die
+        // Besucherkennung. Genau das macht ein eingeloggter Browser — und genau
+        // diese Paarung fehlte uns: wir haben angemeldet gestreamt, aber einen
+        // Token vorgezeigt, der auf einen anonymen Besucher ausgestellt war.
+        // Der Server duldet so etwas nur ~1–2 MB ("Attestierung erforderlich",
+        // STREAM_PROTECTION_STATUS 2→3) — das sind die 40–60 s, nach denen
+        // Kids-Videos abbrechen. Kill-Switch: POTOKEN_BIND_DATASYNC=0.
+        final String binding = (datasyncId != null
+                && !"0".equals(env("POTOKEN_BIND_DATASYNC")))
+                ? datasyncId : visitorDate;
+        System.out.println("[Piped/Bg] /get_pot POST content_binding=" 
+                + (binding == datasyncId ? "datasyncId" : "visitorData")
+                + " length=" + binding.length());
         // Brainicism's bgutil-pot-server: POST /get_pot mit content_binding (volle visitorData ok)
         String poToken = ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST", mapper.writeValueAsBytes(mapper.createObjectNode().put(
-                "content_binding", visitorDate
+                "content_binding", binding
         )), Map.of(
                 "Content-Type", "application/json"
         )).thenApply(response -> {

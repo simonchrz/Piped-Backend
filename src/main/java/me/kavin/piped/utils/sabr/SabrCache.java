@@ -282,9 +282,13 @@ public final class SabrCache {
             final int total = SparseStore.cachedTotal(videoId, itag);
             final long lmt = SparseStore.cachedLmt(videoId, itag);
             if (lastSeq <= 0 || total <= 0 || lmt <= 0 || lastSeq >= total) continue;
-            // Dauer schaetzen wir nicht — sie steckt in FORMAT_INIT; hier zaehlt
-            // nur, ab WO weitergemacht wird.
-            out.put(itag, new SabrSession.Resume(lastSeq, 0, total, 0, lmt));
+            // ⚠️ MIT Zeitbasis. Ohne totalDurationMs ist perSegMs()=0, damit
+            // bleibt die Spielzeit bei 0 — und der Server schickt das Video
+            // WIEDER VON VORN (gemessen: 3,4 MB pro Runde, new=0, Sitzung
+            // meldet "stuck", obwohl 12 Segmente laengst da sind).
+            final long durMs = SparseStore.cachedDurationMs(videoId, itag);
+            final long perSeg = total > 0 ? durMs / total : 0;
+            out.put(itag, new SabrSession.Resume(lastSeq, perSeg * lastSeq, total, durMs, lmt));
         }
         return out;
     }
