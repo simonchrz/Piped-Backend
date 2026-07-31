@@ -278,7 +278,17 @@ public class SynthHlsHandlers {
     /// (Route → 5xx), damit der Client es erneut versuchen kann.
     /// ⚠️ Diese Wartezeit haelt einen der nur ZWEI Resolve-Slots — kurz halten,
     /// sonst hungern parallele Taps/Segmentabrufe aus (503 → -16849).
-    private static final int SABR_PLAYLIST_WAIT_MS = 3_000;
+    /// Wie lange der Playlist-Bau auf brauchbare SABR-Daten wartet.
+    ///
+    /// ⚠️ 3 s waren zu knapp und kosteten den ERSTEN Tap: gemessen 2026-07-31
+    /// gab der Bau um 12:01:22,048 auf ("sabr cache not usable yet") — die
+    /// Offset-Tabelle lag um 12:01:23,253 vor, also 1,2 s SPAETER. In der App
+    /// war das ein HTTP 500 (`-1008` / `-16847`), und der zweite Versuch lief
+    /// sauber. Eine kalte SABR-Leiter braucht Player-Aufruf plus erste Runde,
+    /// bei Drosselung zusaetzlich die Client-Stufen — das sind Sekunden, keine
+    /// Millisekunden. Warten kostet hier nichts: der Resolve-Slot ist zu Beginn
+    /// von sabrStreamPlaylist bereits freigegeben.
+    private static final int SABR_PLAYLIST_WAIT_MS = 15_000;
 
     /// Vom Route-Layer gesetzt: gibt den YT-Resolve-Slot FRÜH frei, sobald der
     /// Request nur noch auf LOKALE SABR-Daten wartet.
