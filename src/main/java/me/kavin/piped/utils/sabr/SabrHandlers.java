@@ -180,6 +180,24 @@ public final class SabrHandlers {
                         + " content-bound mint failed -> keeping visitor-bound token");
             }
         }
+        // ⚠️ ÜBERSTEUERUNG fuer den Attestierungs-Test: Token UND Sitzungskennung
+        // stammen dann aus einer echten Browser-Sitzung (pot-browser/capture-pot.js
+        // praegt sie mit unseren Cookies in einem headless Chromium). Genau diese
+        // Paarung fehlt uns sonst — unser Token kommt aus dem bgutil-Container mit
+        // EIGENER BotGuard-Sitzung, und YouTube duldet den fremden Ausweis nur
+        // ~1-2 MB (STREAM_PROTECTION_STATUS 2->3 bei ~61 s).
+        final String potOverride = System.getenv("YT_SABR_POT_B64");
+        if (potOverride != null && !potOverride.isBlank()) {
+            try {
+                poToken = java.util.Base64.getDecoder().decode(potOverride.trim());
+            } catch (IllegalArgumentException e) {
+                poToken = java.util.Base64.getUrlDecoder().decode(potOverride.trim());
+            }
+            final String visitorOverride = System.getenv("YT_SABR_VISITOR");
+            if (visitorOverride != null && !visitorOverride.isBlank()) visitorData = visitorOverride;
+            System.out.println("[Sabr] " + videoId + " ÜBERSTEUERT: Browser-Token "
+                    + poToken.length + "B + zugehoerige Sitzungskennung");
+        }
         System.out.println("[Sabr] " + videoId + " runSession poToken="
                 + (poToken != null ? poToken.length + "B" : "NONE")
                 + (contentBoundToken ? " (content-bound)" : "")
@@ -195,14 +213,29 @@ public final class SabrHandlers {
             final PoTokenResult p3 = bg.sabrSessionPoToken();
             if (p3 != null) attestationPoToken = p3.playerRequestPoToken;
         }
+        // ⚠️ VOLLES SITZUNGS-TRANSPLANTAT (Test): abrUrl + ustreamerConfig aus
+        // der Browser-Sitzung uebernehmen. Die Duldungsgrenze liegt immer bei
+        // exakt 61,1 s / 12 Segmenten — unabhaengig vom Token. Das deutet darauf
+        // hin, dass sie an der SITZUNG haengt, und die entsteht im Player-Aufruf.
+        final String abrOverride = System.getenv("YT_SABR_ABRURL");
+        final String ustOverride = System.getenv("YT_SABR_UST");
+        final boolean transplant = abrOverride != null && !abrOverride.isBlank()
+                && ustOverride != null && !ustOverride.isBlank();
+
         final JsonNode player = pureWeb
                 ? webPlayer(videoId, visitorData, family, attestationPoToken)
                 : webClient
                 ? webEmbedPlayer(videoId, visitorData, family, attestationPoToken)
                 : androidPlayer(videoId, visitorData, family, attestationPoToken, vrClient);
         final JsonNode sd = player.path("streamingData");
-        final String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
-        final String ustB64 = findFirst(player, "videoPlaybackUstreamerConfig");
+        String abrUrl = sd.path("serverAbrStreamingUrl").asText(null);
+        String ustB64 = findFirst(player, "videoPlaybackUstreamerConfig");
+        if (transplant) {
+            abrUrl = abrOverride.trim();
+            ustB64 = ustOverride.trim();
+            System.out.println("[Sabr] " + videoId + " SITZUNGS-TRANSPLANTAT: abrUrl "
+                    + abrUrl.length() + " Zeichen, ustreamerConfig " + ustB64.length() + " Zeichen");
+        }
         if (abrUrl == null || ustB64 == null) {
             throw new IllegalStateException("video " + videoId + " has no SABR streaming url "
                     + "(status=" + player.path("playabilityStatus").path("status").asText() + ")");

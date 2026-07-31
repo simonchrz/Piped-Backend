@@ -837,7 +837,10 @@ public final class SabrSession {
         //   35 playback_rate     = 1.0f     (wir: nie gesetzt, brauchte fixed32)
         // Unsere bisherige Form (28 + 40) enthaelt dagegen zwei Felder, die die
         // Referenz gar nicht sendet. Ab Runde 2 kommt die Spielzeit dazu.
-        if (useCasRef()) {
+        // ⚠️ Ausdrueckliche Vollform hat Vorrang — sonst gewinnt fuer WEB immer
+        // die Referenz-Form und der Schalter waere wirkungslos (genau so
+        // passiert: Log zeigte weiter "form=ref len=18").
+        if (!"1".equals(System.getenv("YT_SABR_CAS_FULL")) && useCasRef()) {
             final ProtoWriter w = new ProtoWriter()
                     .varintField(21, 1080)
                     .varintField(34, 1);
@@ -853,22 +856,31 @@ public final class SabrSession {
         // die uns beim Kids-Cap schon einmal fehlgeleitet hat).
         long buffered = 0;
         for (FState s : states.values()) buffered = Math.max(buffered, s.bufferedMs);
+        // Werte aus einem FRISCHEN Browser-Mitschnitt (2026-07-31, Chrome-
+        // Erweiterung, laufende Wiedergabe desselben Kids-Videos). Der echte
+        // Player sendet 18 Felder / 102 B; wir kamen mit 3 Feldern / 13 B.
+        // Feldnummern und Groessenordnungen 1:1 uebernommen — nur die
+        // zeitabhaengigen Werte setzen wir aus dem echten Sitzungsverlauf.
+        // ⚠️ Feld 79 (`playback_authorization`, 18 B) und Feld 72 (14 B) sendet
+        // der Browser ebenfalls; ihr INHALT ist sitzungsgebunden und liesse
+        // sich nicht sinnvoll kopieren — sie bleiben deshalb weg.
         return new ProtoWriter()
-                .varintField(18, 2072)          // client_viewport_width
-                .varintField(19, 1166)          // client_viewport_height
+                .varintField(18, 2084)          // client_viewport_width
+                .varintField(19, 1172)          // client_viewport_height
                 .varintField(21, 0)             // sticky_resolution
-                .varintField(23, 13335011)      // bandwidth_estimate (B/s)
+                .varintField(23, 3221101)       // bandwidth_estimate (B/s)
                 .varintField(28, playerTimeMs)  // player_time_ms
                 .varintField(29, buffered)      // time_since_last_seek
                 .varintField(34, 0)             // visibility
                 .varintField(36, wall)          // elapsed_wall_time_ms
                 .varintField(39, wall)          // time_since_last_action_ms
                 .varintField(46, 1)             // drc_enabled
-                .varintField(57, 78)            // field57
+                .varintField(57, 162)           // field57
                 .varintField(58, 0)             // prefer_vp9
                 .varintField(59, 8192)          // av1_quality_threshold
-                .varintField(68, 2383)          // sabr_force_max_network_interruption_duration_ms
-                .varintField(76, 0)             // enable_voice_boost
+                .varintField(68, 7631)          // sabr_force_max_network_interruption_duration_ms
+                .varintField(71, 1)             // field71 (Browser: 1)
+                .varintField(85, 1)             // field85 (Browser: 1)
                 .toByteArray();
     }
 
