@@ -253,6 +253,66 @@ public class BgPoTokenProvider implements PoTokenProvider {
         return poToken;
     }
 
+    /// Holt die BotGuard-Aufgabe in UNSEREM Namen (angemeldet) statt sie den
+    /// Provider anonym besorgen zu lassen.
+    ///
+    /// Der bgutil-Container ruft sonst selbst `/att/get` auf — ohne unsere
+    /// Cookies (sein Log sagt woertlich "Using challenge from /att/get"). Das
+    /// Token beantwortet dann die Frage an einen fremden Besucher. Mit unseren
+    /// Cookies stellt YouTube die Aufgabe UNSERER Sitzung (HTTP 200 mit
+    /// `challenge` + `bgChallenge`), und der Provider loest genau die.
+    ///
+    /// ⚠️ Dem Provider das `bgChallenge`-OBJEKT geben, nicht die verschluesselte
+    /// Zeichenkette daneben — sonst scheitert er an
+    /// "Cannot destructure property privateDoNotAccessOrElseTrustedResourceUrlWrappedValue".
+    /// ⚠️ Das bricht NICHT den 60-Sekunden-Cap bei Made-for-Kids (sechs Ansaetze
+    /// gemessen, alle wirkungslos) — es ist die korrekte Identitaet, kein
+    /// Freifahrtschein. Kill-Switch: POTOKEN_OWN_CHALLENGE=0.
+    private @Nullable com.fasterxml.jackson.databind.JsonNode fetchOwnChallenge(String visitorData) {
+        if ("0".equals(env("POTOKEN_OWN_CHALLENGE"))) return null;
+        try {
+            final var client = mapper.createObjectNode();
+            client.put("clientName", "WEB").put("clientVersion", WEB_CLIENT_VERSION)
+                    .put("visitorData", visitorData).put("hl", "de").put("gl", "DE");
+            final var ctx = mapper.createObjectNode();
+            ctx.set("client", client);
+            final var body = mapper.createObjectNode();
+            body.put("engagementType", "ENGAGEMENT_TYPE_UNBOUND");
+            body.set("context", ctx);
+
+            final java.util.Map<String, String> headers = new java.util.HashMap<>(java.util.Map.of(
+                    "Content-Type", "application/json",
+                    "User-Agent", me.kavin.piped.consts.Constants.USER_AGENT,
+                    "X-Goog-Visitor-Id", visitorData,
+                    "X-Youtube-Client-Name", "1",
+                    "X-Youtube-Client-Version", WEB_CLIENT_VERSION,
+                    "Origin", "https://www.youtube.com"));
+            final String cookies = loadCookieHeader();
+            if (cookies != null) headers.put("Cookie", cookies);
+
+            final var resp = ReqwestUtils.fetch(
+                    "https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false",
+                    "POST", mapper.writeValueAsBytes(body), headers).get(20, TimeUnit.SECONDS);
+            if (resp.status() / 100 != 2) {
+                System.out.println("[Piped/Bg] att/get HTTP " + resp.status() + " -> ohne eigene Aufgabe");
+                return null;
+            }
+            final var json = mapper.readTree(resp.body());
+            final var bg = json.get("bgChallenge");
+            if (bg == null || bg.isNull()) {
+                System.out.println("[Piped/Bg] att/get ohne bgChallenge -> ohne eigene Aufgabe");
+                return null;
+            }
+            return bg;
+        } catch (Exception e) {
+            System.out.println("[Piped/Bg] eigene Aufgabe nicht holbar (" + e.getMessage() + ")");
+            return null;
+        }
+    }
+
+    /// Client-Version fuer att/get und den Sitzungskontext.
+    private static final String WEB_CLIENT_VERSION = "2.20260122.01.00";
+
     private PoTokenResult createWebClientPoToken() throws Exception {
         String visitorDate = getWebVisitorData();
         // ⚠️ ANGEMELDET wird an die KONTO-Kennung gebunden, nicht an die
@@ -269,9 +329,20 @@ public class BgPoTokenProvider implements PoTokenProvider {
                 + (binding == datasyncId ? "datasyncId" : "visitorData")
                 + " length=" + binding.length());
         // Brainicism's bgutil-pot-server: POST /get_pot mit content_binding (volle visitorData ok)
-        String poToken = ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST", mapper.writeValueAsBytes(mapper.createObjectNode().put(
-                "content_binding", binding
-        )), Map.of(
+        final var potBody = mapper.createObjectNode().put("content_binding", binding);
+        final var eigeneAufgabe = fetchOwnChallenge(visitorDate);
+        if (eigeneAufgabe != null) {
+            potBody.set("challenge", eigeneAufgabe);
+            final var client = mapper.createObjectNode();
+            client.put("clientName", "WEB").put("clientVersion", WEB_CLIENT_VERSION)
+                    .put("visitorData", visitorDate).put("hl", "de").put("gl", "DE");
+            final var ctx = mapper.createObjectNode();
+            ctx.set("client", client);
+            potBody.set("innertube_context", ctx);
+            System.out.println("[Piped/Bg] praege mit EIGENER Aufgabe (angemeldete Sitzung)");
+        }
+        String poToken = ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST",
+                mapper.writeValueAsBytes(potBody), Map.of(
                 "Content-Type", "application/json"
         )).thenApply(response -> {
             try {
