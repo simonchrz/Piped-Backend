@@ -20,6 +20,14 @@ import java.util.zip.GZIPInputStream;
 /// (140 m4a) + video (137 avc 1080p). The serving layer (SabrCache) calls this.
 public final class SabrHandlers {
 
+    /// Bedarfssteuerung der Sessions. SabrCache setzt beides (dort liegt das
+    /// Wissen, was der Player angefordert hat und was auf Platte liegt); hier
+    /// nur durchgereicht, damit die sabr-Schicht nicht auf die Cache-Schicht
+    /// zeigen muss. STOP = Sitzung beenden (niemand schaut mehr zu),
+    /// PAUSE = genug Vorlauf, diese Runde nicht fragen.
+    public static volatile java.util.function.Function<String, java.util.function.BooleanSupplier> SESSION_STOP;
+    public static volatile java.util.function.Function<String, java.util.function.BooleanSupplier> SESSION_PAUSE;
+
     private static final String ANDROID_UA =
             "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
     private static final String ANDROID_VR_UA =
@@ -266,6 +274,10 @@ public final class SabrHandlers {
         session.setFormatCandidates(candA, candV);
         // WEB braucht die Referenz-Form des client_abr_state (s. SabrSession).
         session.setWebClient(pureWeb);
+        // Bedarfsgetriebene Taktung (s. SabrCache): aufhoeren, wenn niemand mehr
+        // anfordert; pausieren, solange genug Vorlauf da ist.
+        session.setStopWhen(SESSION_STOP == null ? null : SESSION_STOP.apply(videoId));
+        session.setPauseWhen(SESSION_PAUSE == null ? null : SESSION_PAUSE.apply(videoId));
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer

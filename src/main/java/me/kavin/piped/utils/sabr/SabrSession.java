@@ -156,6 +156,25 @@ public final class SabrSession {
     /// der alten Form, die dort nachweislich komplette Downloads liefert.
     private boolean webClient;
     public void setWebClient(boolean w) { this.webClient = w; }
+
+    /// Abbruchbedingung, vor jeder Runde geprueft. Damit kann ein
+    /// HINTERGRUND-Download zuruecktreten, sobald der Nutzer ein anderes Video
+    /// antippt: ein Voll-Download dauert Minuten, und die Downloads laufen
+    /// serialisiert — ohne das Zuruecktreten stuende der echte Tap hinter den
+    /// Prefetches der App in der Warteschlange. Das bereits Geholte bleibt
+    /// erhalten (die .bin waechst pro Runde), es geht also nichts verloren.
+    private java.util.function.BooleanSupplier stopWhen;
+    public void setStopWhen(java.util.function.BooleanSupplier s) { this.stopWhen = s; }
+
+    /// „Weit genug voraus" — vor jeder Runde geprueft. Solange wahr, wird NICHT
+    /// gefragt, sondern gewartet. Damit laeuft die Session bedarfsgetrieben: sie
+    /// holt so viel Vorlauf, wie der Player (per Range-Requests) angefordert
+    /// hat, und schweigt danach. Der Server ist damit einverstanden — sein
+    /// `max_time_since_last_request_ms` (NEXT_REQUEST_POLICY Feld 3, typisch
+    /// 60 s) sagt sogar genau, wie lange wir schweigen duerfen; laenger nicht,
+    /// sonst laeuft die Sitzung ab. Deshalb hier ein Heartbeat kurz davor.
+    private java.util.function.BooleanSupplier pauseWhen;
+    public void setPauseWhen(java.util.function.BooleanSupplier s) { this.pauseWhen = s; }
     private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
     /// Liefert einen FRISCHEN content-bound po_token. Wird aufgerufen, wenn der
     /// Server STREAM_PROTECTION_STATUS=3 („Attestierung erforderlich") meldet.
@@ -391,6 +410,29 @@ public final class SabrSession {
         try {
             for (int iter = 0; iter < maxIterations; iter++) {
                 res.iterations = iter + 1;
+                if (stopWhen != null && stopWhen.getAsBoolean()) { stopReason = "idle"; break; }
+                // BEDARFSGETRIEBEN: warten, solange genug Vorlauf da ist. Der
+                // Player fordert per Range weiter an, das hebt die Bremse wieder
+                // auf. Spaetestens nach `max_time_since_last_request_ms` (Policy
+                // Feld 3, default hier 45 s) fragen wir trotzdem einmal, damit
+                // die Sitzung nicht abläuft.
+                if (pauseWhen != null) {
+                    final long heartbeat = policyMaxIdleMs > 0
+                            ? Math.max(5_000, policyMaxIdleMs - 15_000) : 45_000;
+                    final long pauseStart = System.currentTimeMillis();
+                    boolean logged = false;
+                    while (pauseWhen.getAsBoolean()) {
+                        if (stopWhen != null && stopWhen.getAsBoolean()) break;
+                        if (System.currentTimeMillis() - pauseStart >= heartbeat) break;
+                        if (!logged) {
+                            System.out.println("[Sabr] genug Vorlauf — warte auf Player-Bedarf");
+                            logged = true;
+                        }
+                        try { Thread.sleep(1_000); }
+                        catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    }
+                    if (stopWhen != null && stopWhen.getAsBoolean()) { stopReason = "idle"; break; }
+                }
                 // BEDARFSGESTEUERTE TAKTUNG: vor jeder Folgerunde die vom Server
                 // per NEXT_REQUEST_POLICY (Feld 4, backoff_time_ms) angeordnete
                 // Wartezeit einhalten — exakt wie die Referenz-Implementierung

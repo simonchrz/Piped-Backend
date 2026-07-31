@@ -80,6 +80,121 @@ public final class SabrCache {
     /// etwas tut.
     private static final Set<String> DOWNLOAD_ACTIVE = ConcurrentHashMap.newKeySet();
 
+    /// Wie viele SABR-Downloads gleichzeitig laufen duerfen.
+    ///
+    /// ⚠️ Load-bearing seit dem WEB-Pfad. Vorher endete jede Kids-Session nach
+    /// ~13 MB, ein Schwall paralleler Sessions war also harmlos. Jetzt laedt
+    /// JEDE Session das KOMPLETTE Video (~700 MB) — und die App laedt beim
+    /// Scrollen mehrere Videos vor. Gemessen 2026-07-31: vier gleichzeitige
+    /// Voll-Downloads, Load 8,0 auf vier Kernen, und der echte Tap des Nutzers
+    /// scheiterte davor am Resolve („exceeded 12s budget") → HTTP 500 in der App.
+    /// Ein Download nach dem anderen: die Warteschlange kostet nichts, weil
+    /// ensureFile ohnehin nur auf den ANFANG wartet und danach ausliefert.
+    /// `SABR_MAX_PARALLEL_DOWNLOADS` stellt den Wert um.
+    private static final java.util.concurrent.Semaphore DOWNLOAD_SLOTS =
+            new java.util.concurrent.Semaphore(maxParallelDownloads(), true);
+
+    // ── Bedarfsgetriebener Download ────────────────────────────────────────
+    // Ein Voll-Download „auf Verdacht" ist falsch: AVPlayer sagt uns per
+    // Range-Requests laufend, wo er steht, und wenn das Video weggeklickt wird,
+    // hoeren die Anfragen auf. Vorher lud jede Session stur bis zum Ende — beim
+    // Scroll-Prefetch der App liefen dadurch VIER Voll-Downloads gleichzeitig
+    // (Load 8,0 auf vier Kernen, 2026-07-31), und der echte Tap scheiterte davor
+    // am Resolve-Budget (HTTP 500 in der App). Jetzt gilt:
+    //   • Vorlauf halten: LEAD_BYTES ueber dem hoechsten angeforderten Offset,
+    //     danach pausiert die Session (kostet nichts).
+    //   • Aufhoeren, wenn IDLE_STOP_MS lang niemand mehr angefordert hat —
+    //     also z.B. beim Wegklicken oder bei einem nie angesehenen Prefetch.
+    // Der Teil-Cache bleibt in beiden Faellen erhalten; ein spaeterer Abruf
+    // setzt fort, weil `.part`/`.bin` per keep-larger weitergefuehrt werden.
+    private static final Map<String, Long> DEMAND_OFFSET = new ConcurrentHashMap<>();
+    private static final Map<String, Long> LAST_REQUEST = new ConcurrentHashMap<>();
+
+    /// Wieviel Vorlauf vor der Abspielposition gehalten wird. 48 MB sind bei
+    /// 1080p rund 3–4 Minuten — genug, dass Puffern und Vorspulen sich nicht
+    /// anfuehlen wie Nachladen, und weit weniger als ein ganzes Video.
+    private static final long LEAD_BYTES = envMb("SABR_LEAD_MB", 48);
+    /// So lange ohne Anforderung -> Sitzung beenden.
+    private static final long IDLE_STOP_MS = 90_000;
+
+    private static long envMb(String name, long defMb) {
+        final String v = System.getenv(name);
+        long mb = defMb;
+        if (v != null && !v.isBlank()) {
+            try { mb = Long.parseLong(v.trim()); } catch (NumberFormatException ignored) {}
+        }
+        return mb * 1024L * 1024;
+    }
+
+    static {
+        SabrHandlers.SESSION_STOP = vid -> () -> {
+            final long last = LAST_REQUEST.getOrDefault(vid, 0L);
+            return last > 0 && System.currentTimeMillis() - last > IDLE_STOP_MS;
+        };
+        SabrHandlers.SESSION_PAUSE = vid -> () -> {
+            // Der Vorlauf haengt an der VIDEO-Spur — sie macht ~95% der Bytes
+            // aus, und Audio laeuft im selben Zug mit.
+            // ⚠️ NICHT „jede Spur braucht LEAD_BYTES": die Audiospur ist oft
+            // KLEINER als der Vorlauf (3,4 MB Datei vs. 6 MB Soll), damit waere
+            // die Bedingung nie erfuellt und es wuerde wieder alles geladen —
+            // genau so gemessen 2026-07-31 beim ersten Versuch.
+            try (var s = Files.newDirectoryStream(DIR, safe(vid) + "_*.part")) {
+                for (Path p : s) {
+                    final String n = p.getFileName().toString();
+                    final int itag;
+                    try {
+                        itag = Integer.parseInt(n.substring(n.lastIndexOf('_') + 1).replace(".part", ""));
+                    } catch (NumberFormatException e) { continue; }
+                    if (isAudioItag(itag)) continue;
+                    final long have = Files.size(p);
+                    final long want = DEMAND_OFFSET.getOrDefault(safe(vid) + "_" + itag, 0L) + LEAD_BYTES;
+                    return have >= want;
+                }
+                return false;   // noch keine Videospur -> weiterladen
+            } catch (IOException e) {
+                return false;
+            }
+        };
+    }
+
+    /// Bis zu welchem Byte will der Client? Ohne Range-Header (oder bei offenem
+    /// Ende) zaehlt der Start plus ein Fenster — mehr braucht er in dieser
+    /// Antwort ohnehin nicht (s. MAX_RESPONSE_BYTES).
+    private static long requestedEnd(String range) {
+        if (range == null || !range.startsWith("bytes=")) return MAX_RESPONSE_BYTES;
+        try {
+            final String body = range.substring(6);
+            final int dash = body.indexOf('-');
+            if (dash < 0) return MAX_RESPONSE_BYTES;
+            final String s = body.substring(0, dash).trim();
+            final String e = body.substring(dash + 1).trim();
+            final long start = s.isEmpty() ? 0 : Long.parseLong(s);
+            return e.isEmpty() ? start + MAX_RESPONSE_BYTES : Long.parseLong(e);
+        } catch (Exception ex) {
+            return MAX_RESPONSE_BYTES;
+        }
+    }
+
+    /// Anforderung des Players vermerken — Grundlage der Bedarfssteuerung.
+    private static void noteRequest(String videoId, int itag, long endOffset) {
+        LAST_REQUEST.put(videoId, System.currentTimeMillis());
+        DEMAND_OFFSET.merge(safe(videoId) + "_" + itag, endOffset, Math::max);
+    }
+
+    private static int maxParallelDownloads() {
+        final String v = System.getenv("SABR_MAX_PARALLEL_DOWNLOADS");
+        if (v != null && !v.isBlank()) {
+            try { return Math.max(1, Integer.parseInt(v.trim())); }
+            catch (NumberFormatException ignored) {}
+        }
+        // ⚠️ NICHT 1: seit der Bedarfssteuerung laedt eine Session nur ihren
+        // Vorlauf und PAUSIERT dann — dabei haelt sie ihren Platz weiter. Mit
+        // nur einem Platz muesste ein zweiter Tap bis zum Idle-Stop (90 s)
+        // warten. Drei Plaetze deckeln den Ansturm (3 × ~48 MB Vorlauf), ohne
+        // echte Taps auszubremsen; pausierte Sessions kosten nichts.
+        return 3;
+    }
+
     /// Ab wann ist genug da, um zu antworten? Der Playlist-Layer baut eine
     /// EVENT-Playlist aus dem, was auf Platte liegt, und pollt nach — er braucht
     /// nur den Anfang. Video-Segmente sind ~1–9 MB, Audio-Segmente ~160 KB.
@@ -110,6 +225,10 @@ public final class SabrCache {
     public static Path ensureFile(String videoId, int itag) throws Exception {
         final Path file = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
         if (Files.exists(file) && Files.size(file) >= earlyServeBytes(itag)) return file;
+        // Auch der Playlist-Bau zaehlt als Lebenszeichen (sonst liefe die
+        // frische Session in ihren Idle-Stop, bevor der Player das erste
+        // Segment anfordert).
+        LAST_REQUEST.put(videoId, System.currentTimeMillis());
         startDownload(videoId);
         final long deadline = System.currentTimeMillis() + EARLY_WAIT_MS;
         while (System.currentTimeMillis() < deadline) {
@@ -125,19 +244,37 @@ public final class SabrCache {
     /// Serialisierung; DOWNLOAD_ACTIVE verhindert, dass Audio- und Video-Abruf
     /// zwei Threads in denselben Lock schicken.
     private static void startDownload(String videoId) {
-        if (anyFileFor(videoId) && !DOWNLOAD_ACTIVE.contains(videoId)) return;
+        startDownload(videoId, false);
+    }
+
+    /// resume=true: fortsetzen, obwohl schon Dateien da sind — der Player will
+    /// Bytes, die wir (noch) nicht haben. Ohne das bliebe eine pausierte oder
+    /// idle beendete Session liegen, bis die Playlist-Schicht zufaellig einen
+    /// Refill ausloest.
+    private static void startDownload(String videoId, boolean resume) {
+        if (!resume && anyFileFor(videoId) && !DOWNLOAD_ACTIVE.contains(videoId)) return;
         if (!DOWNLOAD_ACTIVE.add(videoId)) return;
         Thread.ofVirtual().name("sabr-dl-" + videoId).start(() -> {
+            boolean acquired = false;
             try {
+                // Warten, bis ein Download-Platz frei ist. Wartende Videos sind
+                // unkritisch: der Abruf haengt nicht daran (ensureFile wartet nur
+                // auf den Anfang und laeuft sonst in seinen Timeout), und ein
+                // Prefetch darf ruhig hinten anstehen.
+                DOWNLOAD_SLOTS.acquire();
+                acquired = true;
                 synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
                     // anyFileFor guard: if the session already ran but produced
                     // DIFFERENT itags (video without 1080p avc), a request for the
                     // absent itag must not re-trigger the whole download forever.
-                    if (!anyFileFor(videoId)) download(videoId);
+                    if (resume || !anyFileFor(videoId)) download(videoId);
                 }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
                 System.out.println("[SabrCache] " + videoId + " download failed: " + e.getMessage());
             } finally {
+                if (acquired) DOWNLOAD_SLOTS.release();
                 DOWNLOAD_ACTIVE.remove(videoId);
             }
         });
@@ -242,7 +379,18 @@ public final class SabrCache {
     }
 
     public static HttpResponse handle(String videoId, int itag, String range, boolean head) throws Exception {
+        // Der Player sagt mit JEDEM Range-Request, wie weit er ist — das ist die
+        // Eingabe der Bedarfssteuerung (s. noteRequest / SESSION_PAUSE).
+        final long wantEnd = requestedEnd(range);
+        noteRequest(videoId, itag, wantEnd);
         final Path file = ensureFile(videoId, itag);
+        // Der Player will ueber das hinaus, was auf Platte liegt -> Session
+        // fortsetzen. Das ist der Gegenpart zur Pause: sie haelt an, sobald der
+        // Vorlauf reicht, und hier faehrt sie wieder an. Ohne das bliebe eine
+        // idle beendete Session liegen, bis die Playlist-Schicht einen Refill
+        // ausloest (Sperrzeit 5 min — viel zu traege, wenn der Player wartet).
+        if (file != null && wantEnd >= Files.size(file) - LEAD_BYTES / 2)
+            startDownload(videoId, true);
         if (file == null) {
             return HttpResponse.ofCode(502).withBody("sabr: no media for itag".getBytes());
         }
