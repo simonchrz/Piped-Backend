@@ -561,6 +561,14 @@ public final class SabrSession {
                 final long frontier = states.values().stream().mapToLong(FState::contiguousEndMs).min().orElse(playerTimeMs);
                 if (!paced) {
                     playerTimeMs = frontier;
+                    // Pro Runde flushen und veroeffentlichen, damit der Cache
+                    // WAEHREND des Downloads waechst: eine komplette Session
+                    // dauert Minuten, und ohne das entsteht die servierte Datei
+                    // erst am Ende (erster Tap wartete gemessen 161 s).
+                    if (publishHook != null) {
+                        for (FState s : states.values()) s.flush();
+                        publishHook.run();
+                    }
                 } else {
                     // never claim playback ahead of wall-clock (+8s head start)
                     playerTimeMs = Math.min(frontier, (System.currentTimeMillis() - wallStart) + 8_000);

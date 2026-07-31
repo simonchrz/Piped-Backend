@@ -71,19 +71,72 @@ public final class SabrCache {
     /// Ensures the video has been SABR-downloaded (once, per-videoId lock) and
     /// returns the cached file for the itag, or null if unavailable. Lets the
     /// synth-hls layer read the file directly (box scan) without an HTTP hop.
+    /// Laeuft fuer dieses Video gerade ein Download? Verhindert, dass Audio- und
+    /// Video-Abruf zwei Sessions starten, und sagt der Wartelogik, ob sich noch
+    /// etwas tut.
+    private static final Set<String> DOWNLOAD_ACTIVE = ConcurrentHashMap.newKeySet();
+
+    /// Ab wann ist genug da, um zu antworten? Der Playlist-Layer baut eine
+    /// EVENT-Playlist aus dem, was auf Platte liegt, und pollt nach — er braucht
+    /// nur den Anfang. Video-Segmente sind ~1–9 MB, Audio-Segmente ~160 KB.
+    private static long earlyServeBytes(int itag) {
+        return isAudioItag(itag) ? 128L * 1024 : 1024L * 1024;
+    }
+
+    private static boolean isAudioItag(int itag) {
+        return itag == 139 || itag == 140 || itag == 141
+                || itag == 249 || itag == 250 || itag == 251;
+    }
+
+    /// Wie lange der erste Abruf hoechstens auf den Anfang wartet. Danach
+    /// antwortet er mit dem, was da ist (oder 502) — der Download laeuft im
+    /// Hintergrund weiter.
+    private static final long EARLY_WAIT_MS = 30_000;
+
+    /// Startet den Download im HINTERGRUND (einmal pro Video) und wartet nur,
+    /// bis der Anfang serviert werden kann.
+    ///
+    /// ⚠️ Vorher lief `download()` synchron in diesem Aufruf. Das war richtig,
+    /// solange eine Kids-Session nach ~13 MB endete; seit der WEB-Pfad KOMPLETTE
+    /// Videos holt, blockierte der erste Tap minutenlang (gemessen 161 s fuer
+    /// 1 KB!) — und der /sabr-Router haelt waehrenddessen einen der nur ZWEI
+    /// Resolve-Slots (ServerLauncher: acquire vor handle, release im finally).
+    /// Zwei kalte Kids-Taps haetten damit alle Resolves lahmgelegt: exakt die
+    /// dokumentierte 503-Schleife (-1008 / -16849 in der App).
     public static Path ensureFile(String videoId, int itag) throws Exception {
         final Path file = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
-        if (!Files.exists(file)) {
-            synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
-                // anyFileFor guard: if the session already ran but produced
-                // DIFFERENT itags (video without 1080p avc), a request for the
-                // absent itag must not re-trigger the whole download forever.
-                if (!Files.exists(file) && !anyFileFor(videoId)) {
-                    download(videoId);
-                }
-            }
+        if (Files.exists(file) && Files.size(file) >= earlyServeBytes(itag)) return file;
+        startDownload(videoId);
+        final long deadline = System.currentTimeMillis() + EARLY_WAIT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if (Files.exists(file) && Files.size(file) >= earlyServeBytes(itag)) break;
+            // Session fertig oder gescheitert -> nicht weiter warten.
+            if (!DOWNLOAD_ACTIVE.contains(videoId)) break;
+            Thread.sleep(200);
         }
         return Files.exists(file) ? file : null;
+    }
+
+    /// Einmaliger Hintergrund-Download pro Video. Der per-Video-Lock bleibt die
+    /// Serialisierung; DOWNLOAD_ACTIVE verhindert, dass Audio- und Video-Abruf
+    /// zwei Threads in denselben Lock schicken.
+    private static void startDownload(String videoId) {
+        if (anyFileFor(videoId) && !DOWNLOAD_ACTIVE.contains(videoId)) return;
+        if (!DOWNLOAD_ACTIVE.add(videoId)) return;
+        Thread.ofVirtual().name("sabr-dl-" + videoId).start(() -> {
+            try {
+                synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
+                    // anyFileFor guard: if the session already ran but produced
+                    // DIFFERENT itags (video without 1080p avc), a request for the
+                    // absent itag must not re-trigger the whole download forever.
+                    if (!anyFileFor(videoId)) download(videoId);
+                }
+            } catch (Exception e) {
+                System.out.println("[SabrCache] " + videoId + " download failed: " + e.getMessage());
+            } finally {
+                DOWNLOAD_ACTIVE.remove(videoId);
+            }
+        });
     }
 
     /// The itags the SABR session ACTUALLY picked for this video, as
@@ -93,6 +146,22 @@ public final class SabrCache {
     public static int[] itagsFor(String videoId) throws Exception {
         final Path manifest = DIR.resolve(safe(videoId) + ".itags");
         if (!Files.exists(manifest)) {
+            // Das Manifest schreibt download() erst am ENDE. Seit der Download
+            // im Hintergrund laeuft (s. ensureFile) darf hier nicht mehr
+            // minutenlang darauf gewartet werden — die tatsaechlich gewaehlten
+            // itags stehen aber schon in den Dateinamen, sobald die Session die
+            // ersten Bytes geschrieben hat.
+            startDownload(videoId);
+            final long deadline = System.currentTimeMillis() + EARLY_WAIT_MS;
+            while (System.currentTimeMillis() < deadline
+                    && !Files.exists(manifest) && !anyFileFor(videoId)
+                    && DOWNLOAD_ACTIVE.contains(videoId)) {
+                Thread.sleep(200);
+            }
+            if (!Files.exists(manifest)) {
+                final int[] derived = deriveItags(videoId);
+                if (derived != null) return derived;
+            }
             synchronized (LOCKS.computeIfAbsent(videoId, k -> new Object())) {
                 if (!Files.exists(manifest) && !anyFileFor(videoId)) {
                     download(videoId);
@@ -140,6 +209,24 @@ public final class SabrCache {
             }
         } catch (IOException ignored) {}
         return out.toString();
+    }
+
+    /// itags aus den bereits geschriebenen Cache-Dateien ableiten — Ersatz fuer
+    /// das Manifest, solange die Session noch laeuft. null, wenn (noch) kein
+    /// Paar aus Audio und Video da ist.
+    private static int[] deriveItags(String videoId) {
+        int audio = -1, video = -1;
+        try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.bin")) {
+            for (Path p : s) {
+                final String n = p.getFileName().toString();
+                try {
+                    final int it = Integer.parseInt(
+                            n.substring(n.lastIndexOf('_') + 1).replace(".bin", ""));
+                    if (isAudioItag(it)) audio = it; else video = it;
+                } catch (NumberFormatException ignored) {}
+            }
+        } catch (IOException ignored) {}
+        return (audio > 0 && video > 0) ? new int[]{audio, video} : null;
     }
 
     private static boolean anyFileFor(String videoId) {
@@ -278,7 +365,12 @@ public final class SabrCache {
         // Known capped (kids): burst rungs are wasted requests — refill goes
         // straight to the paced 1x session; the sync warm path keeps serving
         // the existing partial cache untouched.
-        if (isCapMarked(videoId)) {
+        // ⚠️ Nur abkuerzen, wenn tatsaechlich ein Teil-Cache da ist, den die
+        // Playlist-Schicht ausliefern kann. Ohne Cache hiesse die Abkuerzung
+        // „30 Minuten lang gar nichts" (502 statt Video) — genau das passiert,
+        // wenn die Eviction die Dateien geraeumt hat oder eine Session ohne ein
+        // einziges Segment endete. Dann lieber die Leiter fahren.
+        if (isCapMarked(videoId) && anyFileFor(videoId)) {
             if (!allowPaced) return;
             final String fam = me.kavin.piped.utils.EgressManager.activeEgress();
             System.out.println("[SabrCache] " + videoId + " cap-marked -> paced 1x refill on " + fam);
@@ -399,12 +491,28 @@ public final class SabrCache {
             opened.put(itag, os);
             return os;
         };
-        // Paced sessions run ~video-length; publish the growing .part into the
-        // served .bin once per round so the EVENT playlist keeps growing under
-        // the player (that growth IS the point of pacing).
-        final Runnable publishHook = !paced ? null : () -> {
-            for (Map.Entry<Integer, Path> e : parts.entrySet())
-                publishIfLarger(videoId, e.getKey(), e.getValue(), false);
+        // INKREMENTELL VEROEFFENTLICHEN — pro Runde, nicht erst am Ende.
+        // Seit der WEB-Pfad komplette Videos holt, dauert eine Kids-Session
+        // Minuten (gemessen: 161 s / 197 Runden). Ohne diesen Hook entsteht die
+        // .bin erst danach: der erste Tap wartet die ganze Zeit und haelt dabei
+        // einen der nur ZWEI Resolve-Slots. Mit dem Hook waechst die .bin
+        // waehrend des Downloads, die EVENT-Playlist listet die vorhandenen
+        // Segmente und der Player startet nach Sekunden.
+        //
+        // ⚠️ NICHT die ganze Datei pro Runde kopieren (das macht der paced-Weg):
+        // bei 662 MB × ~200 Runden waeren das zig GB Schreiblast auf der
+        // SD-Karte. publishTail haengt nur die neuen Bytes an -> insgesamt 2×
+        // Dateigroesse. Voraussetzung fuer das Anhaengen ist, dass die .bin von
+        // DIESEM Versuch stammt; existiert schon eine aus einem frueheren
+        // Versuch, bleibt es beim keep-larger-Publish am Ende (sonst wuerden
+        // Bytes zweier Sessions ineinander laufen).
+        final Map<Integer, Long> publishedLen = new ConcurrentHashMap<>();
+        final boolean canAppend = !anyFileFor(videoId);
+        final Runnable publishHook = () -> {
+            for (Map.Entry<Integer, Path> e : parts.entrySet()) {
+                if (canAppend) publishTail(videoId, e.getKey(), e.getValue(), publishedLen);
+                else publishIfLarger(videoId, e.getKey(), e.getValue(), false);
+            }
         };
         // Protokoll-Probe (2026-07-25): erzwingt einen Client-Modus fuer die
         // Session, um die Client<->Token-Konsistenz zu testen (0=ANDROID,
@@ -459,6 +567,40 @@ public final class SabrCache {
             } else if (move) {
                 Files.deleteIfExists(part);
             }
+        } catch (IOException ignored) {}
+    }
+
+    /// Inkrementelles Veroeffentlichen OHNE Voll-Kopie: haengt nur die seit dem
+    /// letzten Aufruf dazugekommenen Bytes der .part an die .bin an. Die Session
+    /// flusht vor dem Hook, es werden also nur ganze Segmente sichtbar; Leser
+    /// sehen jederzeit ein gueltiges PRAEFIX der Enddatei (Anhaengen aendert
+    /// bereits gelesene Offsets nicht).
+    private static void publishTail(String videoId, int itag, Path part, Map<Integer, Long> published) {
+        final Path bin = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
+        try {
+            final long partSize = Files.exists(part) ? Files.size(part) : 0;
+            final long done = published.getOrDefault(itag, 0L);
+            if (partSize <= done) return;
+            final long binSize = Files.exists(bin) ? Files.size(bin) : 0;
+            // Fremde .bin (anderer Versuch/Refill) -> nicht anhaengen, sonst
+            // mischen sich zwei Sessions. Der terminale keep-larger-Publish
+            // raeumt das am Ende korrekt auf.
+            if (binSize != done) return;
+            try (RandomAccessFile in = new RandomAccessFile(part.toFile(), "r");
+                 OutputStream out = Files.newOutputStream(bin,
+                         java.nio.file.StandardOpenOption.CREATE,
+                         java.nio.file.StandardOpenOption.APPEND)) {
+                in.seek(done);
+                final byte[] buf = new byte[1 << 20];
+                long remaining = partSize - done;
+                while (remaining > 0) {
+                    final int n = in.read(buf, 0, (int) Math.min(buf.length, remaining));
+                    if (n <= 0) break;
+                    out.write(buf, 0, n);
+                    remaining -= n;
+                }
+            }
+            published.put(itag, partSize);
         } catch (IOException ignored) {}
     }
 
