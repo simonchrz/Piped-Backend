@@ -155,7 +155,25 @@ public final class SabrHandlers {
                 visitorData = pot.visitorData;
                 if (pot.playerRequestPoToken != null) poToken = b64(pot.playerRequestPoToken);
             }
-            if (contentBoundToken) {
+            // ⚠️ BINDUNGEN NICHT VERTAUSCHEN (yt-dlp PO-Token-Guide):
+            //   • Player-Aufruf  -> Token an die VIDEO-ID gebunden
+            //   • Streaming/GVS  -> Token an die SITZUNG gebunden
+            //     (datasyncId wenn angemeldet, sonst visitorData)
+            // Wir hatten beides ueber einen Kamm geschoren: derselbe
+            // sitzungsgebundene Token diente als Player-Attestierung, und im
+            // content-bound-Rung wanderte ausgerechnet der VIDEO-gebundene in
+            // den streamerContext — also genau falsch herum. Der Server duldet
+            // so etwas 1-2 MB und schaltet dann auf "Attestierung erforderlich"
+            // (prot=2 -> 3 bei ~61 s). Beleg, dass es nicht am Inhalt liegt:
+            // derselbe Anschluss, dasselbe Video, ein echter Browser puffert
+            // 148 s (2026-07-31 per Chrome-Erweiterung gemessen).
+            // Kill-Switch: YT_POT_SPLIT_BINDING=0 stellt das alte Verhalten her.
+            final boolean splitBinding = !"0".equals(System.getenv("YT_POT_SPLIT_BINDING"));
+            if (splitBinding) {
+                final String perVideo = bg.sabrPoTokenForBinding(videoId);
+                if (perVideo != null) attestationPoToken = perVideo;   // Player-Aufruf
+                // poToken (streamerContext/GVS) bleibt der sitzungsgebundene.
+            } else if (contentBoundToken) {
                 final String cb = bg.sabrContentBoundPoToken(videoId);
                 if (cb != null) { poToken = b64(cb); attestationPoToken = cb; }
                 else System.out.println("[Sabr] " + videoId
