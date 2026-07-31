@@ -381,8 +381,17 @@ public class SynthHlsHandlers {
         final boolean listAll = me.kavin.piped.utils.sabr.SabrCache.SPARSE
                 && !partialTerminal
                 && me.kavin.piped.utils.sabr.SabrCache.seekable(videoId);
+        // Im Rueckfall-Modus nur den LUECKENLOSEN Anfang anbieten. Die
+        // Dateigroesse allein reicht dafuer im Streifen-Modus nicht (s.
+        // SparseStore.contiguousFromStart) — sonst listet die Playlist Segmente,
+        // die in Wahrheit Loecher sind, und die Wiedergabe bricht mittendrin ab.
+        final int contiguous = me.kavin.piped.utils.sabr.SabrCache.SPARSE && videoId != null
+                ? me.kavin.piped.utils.sabr.SparseStore.contiguousFromStart(videoId, itag)
+                : Integer.MAX_VALUE;
+        int seq = 0;
         for (SidxParserJava.Entry e : sidx.entries) {
-            if (!listAll && cursor + e.byteSize > fileLen) break;
+            seq++;
+            if (!listAll && (cursor + e.byteSize > fileLen || seq > contiguous)) break;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
             sb.append(String.format("#EXT-X-BYTERANGE:%d@%d\n", e.byteSize, cursor));
             sb.append(segUrl).append('\n');
@@ -545,6 +554,9 @@ public class SynthHlsHandlers {
         return url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1" + freshCpn());
     }
 
+    /// So lange gilt eine bestandene Drossel-Pruefung (s. verificationFresh).
+    private static final long VERIFY_TTL_MS = 90_000;
+
     private static class CacheEntry {
         final Streams streams;
         final long createdAt;
@@ -553,6 +565,20 @@ public class SynthHlsHandlers {
             this.streams = s; this.createdAt = System.currentTimeMillis(); this.urlsVerified = verified;
         }
         boolean fresh() { return System.currentTimeMillis() - createdAt < CACHE_TTL_MS; }
+
+        /// Ist die Drossel-Pruefung noch aussagekraeftig?
+        ///
+        /// ⚠️ `urlsVerified` haelt fest, dass die URLs BEIM AUFLOESEN lebten. Sie
+        /// koennen aber innerhalb der Cache-Dauer sterben — googlevideo dreht
+        /// Drosselfenster im Minutentakt. Genau das schlug in der App auf: erster
+        /// Tap lief auf tote URLs (AVPlayer -1102 „no permission"), der zweite
+        /// funktionierte, weil der Fehlschlag den Sturm-Modus ausgeloest hatte.
+        /// Nach VERIFY_TTL_MS wird die Bestaetigung deshalb ungueltig und der
+        /// naechste Playlist-Bau probt erneut (~200 ms, dieselbe Probe wie im
+        /// Normalpfad).
+        boolean verificationFresh() {
+            return System.currentTimeMillis() - createdAt < VERIFY_TTL_MS;
+        }
     }
 
     /// Resolve-Reuse: let StreamHandlers seed this cache from its /streams
@@ -582,7 +608,7 @@ public class SynthHlsHandlers {
 
     public static Streams getFreshVerifiedStreams(String videoId) {
         CacheEntry e = streamsCache.get(videoId);
-        return (e != null && e.fresh() && e.urlsVerified) ? e.streams : null;
+        return (e != null && e.fresh() && e.urlsVerified && e.verificationFresh()) ? e.streams : null;
     }
 
     /// Serve-stale (backlog #6, built 2026-07-05): the last known-good resolve,
@@ -735,7 +761,8 @@ public class SynthHlsHandlers {
     /// StreamInfo.getInfo (only the cheap HEAD; WebEmbed only if actually 403'd).
     private static Streams fetchStreams(String videoId, boolean requireVerified) throws Exception {
         CacheEntry e = streamsCache.get(videoId);
-        if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
+        if (e != null && e.fresh()
+                && (!requireVerified || (e.urlsVerified && e.verificationFresh()))) return e.streams;
         resolveLock.lock();
         // Stage timing for the cold path — split resolve vs throttle-HEAD vs
         // WebEmbed-retry over real plays, so we can see where a slow cold-start
@@ -748,7 +775,8 @@ public class SynthHlsHandlers {
         long resolveMs = 0, throttleMs = 0, webembedMs = 0;
         try {
             e = streamsCache.get(videoId);
-            if (e != null && e.fresh() && (!requireVerified || e.urlsVerified)) return e.streams;
+            if (e != null && e.fresh()
+                    && (!requireVerified || (e.urlsVerified && e.verificationFresh()))) return e.streams;
 
             // Reuse fresh-but-unverified streams (just cached by a master fetch)
             // so we don't pay a second StreamInfo.getInfo just to verify.

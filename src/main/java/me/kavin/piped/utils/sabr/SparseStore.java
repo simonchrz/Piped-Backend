@@ -158,6 +158,20 @@ public final class SparseStore {
         return -1;
     }
 
+    /// Wie viele Segmente liegen ab 1 LUECKENLOS vor? Nur die darf die Playlist
+    /// im Rueckfall-Modus anbieten.
+    ///
+    /// ⚠️ Die DATEIGROESSE taugt dafuer nicht: im Streifen-Modus reicht die Datei
+    /// bis zum hoechsten geschriebenen Segment, egal was dazwischen fehlt
+    /// (gemessen: Karte `1-12,24-28` bei einer Datei, die bis Segment 28 reicht —
+    /// die Playlist bot daraufhin 28 Segmente an, obwohl 13–23 Loecher sind).
+    public static int contiguousFromStart(String videoId, int itag) {
+        final NavigableSet<Integer> have = present(videoId, itag);
+        int n = 0;
+        while (have.contains(n + 1)) n++;
+        return n;
+    }
+
     /// Welche davon fehlen noch?
     public static List<Integer> missing(String videoId, int itag, List<Integer> segs) {
         final NavigableSet<Integer> have = present(videoId, itag);
