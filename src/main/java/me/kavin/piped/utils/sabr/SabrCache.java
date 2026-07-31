@@ -187,11 +187,11 @@ public final class SabrCache {
         return DIR.resolve(safe(videoId) + "_" + itag + ".state");
     }
 
-    private static void writeState(String videoId, int itag, long binLen,
-                                   int lastSeq, long bufferedMs, int totalSegments, long totalDurationMs) {
+    private static void writeState(String videoId, int itag, long binLen, int lastSeq,
+                                   long bufferedMs, int totalSegments, long totalDurationMs, long lmt) {
         try {
-            Files.writeString(statePath(videoId, itag),
-                    binLen + " " + lastSeq + " " + bufferedMs + " " + totalSegments + " " + totalDurationMs);
+            Files.writeString(statePath(videoId, itag), binLen + " " + lastSeq + " " + bufferedMs
+                    + " " + totalSegments + " " + totalDurationMs + " " + lmt);
         } catch (IOException ignored) {}
     }
 
@@ -206,7 +206,9 @@ public final class SabrCache {
                     itag = Integer.parseInt(n.substring(n.lastIndexOf('_') + 1).replace(".state", ""));
                 } catch (NumberFormatException e) { continue; }
                 final String[] f = Files.readString(p).trim().split("\\s+");
-                if (f.length != 5) continue;
+                // 6 Felder inkl. lmt. Aeltere 5-Feld-Dateien haben keinen Encode
+                // vermerkt — die werden bewusst NICHT fortgesetzt (s. Resume).
+                if (f.length != 6) continue;
                 final Path bin = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
                 if (!Files.exists(bin) || Files.size(bin) != Long.parseLong(f[0])) continue;  // veraltet
                 final int lastSeq = Integer.parseInt(f[1]);
@@ -216,7 +218,7 @@ public final class SabrCache {
                 // anhaengen und die Datei zerstoeren.
                 if (totalSegs > 0 && lastSeq >= totalSegs) continue;
                 out.put(itag, new SabrSession.Resume(lastSeq, Long.parseLong(f[2]),
-                        totalSegs, Long.parseLong(f[4])));
+                        totalSegs, Long.parseLong(f[4]), Long.parseLong(f[5])));
             }
         } catch (Exception ignored) {}
         return out;
@@ -717,9 +719,19 @@ public final class SabrCache {
             } catch (IOException ignored) {}
         }
         final Map<Integer, long[]> progress = new ConcurrentHashMap<>();
-        final SabrSession.ProgressSink progressSink =
-                (itag, lastSeq, bufMs, totalSegs, totalDurMs) ->
-                        progress.put(itag, new long[]{lastSeq, bufMs, totalSegs, totalDurMs});
+        // Welche Spuren wurden WIRKLICH fortgesetzt? Nur bei denen darf der neue
+        // Schwanz angehaengt werden; bei allen anderen enthaelt die .part das
+        // Video ab Segment 1 (dann gilt keep-larger wie bisher).
+        final Set<Integer> resumedItags = ConcurrentHashMap.newKeySet();
+        final SabrSession.ProgressSink progressSink = new SabrSession.ProgressSink() {
+            @Override public void report(int itag, int lastSeq, long bufMs, int totalSegs,
+                                         long totalDurMs, long lmt) {
+                progress.put(itag, new long[]{lastSeq, bufMs, totalSegs, totalDurMs, lmt});
+            }
+            @Override public void resumeApplied(int itag, boolean applied) {
+                if (applied) resumedItags.add(itag); else resumedItags.remove(itag);
+            }
+        };
         final Map<Integer, Long> publishedLen = new ConcurrentHashMap<>();
         // Anhaengen ist erlaubt, wenn noch nichts da ist ODER wir nachweislich
         // an unseren eigenen Fortsetz-Zustand anknuepfen.
@@ -727,15 +739,18 @@ public final class SabrCache {
         final Runnable publishHook = () -> {
             for (Map.Entry<Integer, Path> e : parts.entrySet()) {
                 final int itag = e.getKey();
-                if (canAppend) {
-                    publishTail(videoId, itag, e.getValue(), publishedLen, baseLen.getOrDefault(itag, 0L));
+                // Anhaengen nur, wenn es nichts Fremdes gibt (frisches Video)
+                // oder wir nachweislich an unseren eigenen Stand anknuepfen.
+                final long base = baseLen.getOrDefault(itag, 0L);
+                if (canAppend && (base == 0 || resumedItags.contains(itag))) {
+                    publishTail(videoId, itag, e.getValue(), publishedLen, base);
                     // Fortsetzpunkt mitschreiben — er muss zur .bin passen, sonst
                     // wird er beim naechsten Start verworfen (s. readResume).
                     final long[] pr = progress.get(itag);
                     if (pr != null && pr[0] > 0) {
                         try {
                             final long binLen = Files.size(DIR.resolve(safe(videoId) + "_" + itag + ".bin"));
-                            writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3]);
+                            writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3], pr[4]);
                         } catch (IOException ignored) {}
                     }
                 } else {
@@ -787,7 +802,7 @@ public final class SabrCache {
         for (Map.Entry<Integer, Path> e : parts.entrySet()) {
             final int itag = e.getKey();
             final long base = baseLen.getOrDefault(itag, 0L);
-            if (canAppend && base > 0) {
+            if (canAppend && base > 0 && resumedItags.contains(itag)) {
                 publishTail(videoId, itag, e.getValue(), publishedLen, base);
                 try { Files.deleteIfExists(e.getValue()); } catch (IOException ignored) {}
             } else {
@@ -798,8 +813,16 @@ public final class SabrCache {
             if (pr != null && pr[0] > 0) {
                 try {
                     final long binLen = Files.size(DIR.resolve(safe(videoId) + "_" + itag + ".bin"));
-                    writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3]);
+                    writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3], pr[4]);
                 } catch (IOException ignored) {}
+            } else if (base > 0 && resumedItags.contains(itag)) {
+                // Fortgesetzt, aber KEIN einziges neues Segment: der Server
+                // erkennt unseren Stand nicht an (anderer Encode, abgelaufene
+                // Sitzung, Drosselfenster). Zustand wegwerfen, damit die naechste
+                // Runde sauber von vorn beginnt statt es ewig zu wiederholen.
+                try { Files.deleteIfExists(statePath(videoId, itag)); } catch (IOException ignored) {}
+                System.out.println("[SabrCache] " + videoId + "/" + itag
+                        + " Fortsetzen brachte nichts -> Zustand verworfen");
             }
         }
         return result;

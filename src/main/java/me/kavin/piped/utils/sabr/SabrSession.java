@@ -200,12 +200,20 @@ public final class SabrSession {
     /// Ohne das begann jede Wiederanfahrt wieder bei Segment 1 — der
     /// keep-larger-Publish rettete zwar den Cache, aber die Bytes wurden ein
     /// zweites Mal geholt.
+    /// ⚠️ `lmt` ist Teil der Identitaet: YouTube liefert fuer dasselbe itag je
+    /// nach Player-Call VERSCHIEDENE Encodes (gemessen 2026-07-31 an EINEM
+    /// Video: 553 / 640 / 656 Segmente). Segmentnummern gelten nur innerhalb
+    /// eines Encodes — ohne diesen Abgleich wuerde „weiter ab Segment 15" auf
+    /// die falsche Fassung zeigen (der Server antwortet dann mit einem leeren
+    /// Rahmen) und beim Anhaengen zwei Encodes in EINER Datei vermischen.
     public static final class Resume {
         public final int lastSeq; public final long bufferedMs;
         public final int totalSegments; public final long totalDurationMs;
-        public Resume(int lastSeq, long bufferedMs, int totalSegments, long totalDurationMs) {
+        public final long lmt;
+        public Resume(int lastSeq, long bufferedMs, int totalSegments, long totalDurationMs, long lmt) {
             this.lastSeq = lastSeq; this.bufferedMs = bufferedMs;
             this.totalSegments = totalSegments; this.totalDurationMs = totalDurationMs;
+            this.lmt = lmt;
         }
     }
     private Map<Integer, Resume> resume = Map.of();
@@ -213,9 +221,14 @@ public final class SabrSession {
 
     /// Fortschrittsmeldung pro Runde — die Cache-Schicht schreibt daraus ihre
     /// `.state`-Datei, damit die naechste Sitzung fortsetzen kann.
-    @FunctionalInterface
     public interface ProgressSink {
-        void report(int itag, int lastContiguousSeq, long bufferedMs, int totalSegments, long totalDurationMs);
+        void report(int itag, int lastContiguousSeq, long bufferedMs, int totalSegments,
+                    long totalDurationMs, long lmt);
+        /// Wurde fuer dieses itag tatsaechlich fortgesetzt? Nur dann darf die
+        /// Cache-Schicht den neuen Schwanz an die vorhandene Datei ANHAENGEN —
+        /// sonst enthaelt die .part das Video ab Segment 1 und das Anhaengen
+        /// wuerde die Datei zerstoeren.
+        void resumeApplied(int itag, boolean applied);
     }
     private ProgressSink progressSink;
     public void setProgressSink(ProgressSink p) { this.progressSink = p; }
@@ -231,6 +244,13 @@ public final class SabrSession {
             final Fmt fmt = prefAudio != null && prefAudio.itag == itag ? prefAudio
                     : prefVideo != null && prefVideo.itag == itag ? prefVideo : null;
             if (fmt == null) continue;
+            // Anderer Encode als der gecachte -> NICHT fortsetzen (s. Resume).
+            if (fmt.lmt != r.lmt) {
+                System.out.println("[Sabr] " + itag + " KEIN Fortsetzen: anderer Encode"
+                        + " (Cache lmt=" + r.lmt + ", jetzt lmt=" + fmt.lmt + ") -> von vorn");
+                if (progressSink != null) progressSink.resumeApplied(itag, false);
+                continue;
+            }
             final FState s = states.computeIfAbsent(itag, k -> new FState(fmt));
             s.totalSegments = r.totalSegments;
             s.totalDurationMs = r.totalDurationMs;
@@ -244,7 +264,8 @@ public final class SabrSession {
                 s.segTimes.put(q, new long[]{perSeg * (q - 1), perSeg});
             }
             System.out.println("[Sabr] " + itag + " fortsetzen ab Segment " + (r.lastSeq + 1)
-                    + "/" + r.totalSegments + " (" + r.bufferedMs + "ms gepuffert)");
+                    + "/" + r.totalSegments + " (" + r.bufferedMs + "ms gepuffert, lmt=" + r.lmt + ")");
+            if (progressSink != null) progressSink.resumeApplied(itag, true);
         }
     }
     private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
@@ -692,7 +713,7 @@ public final class SabrSession {
                         if (progressSink != null) {
                             for (FState s : states.values())
                                 progressSink.report(s.fmt.itag, s.contiguousEndSeq(), s.bufferedMs,
-                                        s.totalSegments, s.totalDurationMs);
+                                        s.totalSegments, s.totalDurationMs, s.fmt.lmt);
                         }
                         publishHook.run();
                     }
@@ -714,7 +735,7 @@ public final class SabrSession {
             if (progressSink != null) {
                 for (FState s : states.values())
                     progressSink.report(s.fmt.itag, s.contiguousEndSeq(), s.bufferedMs,
-                            s.totalSegments, s.totalDurationMs);
+                            s.totalSegments, s.totalDurationMs, s.fmt.lmt);
             }
             for (FState s : states.values()) {
                 final Map<String, Object> info = new LinkedHashMap<>();
