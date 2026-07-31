@@ -132,7 +132,19 @@ public class SynthHlsHandlers {
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
-        Streams streams = fetchStreams(videoId);
+        final Streams streams;
+        try {
+            streams = fetchStreams(videoId);
+        } catch (Exception e) {
+            if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)) {
+                System.out.println("[SynthHls] " + videoId
+                        + " Resolve gescheitert (Audio) -> aus dem SABR-Cache bedienen");
+                me.kavin.piped.utils.sabr.SabrCache.markStorm(videoId);
+                return sabrStreamPlaylist(videoId,
+                        me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
+            }
+            throw e;
+        }
         if (isSabrMode(videoId, streams))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
@@ -150,7 +162,24 @@ public class SynthHlsHandlers {
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
-        Streams streams = fetchStreams(videoId);
+        final Streams streams;
+        try {
+            streams = fetchStreams(videoId);
+        } catch (Exception e) {
+            // ⚠️ HABEN wir es schon? Dann NIEMALS "nicht abspielbar" melden.
+            // Der Resolve kann an der Bot-Wall scheitern, waehrend der
+            // SABR-Cache das Video sofort ausliefert (gemessen 2026-07-31 an
+            // qBFvRSXjaEI: /sabr lieferte 206 in 4 ms, die Variante antwortete
+            // mit 403 {"unplayable":true} — genau der Text, den die App zeigte).
+            if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)) {
+                System.out.println("[SynthHls] " + videoId
+                        + " Resolve gescheitert (" + e.getMessage() + ") -> aus dem SABR-Cache bedienen");
+                me.kavin.piped.utils.sabr.SabrCache.markStorm(videoId);
+                return sabrStreamPlaylist(videoId,
+                        me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
+            }
+            throw e;
+        }
         if (isSabrMode(videoId, streams))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
