@@ -614,9 +614,16 @@ public class StreamHandlers {
                 // (storm AND SABR dead) surfaces as a playlist error instead of
                 // this 503 — logged, mark expires after 30 min.
                 // Kill switch: YT_SABR_STORM_FALLBACK=false.
+                // ⚠️ Liegt bereits SABR-Material auf Platte, braucht es KEINE Probe:
+                // wir koennen sofort daraus ausliefern. Ohne diese Abkuerzung
+                // scheiterte die frische Probe im Drosselfenster und wir gaben
+                // 503 zurueck, obwohl /sabr/<id>/137 in 16 ms ein 206 lieferte —
+                // in der App der Wiederholungs-Dialog statt eines spielenden
+                // Videos (2026-07-31 gemessen an klbPE-HNmIE).
+                final boolean sabrCacheReady = SabrCache.hasCache(videoId);
                 if (stillThrottled
                         && !"false".equalsIgnoreCase(System.getenv("YT_SABR_STORM_FALLBACK"))
-                        && SabrHandlers.sabrViable(videoId)) {
+                        && (sabrCacheReady || SabrHandlers.sabrViable(videoId))) {
                     SabrCache.markStorm(videoId);
                     Multithreading.runAsync(() -> {
                         try {
@@ -634,7 +641,8 @@ public class StreamHandlers {
                     stillThrottled = false;
                     servedViaSabr = true;
                     System.out.println("[ResolvePath] " + videoId
-                            + " -> SABR-STORM (WebEmbed+TVHTML5 403, serving via /sabr)");
+                            + " -> SABR-STORM (WebEmbed+TVHTML5 403, serving via /sabr"
+                            + (sabrCacheReady ? ", Cache vorhanden" : ", Probe ok") + ")");
                 }
 
                 // Final segment-liveness gate: WebEmbed AND TVHTML5 both 403 -> don't
