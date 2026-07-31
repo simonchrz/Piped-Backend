@@ -484,9 +484,20 @@ public class SynthHlsHandlers {
             sb.append("#EXT-X-ENDLIST");
             if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         } else {
+            // ⚠️ Teil-Cache EHRLICH als fertiges Video ausliefern statt als
+            // wachsende EVENT-Playlist. Ohne ENDLIST haelt AVPlayer das fuer
+            // einen Livestream: KEINE Gesamtzeit, kein Seek-Balken. Und laesst
+            // man die Playlist wachsen, fordert der Player den Bereich direkt
+            // HINTER dem Cache an, bekommt nach 20 s ein 503 und bricht mit
+            // -11867 ab ("Could not download required resources") — beides
+            // 2026-07-31 in der App gemeldet, beides an NKpJY7cnaN4 im Log
+            // nachvollzogen (Bereich 74284489-… bei 74-MB-Datei).
+            // Sauber beendet spielt er das Vorhandene mit korrekter Dauer und
+            // hoert am Ende auf; der Refill fuellt fuer den naechsten Aufruf.
             System.out.println("[SynthHls] " + videoId + "/" + itag + " sabr cache truncated: "
                     + emitted + "/" + sidx.entries.size() + " segments on disk ("
-                    + fileLen + "B) -> EVENT playlist + refill");
+                    + fileLen + "B) -> Teil-VOD mit ENDLIST + refill");
+            sb.append("#EXT-X-ENDLIST");
             if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         }
         return sb.toString();
