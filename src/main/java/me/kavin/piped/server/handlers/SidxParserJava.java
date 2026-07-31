@@ -37,9 +37,37 @@ public class SidxParserJava {
     /// swaps a fresh cpn into the URL per play (swapCpn, throttle-safety) — so
     /// keying on the raw URL would MISS on every play and re-fetch the index from
     /// googlevideo. Strip the cpn so the index is reused across plays / prefetch.
+    /// Schluessel ueber die IDENTITAET des Streams, nicht ueber die URL.
+    ///
+    /// ⚠️ Vorher wurde nur `cpn` normalisiert — `expire`, `ei`, `sig`, `ip`, `mt`
+    /// aendern sich aber bei JEDEM Resolve. Damit war der Cache faktisch wirkungslos:
+    /// nach einem frischen Resolve wurde der sidx neu geholt, und genau dieser
+    /// Abruf faellt regelmaessig aus ([SidxCache] GIVEUP). Ohne sidx wird die
+    /// Playlist EIN Segment ueber die ganze Laufzeit — dann kann AVPlayer nicht
+    /// springen (in der App als "Springen geht mal, mal nicht" aufgeschlagen).
+    /// `id` + `itag` + `lmt` bezeichnen den Encode eindeutig, und der Index gehoert
+    /// zum Encode: ein einmal geholter sidx bleibt damit ueber alle spaeteren
+    /// Resolves hinweg gueltig.
     private static String cacheKey(String url, int start, int end) {
+        if (url != null) {
+            final String id = urlParam(url, "id");
+            final String itag = urlParam(url, "itag");
+            final String lmt = urlParam(url, "lmt");
+            if (id != null && itag != null && lmt != null)
+                return "id=" + id + "&itag=" + itag + "&lmt=" + lmt + "#" + start + "-" + end;
+        }
         String stable = url == null ? "" : url.replaceAll("([?&]cpn=)[A-Za-z0-9_-]{16}", "$1X");
         return stable + "#" + start + "-" + end;
+    }
+
+    private static String urlParam(String url, String name) {
+        final int q = url.indexOf('?');
+        if (q < 0) return null;
+        for (String kv : url.substring(q + 1).split("&")) {
+            final int eq = kv.indexOf('=');
+            if (eq > 0 && kv.substring(0, eq).equals(name)) return kv.substring(eq + 1);
+        }
+        return null;
     }
 
     // Aggressive per-attempt timeouts: these bound socket INACTIVITY, not total
