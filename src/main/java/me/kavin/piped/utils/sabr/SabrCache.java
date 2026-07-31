@@ -28,7 +28,11 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class SabrCache {
 
     private static final Path DIR = ensureDir();
-    private static final long MAX_CACHE_BYTES = 8L * 1024 * 1024 * 1024; // 8 GB
+    /// Cache-Deckel. Der Wert stammt aus der Zeit der 13-MB-Teilcaches; seit dem
+    /// WEB-Pfad kostet EIN Kids-Video ~724 MB, 8 GB sind also nur noch ~11
+    /// Videos. Stellbar per `SABR_CACHE_MAX_GB` — die eigentliche Sicherung ist
+    /// aber MIN_FREE_BYTES (freier Plattenplatz), s. maybeEvict.
+    private static final long MAX_CACHE_BYTES = envGb("SABR_CACHE_MAX_GB", 8);
     private static final ConcurrentHashMap<String, Object> LOCKS = new ConcurrentHashMap<>();
 
     // ── storm-fallback marks ────────────────────────────────────────────────
@@ -513,6 +517,13 @@ public final class SabrCache {
                 if (canAppend) publishTail(videoId, e.getKey(), e.getValue(), publishedLen);
                 else publishIfLarger(videoId, e.getKey(), e.getValue(), false);
             }
+            // WAEHREND des Downloads aufraeumen, nicht erst danach: ein Video
+            // waechst inzwischen auf ~700 MB (und belegt bis zum Schluss doppelt,
+            // weil .part und .bin nebeneinander liegen). Bis zum Session-Ende zu
+            // warten hiesse, den Deckel um Gigabytes zu ueberfahren. maybeEvict
+            // drosselt sich selbst auf einen Lauf pro 30 s und ruehrt das gerade
+            // laufende Video nicht an.
+            maybeEvict();
         };
         // Protokoll-Probe (2026-07-25): erzwingt einen Client-Modus fuer die
         // Session, um die Client<->Token-Konsistenz zu testen (0=ANDROID,
@@ -746,37 +757,83 @@ public final class SabrCache {
         return buf;
     }
 
+    /// Untergrenze fuer den FREIEN Plattenplatz. Der Cache-Deckel allein genuegt
+    /// nicht mehr: die SD-Karte teilt sich das Dateisystem mit allem anderen auf
+    /// dem Pi, und seit der WEB-Pfad komplette Videos holt, kostet EIN Video
+    /// ~724 MB — waehrend des Downloads sogar doppelt, weil `.part` und die
+    /// wachsende `.bin` nebeneinander liegen. `SABR_CACHE_MIN_FREE_GB` stellt
+    /// den Wert um.
+    private static final long MIN_FREE_BYTES = envGb("SABR_CACHE_MIN_FREE_GB", 3);
+
+    private static long envGb(String name, long defGb) {
+        final String v = System.getenv(name);
+        long gb = defGb;
+        if (v != null && !v.isBlank()) {
+            try { gb = Long.parseLong(v.trim()); } catch (NumberFormatException ignored) {}
+        }
+        return gb * 1024L * 1024 * 1024;
+    }
+
     private static long lastEvict = 0;
+
+    /// LRU-Eviction ueber GANZE VIDEOS.
+    ///
+    /// ⚠️ Vorher wurden einzelne `.bin` geloescht. Bei 13-MB-Fragmenten war das
+    /// egal, jetzt nicht mehr: faellt die Video-Datei und die Audio-Datei bleibt,
+    /// ist `anyFileFor` weiter true — der `ensureFile`-Guard verhindert dann
+    /// jeden Neu-Download, und das Video ist dauerhaft halb. Ausserdem blieben
+    /// die `.itags`-Manifeste ewig liegen. Jetzt fliegt pro Runde ein komplettes
+    /// Video (alle `_*.bin` + Manifest) raus, aeltestes zuerst — und niemals
+    /// eines, das gerade heruntergeladen wird.
     private static synchronized void maybeEvict() {
         final long now = System.currentTimeMillis();
         if (now - lastEvict < 30_000) return;
         lastEvict = now;
         try {
+            final Map<String, List<Path>> byVideo = new java.util.HashMap<>();
+            final Map<String, Long> sizeOf = new java.util.HashMap<>();
+            final Map<String, Long> touchedAt = new java.util.HashMap<>();
             long total = 0;
-            final List<Path> files = new ArrayList<>();
             try (var stream = Files.list(DIR)) {
                 for (Path p : (Iterable<Path>) stream::iterator) {
-                    if (p.getFileName().toString().endsWith(".bin")) files.add(p);
-                }
-            }
-            for (Path p : files) total += Files.size(p);
-            if (total <= MAX_CACHE_BYTES) return;
-            files.sort((a, b) -> {
-                try {
-                    return Long.compare(Files.getLastModifiedTime(a).toMillis(),
-                            Files.getLastModifiedTime(b).toMillis());
-                } catch (IOException ex) {
-                    return 0;
-                }
-            });
-            for (Path p : files) {
-                if (total <= MAX_CACHE_BYTES * 8 / 10) break;
-                try {
+                    final String n = p.getFileName().toString();
+                    final String id;
+                    if (n.endsWith(".bin")) id = n.substring(0, n.lastIndexOf('_'));
+                    else if (n.endsWith(".itags")) id = n.substring(0, n.length() - 6);
+                    else continue;
                     final long sz = Files.size(p);
-                    Files.delete(p);
-                    total -= sz;
-                } catch (IOException ignored) {}
+                    total += sz;
+                    byVideo.computeIfAbsent(id, k -> new ArrayList<>()).add(p);
+                    sizeOf.merge(id, sz, Long::sum);
+                    touchedAt.merge(id, Files.getLastModifiedTime(p).toMillis(), Math::max);
+                }
             }
+            final long free = Files.getFileStore(DIR).getUsableSpace();
+            if (total <= MAX_CACHE_BYTES && free >= MIN_FREE_BYTES) return;
+            // Ziel: unter 80% des Deckels UND ueber der Freiplatz-Grenze.
+            final long targetTotal = MAX_CACHE_BYTES * 8 / 10;
+            final List<String> lru = new ArrayList<>(byVideo.keySet());
+            lru.sort((a, b) -> Long.compare(touchedAt.getOrDefault(a, 0L), touchedAt.getOrDefault(b, 0L)));
+            // Dateinamen tragen die dateisichere Form der videoId — dagegen
+            // pruefen, nicht gegen die rohe (bei YouTube-IDs identisch, aber
+            // darauf soll sich das hier nicht verlassen).
+            final Set<String> activeSafe = new java.util.HashSet<>();
+            for (String v : DOWNLOAD_ACTIVE) activeSafe.add(safe(v));
+            long freed = 0;
+            for (String id : lru) {
+                if (total - freed <= targetTotal && free + freed >= MIN_FREE_BYTES) break;
+                if (activeSafe.contains(id)) continue;   // laeuft gerade
+                for (Path p : byVideo.get(id)) {
+                    try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                }
+                freed += sizeOf.getOrDefault(id, 0L);
+                System.out.println("[SabrCache] evict " + id + " ("
+                        + (sizeOf.getOrDefault(id, 0L) >> 20) + "MB)");
+            }
+            if (freed > 0)
+                System.out.println("[SabrCache] evict gesamt " + (freed >> 20) + "MB, Cache jetzt "
+                        + ((total - freed) >> 20) + "MB, frei "
+                        + ((free + freed) >> 30) + "GB");
         } catch (IOException ignored) {}
     }
 
