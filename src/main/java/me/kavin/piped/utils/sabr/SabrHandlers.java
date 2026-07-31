@@ -94,11 +94,22 @@ public final class SabrHandlers {
         return runSession(videoId, sink, family, contentBoundToken, clientMode, false, null);
     }
 
-    /// paced: 1x-Echtzeit-Session (SabrSession.fetchAll paced) für den Kids-
-    /// Readahead-Cap; publishHook läuft pro Runde nach dem Disk-Flush.
     public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
                                        String family, boolean contentBoundToken,
                                        int clientMode, boolean paced, Runnable publishHook) throws Exception {
+        return runSession(videoId, sink, family, contentBoundToken, clientMode, paced, publishHook, null, null);
+    }
+
+    /// paced: 1x-Echtzeit-Session (SabrSession.fetchAll paced) für den Kids-
+    /// Readahead-Cap; publishHook läuft pro Runde nach dem Disk-Flush.
+    /// resume: was schon auf Platte liegt (fortsetzen ab Segment N+1);
+    /// progress: Fortschrittsmeldung, aus der die Cache-Schicht ihren
+    /// Fortsetz-Zustand schreibt.
+    public static SabrMedia runSession(String videoId, SabrSession.Sink sink,
+                                       String family, boolean contentBoundToken,
+                                       int clientMode, boolean paced, Runnable publishHook,
+                                       java.util.Map<Integer, SabrSession.Resume> resume,
+                                       SabrSession.ProgressSink progress) throws Exception {
         final boolean vrClient = clientMode == 1;
         final boolean webClient = clientMode == 2;
         final boolean pureWeb = clientMode == 3;
@@ -278,6 +289,8 @@ public final class SabrHandlers {
         // anfordert; pausieren, solange genug Vorlauf da ist.
         session.setStopWhen(SESSION_STOP == null ? null : SESSION_STOP.apply(videoId));
         session.setPauseWhen(SESSION_PAUSE == null ? null : SESSION_PAUSE.apply(videoId));
+        session.setResume(resume);
+        session.setProgressSink(progress);
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer

@@ -175,6 +175,53 @@ public final class SabrCache {
         }
     }
 
+    // ── Fortsetz-Zustand ───────────────────────────────────────────────────
+    // Was in der .bin steckt, beschreibt eine winzige Nebendatei
+    // `<id>_<itag>.state`: bis zu welchem Segment sie reicht, wieviel Zeit das
+    // ist, wie gross das Video insgesamt ist — und die Byte-Laenge, bei der das
+    // galt. Nur wenn diese Laenge noch zur .bin passt, wird fortgesetzt; sonst
+    // ist der Zustand veraltet und wir fangen sauber von vorn an. Damit setzt
+    // eine wieder anfahrende Session ab Segment N+1 fort, statt alles noch
+    // einmal zu holen.
+    private static Path statePath(String videoId, int itag) {
+        return DIR.resolve(safe(videoId) + "_" + itag + ".state");
+    }
+
+    private static void writeState(String videoId, int itag, long binLen,
+                                   int lastSeq, long bufferedMs, int totalSegments, long totalDurationMs) {
+        try {
+            Files.writeString(statePath(videoId, itag),
+                    binLen + " " + lastSeq + " " + bufferedMs + " " + totalSegments + " " + totalDurationMs);
+        } catch (IOException ignored) {}
+    }
+
+    /// Fortsetz-Zustand aller Spuren eines Videos, sofern er zur .bin passt.
+    private static Map<Integer, SabrSession.Resume> readResume(String videoId) {
+        final Map<Integer, SabrSession.Resume> out = new java.util.LinkedHashMap<>();
+        try (var s = Files.newDirectoryStream(DIR, safe(videoId) + "_*.state")) {
+            for (Path p : s) {
+                final String n = p.getFileName().toString();
+                final int itag;
+                try {
+                    itag = Integer.parseInt(n.substring(n.lastIndexOf('_') + 1).replace(".state", ""));
+                } catch (NumberFormatException e) { continue; }
+                final String[] f = Files.readString(p).trim().split("\\s+");
+                if (f.length != 5) continue;
+                final Path bin = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
+                if (!Files.exists(bin) || Files.size(bin) != Long.parseLong(f[0])) continue;  // veraltet
+                final int lastSeq = Integer.parseInt(f[1]);
+                final int totalSegs = Integer.parseInt(f[3]);
+                // Schon vollstaendig -> nichts fortzusetzen. Ohne diese Bremse
+                // wuerde eine Fortsetzung die letzten Segmente ein zweites Mal
+                // anhaengen und die Datei zerstoeren.
+                if (totalSegs > 0 && lastSeq >= totalSegs) continue;
+                out.put(itag, new SabrSession.Resume(lastSeq, Long.parseLong(f[2]),
+                        totalSegs, Long.parseLong(f[4])));
+            }
+        } catch (Exception ignored) {}
+        return out;
+    }
+
     /// Anforderung des Players vermerken — Grundlage der Bedarfssteuerung.
     private static void noteRequest(String videoId, int itag, long endOffset) {
         LAST_REQUEST.put(videoId, System.currentTimeMillis());
@@ -658,12 +705,42 @@ public final class SabrCache {
         // DIESEM Versuch stammt; existiert schon eine aus einem frueheren
         // Versuch, bleibt es beim keep-larger-Publish am Ende (sonst wuerden
         // Bytes zweier Sessions ineinander laufen).
+        // Fortsetzen: passt der gespeicherte Zustand zur .bin, macht die Session
+        // ab Segment N+1 weiter und die .part enthaelt NUR den neuen Schwanz —
+        // der wird an die vorhandene .bin angehaengt. baseLen haelt fest, wo die
+        // .bin beim Start stand (Pruefgroesse fuers Anhaengen).
+        final Map<Integer, SabrSession.Resume> resume = readResume(videoId);
+        final Map<Integer, Long> baseLen = new ConcurrentHashMap<>();
+        for (var e : resume.entrySet()) {
+            try {
+                baseLen.put(e.getKey(), Files.size(DIR.resolve(safe(videoId) + "_" + e.getKey() + ".bin")));
+            } catch (IOException ignored) {}
+        }
+        final Map<Integer, long[]> progress = new ConcurrentHashMap<>();
+        final SabrSession.ProgressSink progressSink =
+                (itag, lastSeq, bufMs, totalSegs, totalDurMs) ->
+                        progress.put(itag, new long[]{lastSeq, bufMs, totalSegs, totalDurMs});
         final Map<Integer, Long> publishedLen = new ConcurrentHashMap<>();
-        final boolean canAppend = !anyFileFor(videoId);
+        // Anhaengen ist erlaubt, wenn noch nichts da ist ODER wir nachweislich
+        // an unseren eigenen Fortsetz-Zustand anknuepfen.
+        final boolean canAppend = !anyFileFor(videoId) || !resume.isEmpty();
         final Runnable publishHook = () -> {
             for (Map.Entry<Integer, Path> e : parts.entrySet()) {
-                if (canAppend) publishTail(videoId, e.getKey(), e.getValue(), publishedLen);
-                else publishIfLarger(videoId, e.getKey(), e.getValue(), false);
+                final int itag = e.getKey();
+                if (canAppend) {
+                    publishTail(videoId, itag, e.getValue(), publishedLen, baseLen.getOrDefault(itag, 0L));
+                    // Fortsetzpunkt mitschreiben — er muss zur .bin passen, sonst
+                    // wird er beim naechsten Start verworfen (s. readResume).
+                    final long[] pr = progress.get(itag);
+                    if (pr != null && pr[0] > 0) {
+                        try {
+                            final long binLen = Files.size(DIR.resolve(safe(videoId) + "_" + itag + ".bin"));
+                            writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3]);
+                        } catch (IOException ignored) {}
+                    }
+                } else {
+                    publishIfLarger(videoId, itag, e.getValue(), false);
+                }
             }
             // WAEHREND des Downloads aufraeumen, nicht erst danach: ein Video
             // waechst inzwischen auf ~700 MB (und belegt bis zum Schluss doppelt,
@@ -693,7 +770,8 @@ public final class SabrCache {
             System.out.println("[Sabr] PROBE contentBound=" + effContentBound + " (erzwungen)");
         SabrHandlers.SabrMedia result = null;
         try {
-            result = SabrHandlers.runSession(videoId, sink, family, effContentBound, effClientMode, paced, publishHook);
+            result = SabrHandlers.runSession(videoId, sink, family, effContentBound, effClientMode,
+                    paced, publishHook, resume, progressSink);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
         } finally {
@@ -701,8 +779,29 @@ public final class SabrCache {
             // the error path (runSession throws before the session's finally runs).
             for (OutputStream os : opened.values()) { try { os.close(); } catch (IOException ignored) {} }
         }
-        for (Map.Entry<Integer, Path> e : parts.entrySet())
-            publishIfLarger(videoId, e.getKey(), e.getValue(), true);
+        // Schlussveroeffentlichung. ⚠️ Beim FORTSETZEN enthaelt die .part nur den
+        // neuen Schwanz und ist damit KLEINER als die .bin — der keep-larger-Weg
+        // wuerde sie verwerfen und die letzte Runde ginge verloren (die Session
+        // bricht bei `complete`/`stuck` VOR dem naechsten Publish-Hook ab).
+        // Also in dem Fall anhaengen statt vergleichen.
+        for (Map.Entry<Integer, Path> e : parts.entrySet()) {
+            final int itag = e.getKey();
+            final long base = baseLen.getOrDefault(itag, 0L);
+            if (canAppend && base > 0) {
+                publishTail(videoId, itag, e.getValue(), publishedLen, base);
+                try { Files.deleteIfExists(e.getValue()); } catch (IOException ignored) {}
+            } else {
+                publishIfLarger(videoId, itag, e.getValue(), true);
+            }
+            // Fortsetzpunkt final festhalten, passend zur fertigen .bin.
+            final long[] pr = progress.get(itag);
+            if (pr != null && pr[0] > 0) {
+                try {
+                    final long binLen = Files.size(DIR.resolve(safe(videoId) + "_" + itag + ".bin"));
+                    writeState(videoId, itag, binLen, (int) pr[0], pr[1], (int) pr[2], pr[3]);
+                } catch (IOException ignored) {}
+            }
+        }
         return result;
     }
 
@@ -734,17 +833,21 @@ public final class SabrCache {
     /// flusht vor dem Hook, es werden also nur ganze Segmente sichtbar; Leser
     /// sehen jederzeit ein gueltiges PRAEFIX der Enddatei (Anhaengen aendert
     /// bereits gelesene Offsets nicht).
-    private static void publishTail(String videoId, int itag, Path part, Map<Integer, Long> published) {
+    private static void publishTail(String videoId, int itag, Path part,
+                                    Map<Integer, Long> published, long baseLen) {
         final Path bin = DIR.resolve(safe(videoId) + "_" + itag + ".bin");
         try {
             final long partSize = Files.exists(part) ? Files.size(part) : 0;
             final long done = published.getOrDefault(itag, 0L);
             if (partSize <= done) return;
             final long binSize = Files.exists(bin) ? Files.size(bin) : 0;
-            // Fremde .bin (anderer Versuch/Refill) -> nicht anhaengen, sonst
+            // Die .bin muss genau dort stehen, wo wir sie verlassen haben:
+            // Ausgangslaenge (0 bei frischem Video, sonst der Fortsetzpunkt)
+            // plus das, was diese Sitzung schon angehaengt hat. Passt das nicht,
+            // schreibt jemand anderes hinein — dann NICHT anhaengen, sonst
             // mischen sich zwei Sessions. Der terminale keep-larger-Publish
             // raeumt das am Ende korrekt auf.
-            if (binSize != done) return;
+            if (binSize != baseLen + done) return;
             try (RandomAccessFile in = new RandomAccessFile(part.toFile(), "r");
                  OutputStream out = Files.newOutputStream(bin,
                          java.nio.file.StandardOpenOption.CREATE,
@@ -947,6 +1050,7 @@ public final class SabrCache {
                     final String n = p.getFileName().toString();
                     final String id;
                     if (n.endsWith(".bin")) id = n.substring(0, n.lastIndexOf('_'));
+                    else if (n.endsWith(".state")) id = n.substring(0, n.lastIndexOf('_'));
                     else if (n.endsWith(".itags")) id = n.substring(0, n.length() - 6);
                     else continue;
                     final long sz = Files.size(p);

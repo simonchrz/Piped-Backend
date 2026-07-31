@@ -76,6 +76,18 @@ public final class SabrSession {
         long estStartMs(int seq, long raw) { return raw > 0 ? raw : perSegMs() * Math.max(0, seq - 1); }
         long estDurMs(long raw) { return raw > 0 ? raw : perSegMs(); }
 
+        /// Letztes Segment des ersten zusammenhaengenden Laufs — bis hierhin ist
+        /// die Datei auf Platte lueckenlos, nur das darf als Fortsetzpunkt
+        /// gespeichert werden.
+        int contiguousEndSeq() {
+            int last = 0, prev = Integer.MIN_VALUE;
+            for (int q : segTimes.keySet()) {
+                if (prev != Integer.MIN_VALUE && q != prev + 1) break;
+                last = q; prev = q;
+            }
+            return last;
+        }
+
         long contiguousEndMs() {
             long end = 0; int prev = Integer.MIN_VALUE;
             for (var e : segTimes.entrySet()) {
@@ -104,6 +116,11 @@ public final class SabrSession {
                 writeCursor = buf.firstKey();          // true min seq (TreeMap)
             }
             while (buf.containsKey(writeCursor)) {
+                // ⚠️ Beim FORTSETZEN ist initWritten=true, ohne dass je ein
+                // Strom geoeffnet wurde (das Init liegt schon in der .bin) —
+                // ohne dieses Oeffnen hier lief die erste Schreiboperation der
+                // fortgesetzten Sitzung in eine NPE.
+                if (out == null) out = sink.open(fmt.itag);
                 final byte[] d = buf.remove(writeCursor);
                 out.write(d);
                 bytesWritten += d.length;
@@ -175,6 +192,61 @@ public final class SabrSession {
     /// sonst laeuft die Sitzung ab. Deshalb hier ein Heartbeat kurz davor.
     private java.util.function.BooleanSupplier pauseWhen;
     public void setPauseWhen(java.util.function.BooleanSupplier s) { this.pauseWhen = s; }
+
+    /// FORTSETZEN AB SEGMENT N. Was schon auf Platte liegt, beschreibt der
+    /// Aufrufer hier; die Session tut dann so, als haette sie diese Segmente in
+    /// dieser Sitzung geholt: sie meldet sie in `buffered_ranges`, setzt die
+    /// Spielzeit ans Ende des Vorhandenen und schreibt erst ab N+1 weiter.
+    /// Ohne das begann jede Wiederanfahrt wieder bei Segment 1 — der
+    /// keep-larger-Publish rettete zwar den Cache, aber die Bytes wurden ein
+    /// zweites Mal geholt.
+    public static final class Resume {
+        public final int lastSeq; public final long bufferedMs;
+        public final int totalSegments; public final long totalDurationMs;
+        public Resume(int lastSeq, long bufferedMs, int totalSegments, long totalDurationMs) {
+            this.lastSeq = lastSeq; this.bufferedMs = bufferedMs;
+            this.totalSegments = totalSegments; this.totalDurationMs = totalDurationMs;
+        }
+    }
+    private Map<Integer, Resume> resume = Map.of();
+    public void setResume(Map<Integer, Resume> r) { if (r != null && !r.isEmpty()) resume = r; }
+
+    /// Fortschrittsmeldung pro Runde — die Cache-Schicht schreibt daraus ihre
+    /// `.state`-Datei, damit die naechste Sitzung fortsetzen kann.
+    @FunctionalInterface
+    public interface ProgressSink {
+        void report(int itag, int lastContiguousSeq, long bufferedMs, int totalSegments, long totalDurationMs);
+    }
+    private ProgressSink progressSink;
+    public void setProgressSink(ProgressSink p) { this.progressSink = p; }
+
+    /// Zustand aus `resume` in die FStates spiegeln. Die Zeitstempel werden aus
+    /// der Gesamtdauer geschaetzt (wie estStartMs/estDurMs bei ANDROID) — dem
+    /// Server kommt es auf die Segment-INDIZES an, und die stimmen exakt.
+    private void applyResume(Map<Integer, FState> states) {
+        for (var e : resume.entrySet()) {
+            final int itag = e.getKey();
+            final Resume r = e.getValue();
+            if (r.lastSeq <= 0 || r.totalSegments <= 0) continue;
+            final Fmt fmt = prefAudio != null && prefAudio.itag == itag ? prefAudio
+                    : prefVideo != null && prefVideo.itag == itag ? prefVideo : null;
+            if (fmt == null) continue;
+            final FState s = states.computeIfAbsent(itag, k -> new FState(fmt));
+            s.totalSegments = r.totalSegments;
+            s.totalDurationMs = r.totalDurationMs;
+            s.bufferedMs = r.bufferedMs;
+            s.maxSeq = r.lastSeq;
+            s.initWritten = true;              // Init liegt bereits in der .bin
+            s.writeCursor = r.lastSeq + 1;     // ab hier wird angehaengt
+            final long perSeg = s.perSegMs();
+            for (int q = 1; q <= r.lastSeq; q++) {
+                s.seen.add(q);
+                s.segTimes.put(q, new long[]{perSeg * (q - 1), perSeg});
+            }
+            System.out.println("[Sabr] " + itag + " fortsetzen ab Segment " + (r.lastSeq + 1)
+                    + "/" + r.totalSegments + " (" + r.bufferedMs + "ms gepuffert)");
+        }
+    }
     private byte[] poToken;         // decoded gvs po_token bytes, or null (mid-session erneuerbar)
     /// Liefert einen FRISCHEN content-bound po_token. Wird aufgerufen, wenn der
     /// Server STREAM_PROTECTION_STATUS=3 („Attestierung erforderlich") meldet.
@@ -402,6 +474,11 @@ public final class SabrSession {
         final int stuckLimit = paced ? 24 : 3;   // paced: ~2 min quiet before giving up
         final long wallStart = System.currentTimeMillis();
         final Result res = new Result();
+        applyResume(states);
+        if (!states.isEmpty()) {
+            // Ab dem Ende des Vorhandenen weiterfragen, nicht bei 0.
+            playerTimeMs = states.values().stream().mapToLong(FState::contiguousEndMs).min().orElse(0);
+        }
         String stopReason = "maxIterations";
         System.out.println("[Sabr] session start maxIter=" + maxIterations
                 + (paced ? " PACED" : "")
@@ -609,6 +686,14 @@ public final class SabrSession {
                     // erst am Ende (erster Tap wartete gemessen 161 s).
                     if (publishHook != null) {
                         for (FState s : states.values()) s.flush();
+                        // ERST melden, DANN veroeffentlichen: der Hook schreibt
+                        // die .state-Datei und braucht dafuer den Stand, der
+                        // gleich in der .bin landet.
+                        if (progressSink != null) {
+                            for (FState s : states.values())
+                                progressSink.report(s.fmt.itag, s.contiguousEndSeq(), s.bufferedMs,
+                                        s.totalSegments, s.totalDurationMs);
+                        }
                         publishHook.run();
                     }
                 } else {
@@ -621,6 +706,16 @@ public final class SabrSession {
             }
 
             res.complete = !states.isEmpty() && states.values().stream().allMatch(FState::complete);
+            // ⚠️ ABSCHLUSSMELDUNG. Die Schleife bricht bei `complete`/`stuck` VOR
+            // dem naechsten Publish-Hook ab, der Fortsetzpunkt des Aufrufers
+            // haengt sonst ein bis zwei Runden zurueck — und eine spaetere
+            // Fortsetzung wuerde bereits vorhandene Segmente ein zweites Mal
+            // anhaengen (Datei kaputt). Deshalb hier der Endstand.
+            if (progressSink != null) {
+                for (FState s : states.values())
+                    progressSink.report(s.fmt.itag, s.contiguousEndSeq(), s.bufferedMs,
+                            s.totalSegments, s.totalDurationMs);
+            }
             for (FState s : states.values()) {
                 final Map<String, Object> info = new LinkedHashMap<>();
                 info.put("segments", s.seen.size());
