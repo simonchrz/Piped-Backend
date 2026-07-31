@@ -492,7 +492,7 @@ public class StreamHandlers {
 
                 if (throttleSuspect) {
                     System.out.println("[StreamHandlers] " + videoId + " "
-                            + (degraded ? "degraded (audio=0)" : "URLs throttled (HEAD=403 auf clen/2)")
+                            + (degraded ? "degraded (audio=0)" : throttleNoted(videoId))
                             + ", retry mit force-WebEmbed");
                     YoutubeStreamExtractor.FORCE_WEB_EMBED_FOR_THREAD.set(Boolean.TRUE);
                     try {
@@ -649,6 +649,9 @@ public class StreamHandlers {
                 // hand the app a 200 with dead URLs; surface a distinct 503 so it can
                 // show "YouTube is rate-limiting" instead of a generic timeout.
                 if (stillThrottled) {
+                    // Merken: dieses Video ist gedrosselt. Der Playlist-Bau
+                    // bevorzugt danach den Cache statt kurzlebiger Direkt-URLs.
+                    SabrCache.noteThrottled(videoId);
                     System.out.println("[StreamHandlers] " + videoId
                             + " STILL throttled after WebEmbed + TVHTML5 + SABR (segments 403) -> 503 throttled");
                     // ⚠️ NICHT den Resolve hier in den synth-hls-Cache seeden
@@ -1184,4 +1187,11 @@ public class StreamHandlers {
         }
     }
 
+
+    /// Drossel-Marke setzen und Text fuers Log liefern (s. SabrCache.isSabrMode:
+    /// der Playlist-Bau bevorzugt danach den Cache).
+    private static String throttleNoted(String videoId) {
+        SabrCache.noteThrottled(videoId);
+        return "URLs throttled (HEAD=403 auf clen/2)";
+    }
 }

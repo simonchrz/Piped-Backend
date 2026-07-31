@@ -68,6 +68,7 @@ public final class SparseStore {
             raf.write(data);
         }
         buildOffsets(videoId, itag, data, lmt);
+        persist(videoId, itag, lmt, TOTAL_SEGS.getOrDefault(key(videoId, itag), 0));
     }
 
     /// Segment an SEINE Position schreiben — auch wenn frühere fehlen.
@@ -92,8 +93,33 @@ public final class SparseStore {
                     if (f.length >= 3) parseRanges(f[2], set);
                 }
             } catch (Exception ignored) {}
+            if (set.isEmpty()) deriveFromLegacyFile(videoId, itag, set);
             return set;
         });
+    }
+
+    /// ⚠️ ALTBESTAND. Dateien aus der Zeit vor dem Streifen-Modus haben keine
+    /// Karte — sie sind aber lueckenlos von vorne gefuellt. Ohne diese Ableitung
+    /// gilt „nichts vorhanden", und die Playlist kommt mit NULL Segmenten heraus,
+    /// obwohl Megabytes auf Platte liegen (2026-07-31 an qBFvRSXjaEI: 11,5 MB
+    /// Datei, 7-Byte-Karte, leere Playlist).
+    private static void deriveFromLegacyFile(String videoId, int itag, NavigableSet<Integer> set) {
+        try {
+            final Path bin = binPath(videoId, itag);
+            if (!Files.exists(bin)) return;
+            if (!ensureOffsets(videoId, itag)) return;
+            final long[] offs = OFFSETS.get(key(videoId, itag));
+            if (offs == null) return;
+            final long len = Files.size(bin);
+            for (int seq = 1; seq < offs.length; seq++) {
+                final long end = (seq + 1 < offs.length ? offs[seq + 1] : Long.MAX_VALUE);
+                if (end > len) break;                 // Segment nicht vollstaendig
+                set.add(seq);
+            }
+            if (!set.isEmpty())
+                System.out.println("[Sparse] " + videoId + "/" + itag
+                        + " Altbestand erkannt: " + set.size() + " Segmente aus der Datei abgeleitet");
+        } catch (Exception ignored) {}
     }
 
     /// Offset-Tabelle bereitstellen, auch ohne laufende Sitzung: der sidx steht
@@ -187,6 +213,7 @@ public final class SparseStore {
     }
 
     private static final Map<String, Long> TOTAL_LEN = new ConcurrentHashMap<>();
+    private static final Map<String, Integer> TOTAL_SEGS = new ConcurrentHashMap<>();
 
     /// Byte-Position eines Segments; -1 wenn (noch) unbekannt.
     public static long offsetOf(String videoId, int itag, int seq) {
@@ -247,7 +274,12 @@ public final class SparseStore {
         }
         OFFSETS.put(key(videoId, itag), offs);
         TOTAL_LEN.put(key(videoId, itag), cursor);
-        persist(videoId, itag, lmt, entries.size());
+        TOTAL_SEGS.put(key(videoId, itag), entries.size());
+        // ⚠️ HIER NICHT persistieren: persist() liest present(), und present()
+        // ruft (bei fehlender Karte) die Ableitung, die wieder hierher fuehrt.
+        // ConcurrentHashMap bricht so eine rekursive Aktualisierung ab, der
+        // Fehler wurde verschluckt und die Karte blieb LEER — Ergebnis war eine
+        // Playlist mit null Segmenten trotz 11,5 MB auf Platte (2026-07-31).
         System.out.println("[Sparse] " + videoId + "/" + itag + " Offset-Tabelle: "
                 + entries.size() + " Segmente, Gesamtlaenge " + cursor + "B");
     }

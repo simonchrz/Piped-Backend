@@ -38,13 +38,48 @@ public class YoutubeUnplayable {
     /// Returns YouTube's reason for an unplayable video, or null if the web
     /// page reports it as playable (= a genuine extraction failure, keep the
     /// 500) or the probe itself fails.
+    /// Login-Cookies, NUR die fuer youtube.com. ⚠️ Ein Browser-Export enthaelt
+    /// ALLE Domains; schickt man alles zusammen, antwortet Google mit 302 auf
+    /// accounts.google.com/CookieMismatch und man ist wieder anonym.
+    private static String youtubeCookieHeader() {
+        String path = System.getenv("YOUTUBE_COOKIES_FILE");
+        if (path == null || path.isEmpty()) path = "/app/youtube-cookies.txt";
+        final java.io.File f = new java.io.File(path);
+        if (!f.exists()) return null;
+        final StringBuilder sb = new StringBuilder();
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                final String[] parts = line.split("\\t");
+                if (parts.length < 7 || !parts[0].contains("youtube.com")) continue;
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(parts[5]).append('=').append(parts[6]);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return sb.length() == 0 ? null : sb.toString();
+    }
+
     public static String probeReason(String videoId) {
         try {
-            Request req = new Request.Builder()
+            // ⚠️ MIT unseren Login-Cookies proben. Anonym sieht die Watch-Seite
+            // die Bot-Wall („Melde dich an, damit wir sehen, dass du kein Bot
+            // bist") — und dieser Grund wurde als Urteil „nicht abspielbar" an
+            // die App gereicht, obwohl unser ANGEMELDETER Pfad das Video sehr
+            // wohl bekommt (2026-07-31 an qBFvRSXjaEI: /sabr lieferte 206 in
+            // 4 ms, waehrend die Variante 403 {"unplayable":true} zurueckgab).
+            // Ein Grund, den nur ein anonymer Besucher sieht, taugt nicht als
+            // Aussage ueber UNSERE Abspielbarkeit.
+            final Request.Builder rb = new Request.Builder()
                     .url("https://www.youtube.com/watch?v=" + videoId + "&hl=de")
                     .header("User-Agent", UA)
-                    .header("Accept-Language", "de,en;q=0.8")
-                    .build();
+                    .header("Accept-Language", "de,en;q=0.8");
+            final String cookieHeader = youtubeCookieHeader();
+            if (cookieHeader != null) rb.header("Cookie", cookieHeader);
+            Request req = rb.build();
             try (Response resp = Constants.h2client.newCall(req).execute()) {
                 if (!resp.isSuccessful() || resp.body() == null)
                     return null;

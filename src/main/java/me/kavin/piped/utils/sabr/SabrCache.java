@@ -59,7 +59,25 @@ public final class SabrCache {
     private static final long STORM_TTL_MS = 10 * 60_000L;
 
     public static void markStorm(String videoId) {
+        noteThrottled(videoId);
         STORM_MARKS.put(videoId, System.currentTimeMillis() + STORM_TTL_MS);
+    }
+
+    /// Wurde dieses Video kuerzlich als gedrosselt erlebt? Speist sich aus den
+    /// Sturm- und Cap-Marken; laenger gueltig als der Sturm-Modus selbst, damit
+    /// der Playlist-Bau nicht staendig zwischen Direktpfad und Cache pendelt.
+    private static final Map<String, Long> THROTTLE_SEEN = new ConcurrentHashMap<>();
+    private static final long THROTTLE_SEEN_TTL_MS = 60 * 60_000L;
+
+    public static void noteThrottled(String videoId) {
+        THROTTLE_SEEN.put(videoId, System.currentTimeMillis() + THROTTLE_SEEN_TTL_MS);
+    }
+
+    public static boolean wasThrottledRecently(String videoId) {
+        final Long exp = THROTTLE_SEEN.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { THROTTLE_SEEN.remove(videoId); return false; }
+        return true;
     }
 
     public static boolean isStormMarked(String videoId) {

@@ -271,6 +271,19 @@ public class SynthHlsHandlers {
         // Storm-marked by StreamHandlers stage 4 (WebEmbed+TVHTML5 segments 403,
         // SABR viability probed) — serve from /sabr while the mark lives (30 min).
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return true;
+        // ⚠️ FLACKERNDE Videos aus dem Cache bedienen. Bei Made-for-Kids sterben
+        // die Direkt-URLs binnen Sekunden: die Playlist wird sauber gebaut, ihre
+        // Segmente antworten Minuten spaeter schon mit 302/403 (2026-07-31
+        // mehrfach gemessen). Jede Neuaufloesung bringt wieder URLs mit derselben
+        // kurzen Haltbarkeit — der Cache dagegen liegt bei uns und haelt. Also:
+        // haben wir Material UND ist das Video als gedrosselt bekannt, hat der
+        // Cache Vorrang vor frischen Direkt-URLs.
+        if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)
+                && me.kavin.piped.utils.sabr.SabrCache.wasThrottledRecently(videoId)) {
+            System.out.println("[ResolvePath] " + videoId
+                    + " -> SABR-CACHE (bekannt gedrosselt, Direkt-URLs halten nicht)");
+            return true;
+        }
         // Resolve lieferte GAR NICHTS (Made-for-Kids-Bot-Gate: Player-Response ohne
         // adaptiveFormats, „Melde dich an, damit wir sehen, dass du kein Bot bist"),
         // aber die Bytes liegen schon bei uns → aus dem Cache ausliefern statt einen
@@ -317,7 +330,11 @@ public class SynthHlsHandlers {
     /// bei Drosselung zusaetzlich die Client-Stufen — das sind Sekunden, keine
     /// Millisekunden. Warten kostet hier nichts: der Resolve-Slot ist zu Beginn
     /// von sabrStreamPlaylist bereits freigegeben.
-    private static final int SABR_PLAYLIST_WAIT_MS = 15_000;
+    /// ⚠️ MUSS unter dem Resolve-Budget bleiben (ServerLauncher.withResolveBudget,
+    /// 12 s) — sonst bricht der Aufruf VON AUSSEN mit 500 ab, waehrend wir noch
+    /// warten (2026-07-31 selbst gebaut: 15 s Wartefrist gegen 12 s Budget ->
+    /// "YT resolve exceeded 12s budget", 0 Segmente).
+    private static final int SABR_PLAYLIST_WAIT_MS = 10_000;
 
     /// Vom Route-Layer gesetzt: gibt den YT-Resolve-Slot FRÜH frei, sobald der
     /// Request nur noch auf LOKALE SABR-Daten wartet.
@@ -899,6 +916,11 @@ public class SynthHlsHandlers {
                 throttled = isStreamsThrottled(s);
                 throttleMs = System.currentTimeMillis() - th0;
                 if (throttled) {
+                    // Genau HIER wissen wir, dass das Video gedrosselt ist —
+                    // auch wenn der WebEmbed-Versuch gleich neue URLs bringt.
+                    // Die halten bei Made-for-Kids oft nur Sekunden; der naechste
+                    // Playlist-Bau nimmt deshalb den Cache (s. isSabrMode).
+                    me.kavin.piped.utils.sabr.SabrCache.noteThrottled(videoId);
                     System.out.println("[SynthHls] " + videoId + " URLs throttled (HEAD=403 auf clen/2), retry mit force-WebEmbed");
                     webembedTried = true;
                     long w0 = System.currentTimeMillis();
