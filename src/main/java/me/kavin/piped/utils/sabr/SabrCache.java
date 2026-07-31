@@ -806,7 +806,13 @@ public final class SabrCache {
     }
 
     private static void download(String videoId, boolean allowPacedRequested, boolean demand) throws Exception {
-        final boolean allowPaced = allowPacedRequested && pacedEnabled();
+        // YT_SABR_PACED_ALWAYS=1: getaktete 1x-Sitzung schon im ERSTLAUF, nicht
+        // erst beim Nachfuellen markierter Videos. Gegenprobe zur Frage, ob der
+        // Kids-Cap am zu schnell vorlaufenden player_time haengt â der Server
+        // nennt targetA/targetV=15000ms, unser Play-Head macht in ~15 s Uhrzeit
+        // 61 s Wiedergabe.
+        final boolean allowPaced = "1".equals(System.getenv("YT_SABR_PACED_ALWAYS"))
+                || (allowPacedRequested && pacedEnabled());
         // Known capped (kids): burst rungs are wasted requests — refill goes
         // straight to the paced 1x session; the sync warm path keeps serving
         // the existing partial cache untouched.
@@ -947,7 +953,12 @@ public final class SabrCache {
     /// session result, or null when the session threw before finishing.
     private static SabrHandlers.SabrMedia attempt(String videoId, String family,
                                                   boolean contentBoundToken, int clientMode) {
-        return attempt(videoId, family, contentBoundToken, clientMode, false);
+        // YT_SABR_PACED_ALWAYS=1: auch der ERSTLAUF getaktet. Der Kids-Cap haengt
+        // am behaupteten Play-Head â mit Kopf-Kappe auf 12 s kam prot=3 nie,
+        // dafuer versiegten die Segmente (der Server liefert nur ~15 s ueber den
+        // Kopf hinaus). Richtig ist der Browser-Weg: Kopf in Echtzeit mitfuehren.
+        return attempt(videoId, family, contentBoundToken, clientMode,
+                "1".equals(System.getenv("YT_SABR_PACED_ALWAYS")));
     }
 
     private static SabrHandlers.SabrMedia attempt(String videoId, String family,

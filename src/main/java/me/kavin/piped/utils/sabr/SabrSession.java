@@ -726,6 +726,16 @@ public final class SabrSession {
                 final long frontier = states.values().stream().mapToLong(FState::contiguousEndMs).min().orElse(playerTimeMs);
                 if (!paced) {
                     playerTimeMs = frontier;
+                    // GEGENPROBE YT_SABR_HEAD_CAP_MS: Play-Head bewusst niedrig
+                    // halten. Messbild 2026-07-31: prot kippt auf 3, sobald
+                    // UNSER behaupteter Play-Head ~55-61 s erreicht â getaktet
+                    // wie ungetaktet. Chromium meldet dabei 12,5 s Play-Head und
+                    // puffert trotzdem 100 s. Der Vorlauf laeuft dort ueber die
+                    // buffered_ranges, nicht ueber den Kopf.
+                    final String kappe = System.getenv("YT_SABR_HEAD_CAP_MS");
+                    if (kappe != null && !kappe.isEmpty()) try {
+                        playerTimeMs = Math.min(playerTimeMs, Long.parseLong(kappe.trim()));
+                    } catch (NumberFormatException ignored) { }
                     // Pro Runde flushen und veroeffentlichen, damit der Cache
                     // WAEHREND des Downloads waechst: eine komplette Session
                     // dauert Minuten, und ohne das entsteht die servierte Datei
