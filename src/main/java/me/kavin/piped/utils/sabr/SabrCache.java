@@ -715,7 +715,15 @@ public final class SabrCache {
         // Stufe 1: der Default-Client (WEB) ueber beide Egress-Familien —
         // uebersprungen, solange das WEB-Memo steht (s. WEB_BLOCKED_UNTIL).
         final String fam1 = me.kavin.piped.utils.EgressManager.activeEgress();
-        final boolean skipWeb = DEFAULT_CLIENT != 0 && webBlocked();
+        // ⚠️ Das WEB-Memo spart Fehlversuche beim VORLADEN — aber wenn der Nutzer
+        // WARTET (Sprung), muss der beste Weg probiert werden: der WEB-Pfad ist
+        // der einzige, der die Attestierungssperre bricht (belegt: komplette
+        // Kids-Videos). Ohne diese Ausnahme lief jeder Sprung auf ANDROID und
+        // damit in prot=3 (2026-07-31 gemessen: Sprung auf Segment 332 korrekt
+        // ausgefuehrt, Server lieferte nichts, weil ANDROID gedeckelt ist).
+        final boolean skipWeb = DEFAULT_CLIENT != 0 && webBlocked() && !demand;
+        if (demand && webBlocked())
+            System.out.println("[SabrCache] " + videoId + " Sprung: WEB-Memo uebergangen");
         if (skipWeb)
             System.out.println("[SabrCache] " + videoId
                     + " WEB-Memo aktiv -> direkt ANDROID (spart 2 Fehlversuche)");
