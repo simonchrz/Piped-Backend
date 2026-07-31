@@ -44,7 +44,32 @@ public final class SabrHandlers {
     /// SABR is viable when it answers with a serverAbrStreamingUrl — the media
     /// transport itself is verified later by the actual download (ensureFile).
     /// Bounded by androidPlayer's own timeouts; any failure = not viable.
+    /// ⚠️ Mit DEM Client proben, den die Leiter auch benutzt.
+    ///
+    /// Die Probe fragte den ANDROID-Client an — anonym, ohne Token — waehrend
+    /// der Standard laengst WEB ist. Im Drosselfenster scheitert der
+    /// ANDROID-Aufruf, also meldeten wir „SABR tot" und gaben 503 zurueck,
+    /// obwohl der WEB-Pfad lieferte: gemessen 2026-07-31 an S8UJrXGlGmg —
+    /// /streams antwortete 503, ein direkter /sabr-Abruf 206 in 2,6 s.
+    /// Erst WEB (mit visitorData + Attestierung wie die echte Sitzung),
+    /// dann ANDROID als Rueckfall.
     public static boolean sabrViable(String videoId) {
+        String visitorData = null, attest = null;
+        try {
+            final BgPoTokenProvider bg = BgPoTokenProvider.instance();
+            if (bg != null) {
+                final PoTokenResult pot = bg.sabrSessionPoToken();
+                if (pot != null) {
+                    visitorData = pot.visitorData;
+                    attest = pot.playerRequestPoToken;
+                }
+            }
+            if (webPlayer(videoId, visitorData, null, attest)
+                    .path("streamingData").path("serverAbrStreamingUrl").asText(null) != null)
+                return true;
+        } catch (Exception ignored) {
+            // WEB nicht verfuegbar -> ANDROID probieren
+        }
         try {
             return androidPlayer(videoId, null, null, null, false)
                     .path("streamingData").path("serverAbrStreamingUrl")
