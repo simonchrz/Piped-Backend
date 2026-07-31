@@ -495,8 +495,31 @@ public final class SabrCache {
         else SEEK_PROVEN.remove(videoId);
     }
 
+    /// Waechst der Cache gerade? Dann liefert die Quelle JETZT — der staerkste
+    /// verfuegbare Beleg, dass wir fehlende Stellen nachfordern koennen.
+    private static final Map<String, Long> LAST_GROWTH = new ConcurrentHashMap<>();
+    private static final Map<String, Integer> LAST_SEQ_SEEN = new ConcurrentHashMap<>();
+    private static final long GROWTH_FRESH_MS = 60_000;
+
+    private static void noteGrowth(String videoId, int itag, int lastSeq) {
+        final String k = videoId + "_" + itag;
+        final Integer prev = LAST_SEQ_SEEN.put(k, lastSeq);
+        if (prev == null || lastSeq > prev) LAST_GROWTH.put(videoId, System.currentTimeMillis());
+    }
+
+    private static boolean growingNow(String videoId) {
+        final Long t = LAST_GROWTH.get(videoId);
+        return t != null && System.currentTimeMillis() - t < GROWTH_FRESH_MS;
+    }
+
     public static boolean seekable(String videoId) {
         if (seekUnavailable(videoId)) return false;
+        // Ein laufender, liefernder Download ist Beleg genug. Ohne das bekaeme
+        // ein Video, das GERADE geladen wird, nur eine EVENT-Playlist ohne
+        // ENDLIST — und die zeigt AVPlayer als Livestream: KEINE Gesamtdauer,
+        // KEIN Springen (so in der App gemeldet, waehrend der Cache von 96 auf
+        // 100 Segmente wuchs).
+        if (growingNow(videoId)) return true;
         final Long exp = SEEK_PROVEN.get(videoId);
         if (exp == null) return false;
         if (exp < System.currentTimeMillis()) { SEEK_PROVEN.remove(videoId); return false; }
@@ -976,6 +999,7 @@ public final class SabrCache {
                 for (var pe : progress.entrySet()) {
                     final long[] pr = pe.getValue();
                     SparseStore.persist(videoId, pe.getKey(), pr[4], (int) pr[2]);
+                    noteGrowth(videoId, pe.getKey(), (int) pr[0]);
                 }
             }
             maybeEvict();
