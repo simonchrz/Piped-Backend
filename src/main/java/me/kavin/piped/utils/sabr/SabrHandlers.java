@@ -38,7 +38,10 @@ public final class SabrHandlers {
     private static final String WEB_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
     private static final String WEB_EMBEDDED_VERSION = "1.20260122.01.00";
-    private static final String WEB_VERSION = "2.20260122.01.00";
+    /// ⚠️ Am 2026-07-31 meldete ein echter Chromium 2.20260731.00.00 — unsere
+    /// Konstante war ein halbes Jahr alt. Der Wert steht auch im att/get-Kontext
+    /// und im Präge-Kontext; alle drei müssen zusammenpassen.
+    private static final String WEB_VERSION = "2.20260731.00.00";
 
     /// Cheap viability probe for the storm fallback: ONE ANDROID player call.
     /// SABR is viable when it answers with a serverAbrStreamingUrl — the media
@@ -245,8 +248,18 @@ public final class SabrHandlers {
         final byte[] clientInfo;
         final String ua;
         if (pureWeb) {
+            // ⚠️ VOLLE Form. Wir schickten hier nur clientName+Version (22 B).
+            // Ein echter Web-Player schickt 68 B — Sprache, Gerät und Betriebs-
+            // system gehören dazu (Feldvergleich gegen einen echten Chromium-
+            // Mitschnitt, 2026-07-31: Feld 19.1 wir 22 B vs. Chromium 68 B).
+            // Der po_token wird gegen DIESE Client-Angaben geprüft; ein Rumpf-
+            // Block ist der wahrscheinlichste Grund, warum googlevideo uns nach
+            // ~60 s auf STREAM_PROTECTION_STATUS 3 setzt. Die Werte müssen zur
+            // WEB_UA passen — UA sagt Windows, also sagt client_info Windows.
             clientInfo = new ProtoWriter()
+                    .stringField(1, "de_DE")
                     .varintField(16, 1).stringField(17, WEB_VERSION)
+                    .stringField(18, "Windows").stringField(19, "10.0")
                     .toByteArray();
             ua = WEB_UA;
         } else if (webClient) {

@@ -576,7 +576,14 @@ public final class SabrSession {
                         }
                     }
                 }
-                final byte[] resp = post(buildRequest(states, playerTimeMs, playbackCookie));
+                final byte[] reqBytes = buildRequest(states, playerTimeMs, playbackCookie);
+                if (System.getenv("YT_SABR_REQDUMP") != null) try {
+                    java.nio.file.Files.write(java.nio.file.Path.of(System.getenv("YT_SABR_REQDUMP")
+                            + "/req-" + iter + ".bin"), reqBytes);
+                    java.nio.file.Files.writeString(java.nio.file.Path.of(System.getenv("YT_SABR_REQDUMP")
+                            + "/req-" + iter + ".url"), abrUrl);
+                } catch (Exception ignored) {}
+                final byte[] resp = post(reqBytes);
 
                 final Map<Long, Pending> pend = new HashMap<>();
                 final int[] newSegments = {0};
@@ -801,6 +808,8 @@ public final class SabrSession {
         return new String(c);
     }
     private final String cpn = freshCpn();
+    /// Client-Version für den cver-Parameter (Live-Wert 2026-07-31).
+    private static final String CVER = "2.20260731.00.00";
 
     /// `client_abr_state` (Feld 1 der ABR-Anfrage).
     ///
@@ -953,7 +962,10 @@ public final class SabrSession {
         // `unsent_sabr_contexts` (Feld 6) schickt die Referenz immer mit — leer,
         // wenn alle bekannten Kontexte aktiv sind. Ohne das Feld fehlt dem Server
         // die Aussage „ich kenne keine weiteren".
-        sc.bytesField(6, new byte[0]);
+        // ⚠️ Chromium schickt Feld 6 gar nicht (Mitschnitt 2026-07-31, drei
+        // Runden geprüft) — ein leeres Längenfeld ist etwas anderes als
+        // „Feld fehlt“. YT_SABR_UNSENT6=1 stellt das alte Verhalten her.
+        if ("1".equals(System.getenv("YT_SABR_UNSENT6")))        sc.bytesField(6, new byte[0]);
         req.bytesField(19, sc.toByteArray());
         final byte[] out = req.toByteArray();
         // VOLLER Request-Koerper beim ersten Request — Vergleichsgrundlage gegen
@@ -1154,6 +1166,16 @@ public final class SabrSession {
         // (Antwort kommt an, enthaelt aber nichts). `cpn` gehoert ebenfalls an
         // die Medien-URLs, nicht hierher.
         String url = abrUrl + "&rn=" + (++requestNo);
+        // MESSUNG 2026-07-31 (YT_SABR_BROWSERPARAMS=1): ein LIVE-Mitschnitt eines
+        // echten Chromium zeigt am ABR-POST vier Parameter, die wir nicht senden:
+        // cpn, cver, alr=yes, sowie einen Referer-Header OHNE Origin. Der ältere
+        // Mitschnitt (2026-07-25/30), auf dem die Kommentare oben beruhen, sah
+        // das anders — deshalb hier als schaltbare Gegenprobe, nicht als Default.
+        if ("1".equals(System.getenv("YT_SABR_BROWSERPARAMS"))) {
+            if (!url.contains("&cpn=")) url = url + "&cpn=" + cpn;
+            if (!url.contains("&cver=")) url = url + "&cver=" + CVER;
+            if (!url.contains("&alr=")) url = url + "&alr=yes";
+        }
         if (POT_IN_URL && poToken != null && !url.contains("&pot=")) {
             url = url + "&pot=" + java.util.Base64.getUrlEncoder().withoutPadding()
                     .encodeToString(poToken);
@@ -1184,6 +1206,11 @@ public final class SabrSession {
             headers.put("Origin", "https://www.youtube.com");
             headers.put("Referer", "https://www.youtube.com/");
         }
+        // Der Live-Mitschnitt zeigt Referer OHNE Origin — genau diese Kombination
+        // haben wir nie probiert (wir hatten nur beide oder keins).
+        if ("1".equals(System.getenv("YT_SABR_BROWSERPARAMS"))
+                && userAgent != null && userAgent.startsWith("Mozilla/"))
+            headers.put("Referer", "https://www.youtube.com/");
         // TRANSPORT (2026-07-30): ueber reqwest4j bekamen wir auf einen byte-gleichen
         // Request nur einen leeren UMP-Rahmen (11B), waehrend curl mit EXAKT
         // denselben Bytes, denselben Headern, auf BEIDEN Egress-Familien und in
