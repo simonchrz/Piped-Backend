@@ -59,15 +59,82 @@ public class BgPoTokenProvider implements PoTokenProvider {
 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
+    /// visitorData der ANGEMELDETEN Sitzung holen.
+    ///
+    /// ⚠️ Das war die Naht in unserer Identitaet: Player-Aufrufe und
+    /// Segment-Abrufe laufen laengst MIT den Login-Cookies, das visitorData
+    /// wurde aber ANONYM gescrapt — und der BotGuard-Token haengt an genau
+    /// diesem anonymen visitorData. Wir haben also eine angemeldete mit einer
+    /// anonymen Identitaet gemischt. Ein echter eingeloggter Browser bekommt
+    /// dieselben (Kids-)Videos ausgeliefert, waehrend wir 403 kassieren —
+    /// gemessen 2026-07-30 mit Safari gegen unsere IP. Deshalb hier dieselben
+    /// Cookies verwenden, damit visitorData, Token und Abruf EINE Identitaet
+    /// sind. Kill-Switch: POTOKEN_AUTH_VISITOR=0.
     private String getWebVisitorData() throws Exception {
-        var html = RequestUtils.sendGet("https://www.youtube.com").get();
-        var matcher = Pattern.compile("visitorData\":\"([\\w%-]+)\"").matcher(html);
+        final boolean useAuth = !"0".equals(env("POTOKEN_AUTH_VISITOR"));
+        final String cookies = useAuth ? loadCookieHeader() : null;
+        final String html;
+        if (cookies != null) {
+            html = new String(rocks.kavin.reqwest4j.ReqwestUtils.fetch(
+                    "https://www.youtube.com", "GET", null,
+                    java.util.Map.of("User-Agent", me.kavin.piped.consts.Constants.USER_AGENT,
+                            "Cookie", cookies,
+                            "Accept-Language", "de-DE,de;q=0.9")).get().body());
+        } else {
+            html = RequestUtils.sendGet("https://www.youtube.com").get();
+        }
+        java.util.regex.Matcher matcher = Pattern.compile("visitorData\":\"([\\w%-]+)\"").matcher(html);
+
+        // ⚠️ RUECKFALL. Sind die Login-Cookies abgelaufen, leitet YouTube auf
+        // accounts.google.com/CookieMismatch um und der Body ist leer — dann
+        // faende sich hier NICHTS, der Warm-Pool bliebe leer und JEDE Sitzung
+        // liefe ohne visitorData UND ohne Token (gemessen 2026-07-31: Pool
+        // dauerhaft leer, "warm-pool task error: Failed to get visitor data").
+        // Also lieber anonym weitermachen als gar nicht.
+        if (!matcher.find() && cookies != null) {
+            System.out.println("[Piped/Bg] ⚠️ angemeldeter visitorData-Abruf ohne Ergebnis "
+                    + "(Cookies abgelaufen? -> CookieMismatch) — falle auf anonym zurueck");
+            final String anon = RequestUtils.sendGet("https://www.youtube.com").get();
+            matcher = Pattern.compile("visitorData\":\"([\\w%-]+)\"").matcher(anon);
+        }
 
         if (matcher.find()) {
-            return matcher.group(1);
+            final String vd = matcher.group(1);
+            if (!visitorLogged) {
+                visitorLogged = true;
+                System.out.println("[Piped/Bg] visitorData aus " + (cookies != null
+                        ? "ANGEMELDETER Sitzung (" + (html.contains("\"logged_in\":true") ? "logged_in=true" : "Login unklar") + ")"
+                        : "anonymer Sitzung") + " geholt");
+            }
+            return vd;
         }
 
         throw new RuntimeException("Failed to get visitor data");
+    }
+
+    private volatile boolean visitorLogged = false;
+
+    /// Login-Cookies als Header-Zeile (Netscape-Format wie yt-dlp sie schreibt).
+    private static String loadCookieHeader() {
+        String p = System.getenv("YOUTUBE_COOKIES_FILE");
+        if (p == null || p.isEmpty()) p = "/app/youtube-cookies.txt";
+        final java.io.File f = new java.io.File(p);
+        if (!f.exists()) return null;
+        final StringBuilder sb = new StringBuilder();
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                final String[] parts = line.split("\t");
+                if (parts.length < 7) continue;
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(parts[5]).append('=').append(parts[6]);
+            }
+        } catch (Exception e) {
+            return null;
+        }
+        return sb.length() == 0 ? null : sb.toString();
     }
 
     private final Queue<PoTokenResult> validPoTokens = new ConcurrentLinkedQueue<>();
