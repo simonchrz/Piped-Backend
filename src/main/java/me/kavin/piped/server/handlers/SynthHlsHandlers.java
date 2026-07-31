@@ -487,6 +487,13 @@ public class SynthHlsHandlers {
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 String[] parts = line.split("\t");
                 if (parts.length < 7) continue;
+                // ⚠️ NUR youtube.com-Cookies. Ein Export aus dem Browser enthaelt
+                // ALLE Domains (gemessen: 258 Cookies, davon 25 fuer YouTube).
+                // Schickt man alles zusammen, antwortet Google mit 302 auf
+                // accounts.google.com/CookieMismatch — wir waren dadurch NIE
+                // angemeldet, obwohl die Datei gueltige Login-Cookies enthielt.
+                // Mit dem Filter: HTTP 200 und "LOGGED_IN":true.
+                if (!parts[0].contains("youtube.com")) continue;
                 if (sb.length() > 0) sb.append("; ");
                 sb.append(parts[5]).append("=").append(parts[6]);
             }

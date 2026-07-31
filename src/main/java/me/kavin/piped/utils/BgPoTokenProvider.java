@@ -103,7 +103,7 @@ public class BgPoTokenProvider implements PoTokenProvider {
             if (!visitorLogged) {
                 visitorLogged = true;
                 System.out.println("[Piped/Bg] visitorData aus " + (cookies != null
-                        ? "ANGEMELDETER Sitzung (" + (html.contains("\"logged_in\":true") ? "logged_in=true" : "Login unklar") + ")"
+                        ? "ANGEMELDETER Sitzung (" + (html.contains("\"LOGGED_IN\":true") ? "logged_in=true" : "Login unklar") + ")"
                         : "anonymer Sitzung") + " geholt");
             }
             return vd;
@@ -128,6 +128,13 @@ public class BgPoTokenProvider implements PoTokenProvider {
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 final String[] parts = line.split("\t");
                 if (parts.length < 7) continue;
+                // ⚠️ NUR youtube.com-Cookies. Ein Export aus dem Browser enthaelt
+                // ALLE Domains (gemessen: 258 Cookies, davon 25 fuer YouTube).
+                // Schickt man alles zusammen, antwortet Google mit 302 auf
+                // accounts.google.com/CookieMismatch — wir waren dadurch NIE
+                // angemeldet, obwohl die Datei gueltige Login-Cookies enthielt.
+                // Mit dem Filter: HTTP 200 und "LOGGED_IN":true.
+                if (!parts[0].contains("youtube.com")) continue;
                 if (sb.length() > 0) sb.append("; ");
                 sb.append(parts[5]).append('=').append(parts[6]);
             }

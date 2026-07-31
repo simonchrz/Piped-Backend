@@ -95,7 +95,13 @@ public class DownloaderImpl extends Downloader {
             while ((line = r.readLine()) != null) {
                 if (line.startsWith("#") || line.isBlank()) continue;
                 String[] parts = line.split("\\t");
-                if (parts.length >= 7) {
+                // ⚠️ NUR youtube.com-Cookies. Ein Browser-Export enthaelt ALLE
+                // Domains (gemessen: 258 Cookies, davon 25 fuer YouTube). Alles
+                // zusammen zu schicken quittiert Google mit 302 auf
+                // accounts.google.com/CookieMismatch — wir waren dadurch NIE
+                // angemeldet, obwohl die Datei gueltige Login-Cookies enthielt.
+                // Mit Filter: HTTP 200 und "LOGGED_IN":true.
+                if (parts.length >= 7 && parts[0].contains("youtube.com")) {
                     if (sb.length() > 0) sb.append("; ");
                     sb.append(parts[5]).append("=").append(parts[6]);
                 }
