@@ -28,6 +28,14 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class SabrCache {
 
     private static final Path DIR = ensureDir();
+
+    /// Streifen-Modus: Segmente an ihre sidx-Position schreiben statt fortlaufend
+    /// (s. SparseStore). Voraussetzung dafuer, dass der Player an BELIEBIGE
+    /// Stellen springen kann. Default AUS, bis verifiziert.
+    static final boolean SPARSE = "1".equals(System.getenv("SABR_SPARSE"));
+
+    static Path dir() { return DIR; }
+    static String safeId(String videoId) { return safe(videoId); }
     /// Cache-Deckel. Der Wert stammt aus der Zeit der 13-MB-Teilcaches; seit dem
     /// WEB-Pfad kostet EIN Kids-Video ~724 MB, 8 GB sind also nur noch ~11
     /// Videos. Stellbar per `SABR_CACHE_MAX_GB` — die eigentliche Sicherung ist
@@ -571,7 +579,15 @@ public final class SabrCache {
         // „30 Minuten lang gar nichts" (502 statt Video) — genau das passiert,
         // wenn die Eviction die Dateien geraeumt hat oder eine Session ohne ein
         // einziges Segment endete. Dann lieber die Leiter fahren.
-        if (isCapMarked(videoId) && anyFileFor(videoId)) {
+        // ⚠️ Cap-Markierung bremst nur den SYNCHRONEN Weg (der Tap serviert dann
+        // den Teil-Cache statt zu warten). Ein REFILL darf trotzdem die volle
+        // Leiter fahren: die Markierung stammt aus der Zeit, als jeder Weg
+        // aussichtslos war — seit der WEB-Pfad im offenen Fenster komplette
+        // Kids-Videos holt, ist ein spaeterer Versuch genau das Richtige. So
+        // vervollstaendigt sich ein Teil-Video von selbst, sobald das Fenster
+        // aufgeht (Sperrzeit + WEB-Memo deckeln die Versuche).
+        if (isCapMarked(videoId) && anyFileFor(videoId) && !allowPacedRequested) return;
+        if (isCapMarked(videoId) && anyFileFor(videoId) && pacedEnabled()) {
             if (!allowPaced) return;
             final String fam = me.kavin.piped.utils.EgressManager.activeEgress();
             System.out.println("[SabrCache] " + videoId + " cap-marked -> paced 1x refill on " + fam);
@@ -684,13 +700,48 @@ public final class SabrCache {
                                                   boolean paced) {
         final Map<Integer, Path> parts = new ConcurrentHashMap<>();
         final Map<Integer, OutputStream> opened = new ConcurrentHashMap<>();
-        final SabrSession.Sink sink = itag -> {
-            final Path part = DIR.resolve(safe(videoId) + "_" + itag + ".part");
-            Files.deleteIfExists(part);
-            final OutputStream os = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20);
-            parts.put(itag, part);
-            opened.put(itag, os);
-            return os;
+        // Fortlaufende Positionen je Spur (nur im Streifen-Modus): das naechste
+        // zu schreibende Byte, weil die .part hier ein reiner Strom ist.
+        final Map<Integer, Long> streamPos = new ConcurrentHashMap<>();
+        final Map<Integer, java.util.TreeMap<Integer, byte[]>> pending = new ConcurrentHashMap<>();
+        final Map<Integer, Integer> nextSeq = new ConcurrentHashMap<>();
+        final SabrSession.Sink sink = new SabrSession.Sink() {
+            @Override public void writeInit(int itag, long lmt, byte[] data) throws IOException {
+                if (SPARSE) { SparseStore.writeInit(videoId, itag, lmt, data); return; }
+                openStream(itag).write(data);
+                streamPos.merge(itag, (long) data.length, Long::sum);
+            }
+            @Override public void writeSegment(int itag, int seq, byte[] data) throws IOException {
+                if (SPARSE) { SparseStore.writeSegment(videoId, itag, seq, data); return; }
+                final java.util.TreeMap<Integer, byte[]> stash =
+                        pending.computeIfAbsent(itag, k -> new java.util.TreeMap<>());
+                stash.put(seq, data);
+                Integer next = nextSeq.get(itag);
+                if (next == null) { next = stash.firstKey(); nextSeq.put(itag, next); }
+                final OutputStream os = openStream(itag);
+                while (stash.containsKey(next)) {
+                    final byte[] d = stash.remove(next);
+                    os.write(d);
+                    streamPos.merge(itag, (long) d.length, Long::sum);
+                    next = next + 1;
+                }
+                nextSeq.put(itag, next);
+            }
+            /// Klassischer Weg: fortlaufend in eine .part schreiben. ⚠️ Die
+            /// Session sortiert NICHT mehr (das braucht der Streifen-Modus
+            /// gerade nicht), deshalb haelt dieser Pfad die Reihenfolge selbst
+            /// ein: was nicht direkt anschliesst, wartet — sonst entstuende bei
+            /// einer Luecke eine Datei mit vertauschten Segmenten.
+            private OutputStream openStream(int itag) throws IOException {
+                OutputStream os = opened.get(itag);
+                if (os != null) return os;
+                final Path part = DIR.resolve(safe(videoId) + "_" + itag + ".part");
+                Files.deleteIfExists(part);
+                os = new BufferedOutputStream(Files.newOutputStream(part), 1 << 20);
+                parts.put(itag, part);
+                opened.put(itag, os);
+                return os;
+            }
         };
         // INKREMENTELL VEROEFFENTLICHEN — pro Runde, nicht erst am Ende.
         // Seit der WEB-Pfad komplette Videos holt, dauert eine Kids-Session
@@ -934,10 +985,11 @@ public final class SabrCache {
 
     public static void requestRefill(String videoId) {
         if (isRefillExhausted(videoId)) return;          // paced verdict: nichts zu holen
-        // Cap-markiert + paced aus = es gaebe nur eine weitere Burst-Session, die
-        // (gemessen) nichts holt. Spart Slots/IO auf genau den Videos, die die
-        // Kinder am haeufigsten antippen.
-        if (isCapMarked(videoId) && !pacedEnabled()) return;
+        // ⚠️ FRUEHER hier: cap-markiert + paced aus -> abbrechen. Das galt, solange
+        // JEDER Weg an der Attestierung scheiterte. Seit der WEB-Pfad im offenen
+        // Fenster komplette Kids-Videos holt, ist der spaetere Versuch der
+        // einzige Weg, wie ein bei ~60 s abgeschnittenes Video je vollstaendig
+        // wird. Gedeckelt bleibt es durch REFILL_COOLDOWN_MS und das WEB-Memo.
         if (REFILL_ACTIVE.contains(videoId)) return;     // Session läuft bereits
         final long now = System.currentTimeMillis();
         final boolean[] go = {false};

@@ -24,9 +24,16 @@ public final class SabrSession {
     /// Per-itag byte sink. open(itag) is called once, lazily, the first time we
     /// have bytes to write for that itag; the returned stream is written in
     /// fmp4 order (init first, then segments ascending) and closed by the session.
-    @FunctionalInterface
+    /// Ziel der Mediendaten. ⚠️ SEGMENT-ADRESSIERT, nicht als Stream: die Datei
+    /// liegt in sidx-Reihenfolge, und jedes Segment hat darin eine feste
+    /// Position. Dadurch darf ein Segment auch dann geschrieben werden, wenn
+    /// frueheren noch fehlen (Sprung im Video) — die Datei bekommt ein Loch
+    /// statt eines Staus. Vorher war es ein fortlaufender Stream, weshalb ein
+    /// fehlendes Segment alles Nachfolgende blockierte und Springen unmoeglich
+    /// war. Die Byte-Anordnung bleibt exakt dieselbe wie bisher.
     public interface Sink {
-        OutputStream open(int itag) throws IOException;
+        void writeInit(int itag, long lmt, byte[] data) throws IOException;
+        void writeSegment(int itag, int seq, byte[] data) throws IOException;
     }
 
     public static final class Fmt {
@@ -44,7 +51,6 @@ public final class SabrSession {
 
     private final class FState {
         final Fmt fmt;
-        OutputStream out;                 // opened lazily via sink
         byte[] pendingInit;               // init bytes, held until drainToDisk writes them
         boolean initWritten;
         final TreeMap<Integer, byte[]> buf = new TreeMap<>();  // received, not yet flushed
@@ -53,7 +59,6 @@ public final class SabrSession {
         /// ehrlichen buffered_ranges: nur damit lassen sich zusammenhaengende
         /// Laeufe (und damit LOECHER) korrekt an den Server melden.
         final TreeMap<Integer, long[]> segTimes = new TreeMap<>();
-        int writeCursor = Integer.MIN_VALUE;                   // next seq to flush
         int maxSeq = 0;
         long bytesWritten = 0;
         int totalSegments = -1;
@@ -99,42 +104,30 @@ public final class SabrSession {
         }
         boolean complete() { return totalSegments > 0 && seen.size() >= totalSegments && initWritten; }
 
-        /// Flush init (once) + any now-contiguous buffered segments to disk. Called
-        /// after every round; for in-order delivery buf drains to empty each time
-        /// so RAM stays bounded to a single round's worth of media.
+        /// Alles Angekommene an SEINE Position schreiben — unabhaengig von der
+        /// Reihenfolge. Vorher wurde nur der zusammenhaengende Lauf ab
+        /// writeCursor geschrieben; ein fehlendes Segment staute damit alles
+        /// Nachfolgende im RAM und machte Springen unmoeglich. Die Zieldatei
+        /// bekommt jetzt an fehlenden Stellen ein Loch, die Byte-Anordnung
+        /// bleibt aber identisch (sidx-Reihenfolge).
         void drainToDisk() throws IOException {
             if (pendingInit != null && !initWritten) {
-                if (out == null) out = sink.open(fmt.itag);
-                out.write(pendingInit);
+                sink.writeInit(fmt.itag, fmt.lmt, pendingInit);
                 bytesWritten += pendingInit.length;
                 pendingInit = null;
                 initWritten = true;
             }
-            if (!initWritten) return;                 // can't write data before init
-            if (writeCursor == Integer.MIN_VALUE) {
-                if (buf.isEmpty()) return;
-                writeCursor = buf.firstKey();          // true min seq (TreeMap)
+            if (!initWritten) return;                 // ohne Init keine Offsets
+            for (var e : buf.entrySet()) {
+                sink.writeSegment(fmt.itag, e.getKey(), e.getValue());
+                bytesWritten += e.getValue().length;
             }
-            while (buf.containsKey(writeCursor)) {
-                // ⚠️ Beim FORTSETZEN ist initWritten=true, ohne dass je ein
-                // Strom geoeffnet wurde (das Init liegt schon in der .bin) —
-                // ohne dieses Oeffnen hier lief die erste Schreiboperation der
-                // fortgesetzten Sitzung in eine NPE.
-                if (out == null) out = sink.open(fmt.itag);
-                final byte[] d = buf.remove(writeCursor);
-                out.write(d);
-                bytesWritten += d.length;
-                writeCursor++;
-            }
+            buf.clear();
         }
 
-        void flush() {
-            try { if (out != null) out.flush(); } catch (IOException ignored) {}
-        }
+        void flush() { }
 
-        void close() {
-            try { if (out != null) out.close(); } catch (IOException ignored) {}
-        }
+        void close() { }
     }
 
     private static final class Pending {
@@ -256,8 +249,7 @@ public final class SabrSession {
             s.totalDurationMs = r.totalDurationMs;
             s.bufferedMs = r.bufferedMs;
             s.maxSeq = r.lastSeq;
-            s.initWritten = true;              // Init liegt bereits in der .bin
-            s.writeCursor = r.lastSeq + 1;     // ab hier wird angehaengt
+            s.initWritten = true;              // Init liegt bereits in der Datei
             final long perSeg = s.perSegMs();
             for (int q = 1; q <= r.lastSeq; q++) {
                 s.seen.add(q);
