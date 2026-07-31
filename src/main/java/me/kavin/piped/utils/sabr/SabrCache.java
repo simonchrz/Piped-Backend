@@ -473,6 +473,36 @@ public final class SabrCache {
     private static final Map<String, Long> SEEK_UNAVAILABLE = new ConcurrentHashMap<>();
     private static final long SEEK_UNAVAILABLE_TTL_MS = 10 * 60_000L;
 
+    /// Liefert die Quelle fuer dieses Video gerade zuverlaessig? NUR dann bietet
+    /// die Playlist alle Segmente an.
+    ///
+    /// ⚠️ Beweislast umgedreht (2026-07-31, zweimal in der App aufgeschlagen):
+    /// Eine VOD-Playlist wird NICHT neu geladen. Wenn wir beim ERSTEN Bau alle
+    /// Segmente anbieten und die Drosselung erst danach auffaellt, ist der
+    /// Player auf diese Playlist festgenagelt, fordert die Mitte an und haengt
+    /// im Standbild — die spaeter korrigierte Playlist sieht er nie. Also:
+    /// im Zweifel NUR den vorhandenen Anfang anbieten (dann spielt wenigstens
+    /// die erste Minute) und alles erst, wenn eine Sitzung nachweislich sauber
+    /// geliefert hat.
+    private static final Map<String, Long> SEEK_PROVEN = new ConcurrentHashMap<>();
+    private static final long SEEK_PROVEN_TTL_MS = 10 * 60_000L;
+
+    /// Ergebnis einer Sitzung bewerten: sauber beendet = Quelle liefert.
+    private static void noteSessionOutcome(String videoId, SabrHandlers.SabrMedia r) {
+        final boolean healthy = r != null && (r.complete()
+                || "idle".equals(r.stopReason()) || "maxIterations".equals(r.stopReason()));
+        if (healthy) SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
+        else SEEK_PROVEN.remove(videoId);
+    }
+
+    public static boolean seekable(String videoId) {
+        if (seekUnavailable(videoId)) return false;
+        final Long exp = SEEK_PROVEN.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { SEEK_PROVEN.remove(videoId); return false; }
+        return true;
+    }
+
     public static boolean seekUnavailable(String videoId) {
         final Long exp = SEEK_UNAVAILABLE.get(videoId);
         if (exp == null) return false;
@@ -513,6 +543,7 @@ public final class SabrCache {
             missing = SparseStore.missing(videoId, itag, segs);
             if (missing.isEmpty()) {
                 SEEK_SEQ.remove(videoId);
+                SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
                 return true;
             }
             SEEK_SEQ.put(videoId, missing.get(0));
@@ -800,6 +831,7 @@ public final class SabrCache {
                 }
             }
         }
+        noteSessionOutcome(videoId, result);
         if (result == null)
             throw new IllegalStateException("sabr: both family attempts failed for " + videoId);
         // Manifest with the ACTUAL picked itags so the serving layer doesn't

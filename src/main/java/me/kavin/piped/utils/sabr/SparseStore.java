@@ -41,7 +41,7 @@ public final class SparseStore {
 
     private static String key(String videoId, int itag) { return videoId + "_" + itag; }
 
-    static Path binPath(String videoId, int itag) {
+    public static Path binPath(String videoId, int itag) {
         return SabrCache.dir().resolve(SabrCache.safeId(videoId) + "_" + itag + ".bin");
     }
 
@@ -186,6 +186,11 @@ public final class SparseStore {
             Files.writeString(mapPath(videoId, itag),
                     lmt + " " + totalSegments + " " + formatRanges(present(videoId, itag)));
         } catch (IOException ignored) {}
+    }
+
+    /// Welcher Encode liegt im Cache? 0 = unbekannt.
+    public static long cachedLmt(String videoId, int itag) {
+        return readMapLmt(videoId, itag);
     }
 
     private static long readMapLmt(String videoId, int itag) {

@@ -138,7 +138,7 @@ public class SynthHlsHandlers {
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
         PipedStream audio = pickedAudioStream(streams);
         if (audio == null) return "#ERROR".getBytes(StandardCharsets.UTF_8);
-        return streamPlaylist(audio, streams.duration);
+        return streamPlaylist(videoId, audio, streams.duration);
     }
 
     public static byte[] videoPlaylist(String videoId, int idx) throws Exception {
@@ -156,13 +156,13 @@ public class SynthHlsHandlers {
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         if (idx < 0 || idx >= videos.size()) return "#ERROR".getBytes(StandardCharsets.UTF_8);
-        return streamPlaylist(videos.get(idx), streams.duration);
+        return streamPlaylist(videoId, videos.get(idx), streams.duration);
     }
 
     /// Builds an HLS playlist for one DASH stream. Uses sidx fragment boundaries
     /// for multi-segment ranges (~1-2MB each). Falls back to single-segment if
     /// sidx fetch fails — that path may 403 on YouTube's CDN for large files.
-    private static byte[] streamPlaylist(PipedStream stream, long durationSeconds) {
+    private static byte[] streamPlaylist(String videoId, PipedStream stream, long durationSeconds) {
         int initLen = stream.initEnd - stream.initStart + 1;
         int mediaStart = stream.indexEnd + 1;
         long mediaLen = stream.contentLength - mediaStart;
@@ -178,6 +178,18 @@ public class SynthHlsHandlers {
             // ~10KB authenticated cookie jar. Goes via the proxy like the segments
             // (proxy strips the hop-by-hop Connection header that else 400s).
             sidx = SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, null);
+            if (sidx == null) {
+                // ⚠️ Ohne sidx wird die Playlist EIN Segment ueber die ganze
+                // Laufzeit — darin kann AVPlayer nicht springen (in der App
+                // gemeldet: "spielt ab, aber Springen geht nicht"). Der Index
+                // liegt aber oft schon lokal: der SABR-Cache haelt denselben
+                // Init-Kasten inklusive sidx. Gleicher Encode (lmt) = gleiche
+                // Segmentierung, also hier verwenden statt aufzugeben.
+                sidx = localSidxFromSabrCache(videoId, stream.url);
+                if (sidx != null)
+                    System.out.println("[SynthHls] " + videoId + " sidx aus SABR-Cache gerettet ("
+                            + sidx.entries.size() + " Segmente) — Springen bleibt moeglich");
+            }
         }
 
         StringBuilder sb = new StringBuilder();
@@ -368,7 +380,7 @@ public class SynthHlsHandlers {
         // Bereich, den wir nicht fuellen koennen, und haengt im Standbild.
         final boolean listAll = me.kavin.piped.utils.sabr.SabrCache.SPARSE
                 && !partialTerminal
-                && !me.kavin.piped.utils.sabr.SabrCache.seekUnavailable(videoId);
+                && me.kavin.piped.utils.sabr.SabrCache.seekable(videoId);
         for (SidxParserJava.Entry e : sidx.entries) {
             if (!listAll && cursor + e.byteSize > fileLen) break;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
@@ -398,6 +410,46 @@ public class SynthHlsHandlers {
             if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         }
         return sb.toString();
+    }
+
+    /// sidx aus dem lokalen SABR-Cache holen, wenn der HTTP-Abruf scheitert.
+    /// Nur bei GLEICHEM Encode: `lmt` aus der Direkt-URL muss zur gecachten
+    /// Datei passen, sonst waere die Segmentierung eine andere (YouTube liefert
+    /// je Player-Call verschiedene Fassungen desselben itag).
+    private static SidxParserJava.Data localSidxFromSabrCache(String videoId, String directUrl) {
+        try {
+            final int itag = intParam(directUrl, "itag");
+            final long lmt = longParam(directUrl, "lmt");
+            if (itag <= 0 || lmt <= 0) return null;
+            final java.nio.file.Path bin = me.kavin.piped.utils.sabr.SparseStore.binPath(videoId, itag);
+            if (!java.nio.file.Files.exists(bin)) return null;
+            if (me.kavin.piped.utils.sabr.SparseStore.cachedLmt(videoId, itag) != lmt) return null;
+            final int[] box = scanSabrSidx(bin);
+            if (box == null) return null;
+            return SidxParserJava.fromFile(bin, box[0], box[0] + box[1] - 1);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static int intParam(String url, String name) {
+        final String v = param(url, name);
+        try { return v == null ? -1 : Integer.parseInt(v); } catch (NumberFormatException e) { return -1; }
+    }
+
+    private static long longParam(String url, String name) {
+        final String v = param(url, name);
+        try { return v == null ? -1 : Long.parseLong(v); } catch (NumberFormatException e) { return -1; }
+    }
+
+    private static String param(String url, String name) {
+        final int q = url.indexOf('?');
+        if (q < 0) return null;
+        for (String kv : url.substring(q + 1).split("&")) {
+            final int eq = kv.indexOf('=');
+            if (eq > 0 && kv.substring(0, eq).equals(name)) return kv.substring(eq + 1);
+        }
+        return null;
     }
 
     /// Scans the SABR fmp4's top-level boxes for the sidx box; returns {offset, size}.
