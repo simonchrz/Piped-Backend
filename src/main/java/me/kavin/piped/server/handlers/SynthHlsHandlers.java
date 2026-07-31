@@ -357,8 +357,14 @@ public class SynthHlsHandlers {
         sb.append(String.format("#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%d@%d\"\n", segUrl, sidxStart, 0));
         long cursor = sidxEnd + 1L + sidx.firstOffset;
         int emitted = 0;
+        // STREIFEN-MODUS: ALLE Segmente listen, auch noch nicht geholte. Nur so
+        // kann der Player an eine beliebige Stelle springen — die Bytes holt
+        // /sabr dann auf Zuruf nach (SabrCache.ensureRange). Im klassischen
+        // Modus bleibt es beim geladenen Anfang, weil dort ein Sprung ins Leere
+        // ein 416 waere und AVPlayer das Video verwirft.
+        final boolean listAll = me.kavin.piped.utils.sabr.SabrCache.SPARSE;
         for (SidxParserJava.Entry e : sidx.entries) {
-            if (cursor + e.byteSize > fileLen) break;
+            if (!listAll && cursor + e.byteSize > fileLen) break;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
             sb.append(String.format("#EXT-X-BYTERANGE:%d@%d\n", e.byteSize, cursor));
             sb.append(segUrl).append('\n');

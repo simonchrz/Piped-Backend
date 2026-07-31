@@ -96,6 +96,84 @@ public final class SparseStore {
         });
     }
 
+    /// Offset-Tabelle bereitstellen, auch ohne laufende Sitzung: der sidx steht
+    /// am Anfang der Cache-Datei, also laesst sie sich jederzeit rekonstruieren.
+    public static synchronized boolean ensureOffsets(String videoId, int itag) {
+        if (OFFSETS.containsKey(key(videoId, itag))) return true;
+        final Path bin = binPath(videoId, itag);
+        try {
+            if (!Files.exists(bin)) return false;
+            final byte[] head = new byte[Math.min(65536, (int) Math.min(Files.size(bin), 65536))];
+            try (RandomAccessFile raf = new RandomAccessFile(bin.toFile(), "r")) {
+                raf.readFully(head);
+            }
+            buildOffsets(videoId, itag, head, readMapLmt(videoId, itag));
+            return OFFSETS.containsKey(key(videoId, itag));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /// Segmentnummern, die ein Byte-Bereich beruehrt (1-basiert, leer wenn
+    /// unbekannt). Der Bereich [start,end] stammt aus der Playlist und ist
+    /// absolut in der fertigen Datei.
+    public static List<Integer> segmentsForRange(String videoId, int itag, long start, long end) {
+        final List<Integer> out = new ArrayList<>();
+        final long[] offs = OFFSETS.get(key(videoId, itag));
+        if (offs == null) return out;
+        for (int seq = 1; seq < offs.length; seq++) {
+            final long segStart = offs[seq];
+            final long segEnd = (seq + 1 < offs.length ? offs[seq + 1] : Long.MAX_VALUE) - 1;
+            if (segEnd < start) continue;
+            if (segStart > end) break;
+            out.add(seq);
+        }
+        return out;
+    }
+
+    /// Ist ab `fromSeq` genug LUECKENLOSER Vorlauf da (in Bytes)? Grundlage der
+    /// Bedarfssteuerung im Streifen-Modus — dort gibt es keine .part-Datei mehr,
+    /// deren Groesse man messen koennte.
+    public static boolean leadSatisfied(String videoId, int itag, int fromSeq, long leadBytes) {
+        final long[] offs = OFFSETS.get(key(videoId, itag));
+        if (offs == null) return false;
+        final NavigableSet<Integer> have = present(videoId, itag);
+        long sum = 0;
+        for (int seq = Math.max(1, fromSeq); seq < offs.length; seq++) {
+            if (!have.contains(seq)) return false;              // Luecke -> weiterladen
+            sum += (seq + 1 < offs.length ? offs[seq + 1] : offs[seq]) - offs[seq];
+            if (sum >= leadBytes) return true;
+        }
+        return true;                                            // bis zum Ende alles da
+    }
+
+    /// In welchem Segment liegt dieses Byte? 1-basiert, -1 wenn unbekannt.
+    public static int segmentAt(String videoId, int itag, long offset) {
+        final long[] offs = OFFSETS.get(key(videoId, itag));
+        if (offs == null) return -1;
+        for (int seq = 1; seq < offs.length; seq++) {
+            final long end = (seq + 1 < offs.length ? offs[seq + 1] : Long.MAX_VALUE) - 1;
+            if (offset <= end) return seq;
+        }
+        return -1;
+    }
+
+    /// Welche davon fehlen noch?
+    public static List<Integer> missing(String videoId, int itag, List<Integer> segs) {
+        final NavigableSet<Integer> have = present(videoId, itag);
+        final List<Integer> out = new ArrayList<>();
+        for (int seq : segs) if (!have.contains(seq)) out.add(seq);
+        return out;
+    }
+
+    /// Gesamtlaenge der fertigen Datei laut sidx (nicht die aktuelle Dateigroesse!).
+    public static long totalLength(String videoId, int itag) {
+        final long[] offs = OFFSETS.get(key(videoId, itag));
+        return offs == null ? -1 : TOTAL_LEN.getOrDefault(key(videoId, itag), -1L);
+    }
+
+    private static final Map<String, Long> TOTAL_LEN = new ConcurrentHashMap<>();
+
     /// Byte-Position eines Segments; -1 wenn (noch) unbekannt.
     public static long offsetOf(String videoId, int itag, int seq) {
         final long[] offs = OFFSETS.get(key(videoId, itag));
@@ -137,6 +215,7 @@ public final class SparseStore {
             cursor += entries.get(i)[0];
         }
         OFFSETS.put(key(videoId, itag), offs);
+        TOTAL_LEN.put(key(videoId, itag), cursor);
         persist(videoId, itag, lmt, entries.size());
         System.out.println("[Sparse] " + videoId + "/" + itag + " Offset-Tabelle: "
                 + entries.size() + " Segmente, Gesamtlaenge " + cursor + "B");

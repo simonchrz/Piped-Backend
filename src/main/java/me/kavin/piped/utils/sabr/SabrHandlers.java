@@ -27,6 +27,9 @@ public final class SabrHandlers {
     /// PAUSE = genug Vorlauf, diese Runde nicht fragen.
     public static volatile java.util.function.Function<String, java.util.function.BooleanSupplier> SESSION_STOP;
     public static volatile java.util.function.Function<String, java.util.function.BooleanSupplier> SESSION_PAUSE;
+    /// Sprungziel (Segmentnummer) je Video — gesetzt von SabrCache, wenn der
+    /// Player Bytes anfordert, die noch fehlen.
+    public static volatile java.util.function.Function<String, java.util.function.IntSupplier> SESSION_SEEK;
 
     private static final String ANDROID_UA =
             "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip";
@@ -291,6 +294,7 @@ public final class SabrHandlers {
         session.setPauseWhen(SESSION_PAUSE == null ? null : SESSION_PAUSE.apply(videoId));
         session.setResume(resume);
         session.setProgressSink(progress);
+        session.setSeekTargetSeq(SESSION_SEEK == null ? null : SESSION_SEEK.apply(videoId));
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer

@@ -32,7 +32,7 @@ public final class SabrCache {
     /// Streifen-Modus: Segmente an ihre sidx-Position schreiben statt fortlaufend
     /// (s. SparseStore). Voraussetzung dafuer, dass der Player an BELIEBIGE
     /// Stellen springen kann. Default AUS, bis verifiziert.
-    static final boolean SPARSE = "1".equals(System.getenv("SABR_SPARSE"));
+    public static final boolean SPARSE = "1".equals(System.getenv("SABR_SPARSE"));
 
     static Path dir() { return DIR; }
     static String safeId(String videoId) { return safe(videoId); }
@@ -140,6 +140,20 @@ public final class SabrCache {
             return last > 0 && System.currentTimeMillis() - last > IDLE_STOP_MS;
         };
         SabrHandlers.SESSION_PAUSE = vid -> () -> {
+            // Streifen-Modus: es gibt keine .part mehr — der Vorlauf wird an der
+            // Anwesenheitskarte gemessen, ab dem Segment, das der Player gerade
+            // braucht.
+            if (SPARSE) {
+                final int[] itags;
+                try { itags = itagsForCached(vid); } catch (Exception e) { return false; }
+                if (itags == null) return false;
+                final int vItag = itags[1];
+                if (!SparseStore.ensureOffsets(vid, vItag)) return false;
+                final long demand = DEMAND_OFFSET.getOrDefault(safe(vid) + "_" + vItag, 0L);
+                int fromSeq = SparseStore.segmentAt(vid, vItag, demand);
+                if (fromSeq < 1) fromSeq = 1;
+                return SparseStore.leadSatisfied(vid, vItag, fromSeq, LEAD_BYTES);
+            }
             // Der Vorlauf haengt an der VIDEO-Spur — sie macht ~95% der Bytes
             // aus, und Audio laeuft im selben Zug mit.
             // ⚠️ NICHT „jede Spur braucht LEAD_BYTES": die Audiospur ist oft
@@ -232,6 +246,13 @@ public final class SabrCache {
         return out;
     }
 
+    /// itags NUR aus dem, was schon auf Platte liegt — ohne Download anzustossen
+    /// (die Pausen-Pruefung laeuft mitten in einer Sitzung).
+    private static int[] itagsForCached(String videoId) {
+        final int[] derived = deriveItags(videoId);
+        return derived != null ? derived : new int[]{140, 137};
+    }
+
     /// Anforderung des Players vermerken — Grundlage der Bedarfssteuerung.
     private static void noteRequest(String videoId, int itag, long endOffset) {
         LAST_REQUEST.put(videoId, System.currentTimeMillis());
@@ -309,6 +330,14 @@ public final class SabrCache {
     /// idle beendete Session liegen, bis die Playlist-Schicht zufaellig einen
     /// Refill ausloest.
     private static void startDownload(String videoId, boolean resume) {
+        startDownload(videoId, resume, false);
+    }
+
+    /// demand=true: der Player WARTET auf diese Bytes (Sprung). Dann darf weder
+    /// die Cap-Markierung noch der anyFileFor-Guard bremsen — sonst kommt beim
+    /// Vorspulen nie etwas an (2026-07-31 gemessen: Sprung-Anforderung lief in
+    /// die frische Cap-Markierung, Session startete gar nicht -> 503).
+    private static void startDownload(String videoId, boolean resume, boolean demand) {
         if (!resume && anyFileFor(videoId) && !DOWNLOAD_ACTIVE.contains(videoId)) return;
         if (!DOWNLOAD_ACTIVE.add(videoId)) return;
         Thread.ofVirtual().name("sabr-dl-" + videoId).start(() -> {
@@ -324,7 +353,7 @@ public final class SabrCache {
                     // anyFileFor guard: if the session already ran but produced
                     // DIFFERENT itags (video without 1080p avc), a request for the
                     // absent itag must not re-trigger the whole download forever.
-                    if (resume || !anyFileFor(videoId)) download(videoId);
+                    if (resume || !anyFileFor(videoId)) download(videoId, false, demand);
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -435,11 +464,52 @@ public final class SabrCache {
         }
     }
 
+    /// Sprungziel je Video: die Segmentnummer, die der Player gerade braucht.
+    private static final Map<String, Integer> SEEK_SEQ = new ConcurrentHashMap<>();
+    /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
+    private static final long SEEK_WAIT_MS = 20_000;
+
+    static {
+        SabrHandlers.SESSION_SEEK = vid -> () -> SEEK_SEQ.getOrDefault(vid, -1);
+    }
+
+    /// Streifen-Modus: fehlende Segmente eines angefragten Bereichs NACHFORDERN
+    /// statt 416 zu antworten. Das ist der Kern des freien Springens — der
+    /// Player darf jede Stelle anfragen, wir holen sie dann. Gibt true zurueck,
+    /// wenn alle Bytes des Bereichs vorliegen.
+    private static boolean ensureRange(String videoId, int itag, long start, long end) throws Exception {
+        if (!SparseStore.ensureOffsets(videoId, itag)) return false;
+        final List<Integer> segs = SparseStore.segmentsForRange(videoId, itag, start, end);
+        // Kein Segment betroffen = der Bereich liegt im Init/sidx-Kopf. Der ist
+        // da, sobald es Offsets gibt (die stammen ja aus ihm) — also liefern.
+        // ⚠️ Das als Fehler zu werten war der erste Bug hier: AVPlayer holt als
+        // ALLERERSTES genau diesen Kopf (EXT-X-MAP) und bekam ein 503.
+        if (segs.isEmpty()) return true;
+        List<Integer> missing = SparseStore.missing(videoId, itag, segs);
+        if (missing.isEmpty()) return true;
+        System.out.println("[Sparse] " + videoId + "/" + itag + " Bereich " + start + "-" + end
+                + ": " + missing.size() + " Segment(e) fehlen, ab " + missing.get(0) + " nachfordern");
+        SEEK_SEQ.put(videoId, missing.get(0));
+        startDownload(videoId, true, true);
+        final long deadline = System.currentTimeMillis() + SEEK_WAIT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(250);
+            missing = SparseStore.missing(videoId, itag, segs);
+            if (missing.isEmpty()) {
+                SEEK_SEQ.remove(videoId);
+                return true;
+            }
+            SEEK_SEQ.put(videoId, missing.get(0));
+        }
+        return false;
+    }
+
     public static HttpResponse handle(String videoId, int itag, String range, boolean head) throws Exception {
         // Der Player sagt mit JEDEM Range-Request, wie weit er ist — das ist die
         // Eingabe der Bedarfssteuerung (s. noteRequest / SESSION_PAUSE).
         final long wantEnd = requestedEnd(range);
         noteRequest(videoId, itag, wantEnd);
+        if (SPARSE) return handleSparse(videoId, itag, range, head, wantEnd);
         final Path file = ensureFile(videoId, itag);
         // Der Player will ueber das hinaus, was auf Platte liegt -> Session
         // fortsetzen. Das ist der Gegenpart zur Pause: sie haelt an, sobald der
@@ -457,8 +527,37 @@ public final class SabrCache {
         return serveFile(file, itag, range, head);
     }
 
+    /// Auslieferung im Streifen-Modus: der Player darf JEDE Stelle anfragen.
+    /// Fehlt etwas, wird es nachgefordert (ensureRange) statt das Video mit 416
+    /// zu verwerfen. Kommt es nicht rechtzeitig, antworten wir mit 503 —
+    /// AVPlayer wiederholt das, waehrend die Sitzung weiterlaeuft.
+    private static HttpResponse handleSparse(String videoId, int itag, String range,
+                                             boolean head, long wantEnd) throws Exception {
+        final Path file = ensureFile(videoId, itag);
+        if (file == null) return HttpResponse.ofCode(502).withBody("sabr: no media for itag".getBytes());
+        SparseStore.ensureOffsets(videoId, itag);
+        final long total = SparseStore.totalLength(videoId, itag);
+        if (total <= 0) return serveFile(file, itag, range, head);   // sidx noch nicht da
+        final long[] se = range == null || range.isEmpty()
+                ? new long[]{0, Math.min(total - 1, MAX_RESPONSE_BYTES - 1)}
+                : parseRange(range, total);
+        if (se == null) return HttpResponse.ofCode(416);
+        final long start = se[0];
+        final long end = Math.min(se[1], start + MAX_RESPONSE_BYTES - 1);
+        if (!head && !ensureRange(videoId, itag, start, end)) {
+            System.out.println("[Sparse] " + videoId + "/" + itag + " Bereich " + start + "-" + end
+                    + " nicht rechtzeitig da -> 503");
+            return HttpResponse.ofCode(503);
+        }
+        return serveFile(file, itag, range, head, total);
+    }
+
     private static void download(String videoId) throws Exception {
-        download(videoId, false);
+        download(videoId, false, false);
+    }
+
+    private static void download(String videoId, boolean allowPacedRequested) throws Exception {
+        download(videoId, allowPacedRequested, false);
     }
 
     // ── kids readahead-cap heal ─────────────────────────────────────────────
@@ -569,7 +668,7 @@ public final class SabrCache {
         return r;
     }
 
-    private static void download(String videoId, boolean allowPacedRequested) throws Exception {
+    private static void download(String videoId, boolean allowPacedRequested, boolean demand) throws Exception {
         final boolean allowPaced = allowPacedRequested && pacedEnabled();
         // Known capped (kids): burst rungs are wasted requests — refill goes
         // straight to the paced 1x session; the sync warm path keeps serving
@@ -586,7 +685,7 @@ public final class SabrCache {
         // Kids-Videos holt, ist ein spaeterer Versuch genau das Richtige. So
         // vervollstaendigt sich ein Teil-Video von selbst, sobald das Fenster
         // aufgeht (Sperrzeit + WEB-Memo deckeln die Versuche).
-        if (isCapMarked(videoId) && anyFileFor(videoId) && !allowPacedRequested) return;
+        if (isCapMarked(videoId) && anyFileFor(videoId) && !allowPacedRequested && !demand) return;
         if (isCapMarked(videoId) && anyFileFor(videoId) && pacedEnabled()) {
             if (!allowPaced) return;
             final String fam = me.kavin.piped.utils.EgressManager.activeEgress();
@@ -814,6 +913,14 @@ public final class SabrCache {
             // warten hiesse, den Deckel um Gigabytes zu ueberfahren. maybeEvict
             // drosselt sich selbst auf einen Lauf pro 30 s und ruehrt das gerade
             // laufende Video nicht an.
+            // Streifen-Modus: Anwesenheitskarte festschreiben, damit ein Neustart
+            // weiss, was schon da ist.
+            if (SPARSE) {
+                for (var pe : progress.entrySet()) {
+                    final long[] pr = pe.getValue();
+                    SparseStore.persist(videoId, pe.getKey(), pr[4], (int) pr[2]);
+                }
+            }
             maybeEvict();
         };
         // Protokoll-Probe (2026-07-25): erzwingt einen Client-Modus fuer die
@@ -1025,7 +1132,14 @@ public final class SabrCache {
     private static final long MAX_RESPONSE_BYTES = 16L * 1024 * 1024;
 
     private static HttpResponse serveFile(Path file, int itag, String range, boolean head) throws IOException {
-        final long total = Files.size(file);
+        return serveFile(file, itag, range, head, Files.size(file));
+    }
+
+    /// total wird im Streifen-Modus aus dem sidx genommen, NICHT aus der
+    /// Dateigroesse: die Datei hat Loecher, ihre Groesse sagt nichts darueber,
+    /// wie lang das Video ist.
+    private static HttpResponse serveFile(Path file, int itag, String range, boolean head, long total)
+            throws IOException {
         final String ct = itag == 140 ? "audio/mp4" : "video/mp4";
         final boolean noRange = range == null || range.isEmpty();
         if (noRange && (head || total <= MAX_RESPONSE_BYTES)) {

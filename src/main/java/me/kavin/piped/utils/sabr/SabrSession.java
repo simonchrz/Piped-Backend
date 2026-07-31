@@ -186,6 +186,14 @@ public final class SabrSession {
     private java.util.function.BooleanSupplier pauseWhen;
     public void setPauseWhen(java.util.function.BooleanSupplier s) { this.pauseWhen = s; }
 
+    /// SPRUNGZIEL. Liefert die Segmentnummer, die der Player JETZT braucht, oder
+    /// -1. Damit springt die laufende Sitzung an eine beliebige Stelle des
+    /// Videos, statt stur von vorne weiterzuladen — SABR kann das, die
+    /// Abspielposition IST die Steuergroesse. Ohne das war Vorspulen auf den
+    /// bereits geladenen Anfang beschraenkt.
+    private java.util.function.IntSupplier seekTargetSeq;
+    public void setSeekTargetSeq(java.util.function.IntSupplier s) { this.seekTargetSeq = s; }
+
     /// FORTSETZEN AB SEGMENT N. Was schon auf Platte liegt, beschreibt der
     /// Aufrufer hier; die Session tut dann so, als haette sie diese Segmente in
     /// dieser Sitzung geholt: sie meldet sie in `buffered_ranges`, setzt die
@@ -548,6 +556,24 @@ public final class SabrSession {
                     if (waitMs > 0) {
                         try { Thread.sleep(waitMs); }
                         catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    }
+                }
+                // Sprungziel beruecksichtigen: der Player hat Bytes angefordert,
+                // die woanders im Video liegen -> Abspielposition dorthin setzen.
+                if (seekTargetSeq != null) {
+                    final int want = seekTargetSeq.getAsInt();
+                    if (want > 0) {
+                        long perSeg = 0;
+                        for (FState st : states.values())
+                            if (st.perSegMs() > 0) { perSeg = st.perSegMs(); break; }
+                        if (perSeg > 0) {
+                            final long targetMs = perSeg * (want - 1);
+                            if (Math.abs(targetMs - playerTimeMs) > perSeg) {
+                                System.out.println("[Sabr] Sprung auf Segment " + want
+                                        + " (" + targetMs + "ms)");
+                                playerTimeMs = targetMs;
+                            }
+                        }
                     }
                 }
                 final byte[] resp = post(buildRequest(states, playerTimeMs, playbackCookie));
