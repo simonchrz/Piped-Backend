@@ -447,13 +447,24 @@ public class SynthHlsHandlers {
         // Beide Spuren auf die kuerzere gemeinsame Laenge kuerzen (s.
         // availableSeconds) — nur im Rueckfall-Modus, wo wir ohnehin nur den
         // vorhandenen Anfang anbieten.
+        // ⚠️ NUR das BILD kuerzen, nie den TON.
+        //
+        // Der Ton darf ruhig laenger sein — laeuft er aber KUERZER als das Bild,
+        // bleibt der Player stehen, sobald sein Vorlauf-Puffer ueber das
+        // Tonende hinausreicht: gemessen 2026-07-31 an S27Kd7nfzfQ endete der
+        // Ton bei 29,96 s, das Bild lief bis 37,64 s, und die Wiedergabe stoppte
+        // bei ~17 s (Position + Puffer > Tonende). Mein erster Anlauf kuerzte
+        // beide gegeneinander und hat damit ausgerechnet den Ton beschnitten —
+        // also genau die falsche Richtung.
         double capSeconds = Double.MAX_VALUE;
         if (!listAll && videoId != null) {
             try {
                 final int[] pair = me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId);
-                final int other = itag == pair[0] ? pair[1] : pair[0];
-                final double otherSec = availableSeconds(videoId, other);
-                if (otherSec > 0) capSeconds = otherSec;
+                final boolean isAudioTrack = itag == pair[0];
+                if (!isAudioTrack) {
+                    final double audioSec = availableSeconds(videoId, pair[0]);
+                    if (audioSec > 0) capSeconds = audioSec;
+                }
             } catch (Exception ignored) { }
         }
         double emittedSeconds = 0;
