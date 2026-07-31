@@ -398,10 +398,25 @@ public class SynthHlsHandlers {
         final int contiguous = me.kavin.piped.utils.sabr.SabrCache.SPARSE && videoId != null
                 ? me.kavin.piped.utils.sabr.SparseStore.contiguousFromStart(videoId, itag)
                 : Integer.MAX_VALUE;
+        // Beide Spuren auf die kuerzere gemeinsame Laenge kuerzen (s.
+        // availableSeconds) — nur im Rueckfall-Modus, wo wir ohnehin nur den
+        // vorhandenen Anfang anbieten.
+        double capSeconds = Double.MAX_VALUE;
+        if (!listAll && videoId != null) {
+            try {
+                final int[] pair = me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId);
+                final int other = itag == pair[0] ? pair[1] : pair[0];
+                final double otherSec = availableSeconds(videoId, other);
+                if (otherSec > 0) capSeconds = otherSec;
+            } catch (Exception ignored) { }
+        }
+        double emittedSeconds = 0;
         int seq = 0;
         for (SidxParserJava.Entry e : sidx.entries) {
             seq++;
             if (!listAll && (cursor + e.byteSize > fileLen || seq > contiguous)) break;
+            if (!listAll && emittedSeconds + e.duration > capSeconds + 0.001) break;
+            emittedSeconds += e.duration;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));
             sb.append(String.format("#EXT-X-BYTERANGE:%d@%d\n", e.byteSize, cursor));
             sb.append(segUrl).append('\n');
@@ -429,6 +444,36 @@ public class SynthHlsHandlers {
             if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
         }
         return sb.toString();
+    }
+
+    /// Wie viel Spielzeit liegt fuer die ANDERE Spur bereit?
+    ///
+    /// ⚠️ Bei einem Teil-Cache laufen die Spuren auseinander: gemessen an
+    /// DKmHnGJqDn0 hatte das Video 6 Segmente = 36,0 s, der Ton 5 = 49,9 s.
+    /// Ein VOD, dessen Spuren 14 s auseinanderliegen, ist fuer den Player
+    /// mindestens ungewoehnlich — beide auf die kuerzere gemeinsame Laenge zu
+    /// kuerzen kostet nichts und beseitigt die Unstimmigkeit.
+    private static double availableSeconds(String videoId, int itag) {
+        try {
+            final java.nio.file.Path bin = me.kavin.piped.utils.sabr.SparseStore.binPath(videoId, itag);
+            if (!java.nio.file.Files.exists(bin)) return -1;
+            final int[] box = scanSabrSidx(bin);
+            if (box == null) return -1;
+            final SidxParserJava.Data sx = SidxParserJava.fromFile(bin, box[0], box[0] + box[1] - 1);
+            if (sx == null || sx.entries.isEmpty()) return -1;
+            final int have = me.kavin.piped.utils.sabr.SabrCache.SPARSE
+                    ? me.kavin.piped.utils.sabr.SparseStore.contiguousFromStart(videoId, itag)
+                    : sx.entries.size();
+            double sum = 0;
+            int n = 0;
+            for (SidxParserJava.Entry e : sx.entries) {
+                if (n++ >= have) break;
+                sum += e.duration;
+            }
+            return sum;
+        } catch (Exception e) {
+            return -1;
+        }
     }
 
     /// sidx aus dem lokalen SABR-Cache holen, wenn der HTTP-Abruf scheitert.
