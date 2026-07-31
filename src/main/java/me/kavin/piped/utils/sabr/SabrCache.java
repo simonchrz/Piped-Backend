@@ -253,9 +253,43 @@ public final class SabrCache {
         return derived != null ? derived : new int[]{140, 137};
     }
 
+    /// Fortsetz-Zustand aus der Anwesenheitskarte (Streifen-Modus).
+    private static Map<Integer, SabrSession.Resume> readResumeFromMap(String videoId) {
+        final Map<Integer, SabrSession.Resume> out = new java.util.LinkedHashMap<>();
+        final int[] itags = deriveItags(videoId);
+        if (itags == null) return out;
+        for (int itag : itags) {
+            if (!SparseStore.ensureOffsets(videoId, itag)) continue;
+            final int lastSeq = SparseStore.contiguousFromStart(videoId, itag);
+            final int total = SparseStore.cachedTotal(videoId, itag);
+            final long lmt = SparseStore.cachedLmt(videoId, itag);
+            if (lastSeq <= 0 || total <= 0 || lmt <= 0 || lastSeq >= total) continue;
+            // Dauer schaetzen wir nicht — sie steckt in FORMAT_INIT; hier zaehlt
+            // nur, ab WO weitergemacht wird.
+            out.put(itag, new SabrSession.Resume(lastSeq, 0, total, 0, lmt));
+        }
+        return out;
+    }
+
+    /// Wann hat zuletzt jemand WIRKLICH Segmente abgerufen (= zugesehen)?
+    ///
+    /// ⚠️ Vom Playlist-Aufbau zu unterscheiden: der passiert auch beim Vorladen
+    /// im Feed, ganz ohne Zuschauer. Wer nur die Uhr am Playlist-Aufbau
+    /// aufzieht, laesst Hintergrund-Downloads fuer Videos laufen, die niemand
+    /// ansieht — das kostet Bandbreite, Platte und vor allem Ruf bei YouTube
+    /// (und der ist angesichts der 403-Wand das knappste Gut).
+    private static final Map<String, Long> LAST_PLAYBACK = new ConcurrentHashMap<>();
+    private static final long PLAYBACK_RECENT_MS = 30 * 60_000L;
+
+    private static boolean watchedRecently(String videoId) {
+        final Long t = LAST_PLAYBACK.get(videoId);
+        return t != null && System.currentTimeMillis() - t < PLAYBACK_RECENT_MS;
+    }
+
     /// Anforderung des Players vermerken — Grundlage der Bedarfssteuerung.
     private static void noteRequest(String videoId, int itag, long endOffset) {
         LAST_REQUEST.put(videoId, System.currentTimeMillis());
+        LAST_PLAYBACK.put(videoId, System.currentTimeMillis());
         DEMAND_OFFSET.merge(safe(videoId) + "_" + itag, endOffset, Math::max);
     }
 
@@ -494,6 +528,16 @@ public final class SabrCache {
         if (healthy) SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
         else SEEK_PROVEN.remove(videoId);
     }
+
+    /// Welche Token-Bindung hat fuer DIESES Video zuletzt geliefert?
+    ///
+    /// ⚠️ Die Leiter beginnt sonst immer mit dem visitor-bound Token — bei
+    /// Made-for-Kids liefert aber regelmaessig erst die content-bound Stufe.
+    /// Gemessen 2026-07-31 an einem Sprung: 12:16:25,9 Sprung erkannt,
+    /// 12:16:38,5 erste Stufe aufgegeben, danach erst die richtige — von 18,6 s
+    /// Wartezeit gingen ~11 s an eine Stufe, die fuer dieses Video nie liefert.
+    /// Mit dem Merker faengt der naechste Versuch gleich richtig an.
+    private static final Map<String, Boolean> GOOD_BINDING = new ConcurrentHashMap<>();
 
     /// Waechst der Cache gerade? Dann liefert die Quelle JETZT — der staerkste
     /// verfuegbare Beleg, dass wir fehlende Stellen nachfordern koennen.
@@ -782,7 +826,15 @@ public final class SabrCache {
             System.out.println("[SabrCache] " + videoId
                     + " WEB-Memo aktiv -> direkt ANDROID (spart 2 Fehlversuche)");
         int usedClient = skipWeb ? 0 : DEFAULT_CLIENT;
-        SabrHandlers.SabrMedia result = attemptBothFamilies(videoId, fam1, usedClient);
+        // Mit der Bindung anfangen, die zuletzt geliefert hat (s. GOOD_BINDING).
+        final boolean preferContentBound = Boolean.TRUE.equals(GOOD_BINDING.get(videoId));
+        SabrHandlers.SabrMedia result = preferContentBound && !skipWeb
+                ? attempt(videoId, fam1, true, usedClient)
+                : attemptBothFamilies(videoId, fam1, usedClient);
+        if (preferContentBound && (result == null || result.segments() == 0))
+            result = attemptBothFamilies(videoId, fam1, usedClient);
+        if (result != null && result.segments() > 0)
+            GOOD_BINDING.put(videoId, preferContentBound);
         // Stufe 2: Client-Rueckfall auf ANDROID. Es gab Fenster (2026-07-30
         // abends), in denen der WEB-Pfad auf BEIDEN Familien hart 403te, waehrend
         // ANDROID noch seine ~13 MB holte. Ein Teil-Cache ist besser als keiner,
@@ -800,6 +852,7 @@ public final class SabrCache {
             final SabrHandlers.SabrMedia rc = attempt(videoId, fam1, true, DEFAULT_CLIENT);
             if (rc != null && (result == null || rc.segments() > result.segments())) {
                 result = rc;
+                GOOD_BINDING.put(videoId, true);   // diese Bindung liefert hier
                 System.out.println("[SabrCache] " + videoId + " WEB content-bound gewann (segs="
                         + rc.segments() + " complete=" + rc.complete() + ")");
             }
@@ -830,6 +883,7 @@ public final class SabrCache {
             final SabrHandlers.SabrMedia r3 = attempt(videoId, fam1, true, usedClient);
             if (r3 != null && r3.segments() > result.segments()) {
                 result = r3;
+                GOOD_BINDING.put(videoId, true);   // diese Bindung liefert hier
                 System.out.println("[SabrCache] " + videoId + " content-bound retry won"
                         + " (segs=" + r3.segments() + " complete=" + r3.complete() + ")");
             } else {
@@ -941,7 +995,13 @@ public final class SabrCache {
         // ab Segment N+1 weiter und die .part enthaelt NUR den neuen Schwanz —
         // der wird an die vorhandene .bin angehaengt. baseLen haelt fest, wo die
         // .bin beim Start stand (Pruefgroesse fuers Anhaengen).
-        final Map<Integer, SabrSession.Resume> resume = readResume(videoId);
+        // ⚠️ Im Streifen-Modus steht der Stand in der KARTE (.map), nicht in der
+        // alten .state-Datei — sonst startet jede Sitzung wieder bei Segment 1,
+        // laedt Vorhandenes ein zweites Mal und ignoriert den Sprungwunsch
+        // (2026-07-31 beobachtet: Karte wuchs stur 1..456, kein einziger
+        // "Sprung auf"-Eintrag, Sprungabrufe liefen in den Timeout).
+        final Map<Integer, SabrSession.Resume> resume =
+                SPARSE ? readResumeFromMap(videoId) : readResume(videoId);
         final Map<Integer, Long> baseLen = new ConcurrentHashMap<>();
         for (var e : resume.entrySet()) {
             try {
@@ -1172,6 +1232,10 @@ public final class SabrCache {
     private static final Set<String> REFILL_ACTIVE = ConcurrentHashMap.newKeySet();
 
     public static void requestRefill(String videoId) {
+        // Nur nachladen, wenn dieses Video kuerzlich WIRKLICH gespielt wurde.
+        // Ein Playlist-Aufbau allein (Vorladen im Feed) reicht nicht — sonst
+        // laufen Hintergrund-Downloads fuer Videos, die niemand ansieht.
+        if (!watchedRecently(videoId)) return;
         if (isRefillExhausted(videoId)) return;          // paced verdict: nichts zu holen
         // ⚠️ FRUEHER hier: cap-markiert + paced aus -> abbrechen. Das galt, solange
         // JEDER Weg an der Attestierung scheiterte. Seit der WEB-Pfad im offenen

@@ -202,6 +202,18 @@ public final class SparseStore {
         } catch (IOException ignored) {}
     }
 
+    /// Wie viele Segmente hat das Video laut Karte? 0 = unbekannt.
+    public static int cachedTotal(String videoId, int itag) {
+        try {
+            final Path mp = mapPath(videoId, itag);
+            if (!Files.exists(mp)) return 0;
+            final String[] f = Files.readString(mp).trim().split("\\s+");
+            return f.length >= 2 ? Integer.parseInt(f[1]) : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     /// Welcher Encode liegt im Cache? 0 = unbekannt.
     public static long cachedLmt(String videoId, int itag) {
         return readMapLmt(videoId, itag);
