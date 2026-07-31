@@ -362,7 +362,13 @@ public class SynthHlsHandlers {
         // /sabr dann auf Zuruf nach (SabrCache.ensureRange). Im klassischen
         // Modus bleibt es beim geladenen Anfang, weil dort ein Sprung ins Leere
         // ein 416 waere und AVPlayer das Video verwirft.
-        final boolean listAll = me.kavin.piped.utils.sabr.SabrCache.SPARSE;
+        // ⚠️ NUR listen, was wir auch liefern koennen. Ein gedrosseltes Video
+        // (cap/exhausted) oder eines, bei dem ein Nachfordern gerade scheitert,
+        // bekommt die ehrliche Teil-Playlist — sonst springt der Player in einen
+        // Bereich, den wir nicht fuellen koennen, und haengt im Standbild.
+        final boolean listAll = me.kavin.piped.utils.sabr.SabrCache.SPARSE
+                && !partialTerminal
+                && !me.kavin.piped.utils.sabr.SabrCache.seekUnavailable(videoId);
         for (SidxParserJava.Entry e : sidx.entries) {
             if (!listAll && cursor + e.byteSize > fileLen) break;
             sb.append(String.format("#EXTINF:%.3f,\n", e.duration));

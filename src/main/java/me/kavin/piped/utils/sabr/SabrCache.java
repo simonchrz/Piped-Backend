@@ -464,6 +464,22 @@ public final class SabrCache {
         }
     }
 
+    /// Videos, bei denen ein Nachfordern gerade NICHT klappt (Drosselfenster).
+    /// Solange die Marke steht, bietet die Playlist nur das an, was wirklich da
+    /// ist — sonst springt der Player in einen Bereich, den wir nicht liefern
+    /// koennen, und bleibt im Standbild haengen (2026-07-31 in der App: Video
+    /// forderte Byte 418MB von 868MB an, Session cappte bei 3 Segmenten, jede
+    /// Antwort 503). Lieber die erste Minute spielen als gar nichts.
+    private static final Map<String, Long> SEEK_UNAVAILABLE = new ConcurrentHashMap<>();
+    private static final long SEEK_UNAVAILABLE_TTL_MS = 10 * 60_000L;
+
+    public static boolean seekUnavailable(String videoId) {
+        final Long exp = SEEK_UNAVAILABLE.get(videoId);
+        if (exp == null) return false;
+        if (exp < System.currentTimeMillis()) { SEEK_UNAVAILABLE.remove(videoId); return false; }
+        return true;
+    }
+
     /// Sprungziel je Video: die Segmentnummer, die der Player gerade braucht.
     private static final Map<String, Integer> SEEK_SEQ = new ConcurrentHashMap<>();
     /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
@@ -501,6 +517,7 @@ public final class SabrCache {
             }
             SEEK_SEQ.put(videoId, missing.get(0));
         }
+        SEEK_UNAVAILABLE.put(videoId, System.currentTimeMillis() + SEEK_UNAVAILABLE_TTL_MS);
         return false;
     }
 
