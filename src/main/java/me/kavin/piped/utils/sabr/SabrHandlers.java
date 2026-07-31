@@ -487,7 +487,14 @@ public final class SabrHandlers {
         final Map<String, Object> client = new HashMap<>(Map.of(
                 "clientName", "WEB", "clientVersion", WEB_VERSION,
                 "hl", "en", "gl", "US", "userAgent", WEB_UA));
-        if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
+        // ⚠️ Beim ANGEMELDETEN Aufruf keine visitorData mitgeben. Sie beschreibt
+        // einen anonymen Besucher und verdrängt die Kontositzung: YouTube
+        // vergibt dann kein `siu` in der Streaming-URL. Gemessen 2026-07-31 —
+        // identischer Aufruf ohne visitorData liefert siu (signiert in sparams),
+        // mit visitorData nicht. `siu` ist der einzige Unterschied zwischen
+        // unserer Sitzung und der eines echten Browsers.
+        if (!angemeldet() && visitorData != null && !visitorData.isEmpty())
+            client.put("visitorData", visitorData);
         final Map<String, Object> req = new HashMap<>(Map.of(
                 "context", Map.of("client", client),
                 "videoId", videoId, "contentCheckOk", true, "racyCheckOk", true,
@@ -531,11 +538,21 @@ public final class SabrHandlers {
     /// SAPISIDHASH-Signatur über Zeitstempel, SAPISID und Origin. Ohne sie
     /// behandelt Google den Aufruf weiterhin als abgemeldet.
     /// Kill-Switch: YT_SABR_PLAYER_LOGIN=0.
+    /// Können und sollen wir den Player-Call anmelden? Kill-Switch:
+    /// YT_SABR_PLAYER_LOGIN=0.
+    private static boolean angemeldet() {
+        if ("0".equals(System.getenv("YT_SABR_PLAYER_LOGIN"))) return false;
+        try {
+            final String c = me.kavin.piped.utils.BgPoTokenProvider.loadCookieHeader();
+            return c != null && !c.isEmpty()
+                    && (keksWert(c, "SAPISID") != null || keksWert(c, "__Secure-3PAPISID") != null);
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
     private static Map<String, String> angemeldeteKopfzeilen(Map<String, String> basis) {
-        // Standard AUS: die Anmeldung aendert JEDE Sitzung, hat den Kids-Cap aber
-        // nachweislich nicht gebrochen (kein siu, weiterhin Segment 12/548).
-        // YT_SABR_PLAYER_LOGIN=1 schaltet sie fuer weitere Messungen zu.
-        if (!"1".equals(System.getenv("YT_SABR_PLAYER_LOGIN"))) return basis;
+        if (!angemeldet()) return basis;
         final String cookies;
         try {
             cookies = me.kavin.piped.utils.BgPoTokenProvider.loadCookieHeader();
