@@ -506,15 +506,70 @@ public final class SabrHandlers {
         final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
                 "POST", body.getBytes(StandardCharsets.UTF_8),
-                Map.of("Content-Type", "application/json",
+                angemeldeteKopfzeilen(Map.of("Content-Type", "application/json",
                         "Accept-Encoding", "identity",
                         "User-Agent", WEB_UA,
                         "X-Youtube-Client-Name", "1",
                         "X-Youtube-Client-Version", WEB_VERSION,
                         "Origin", "https://www.youtube.com",
-                        "Referer", "https://www.youtube.com/"),
+                        "Referer", "https://www.youtube.com/")),
                 family).get(20, java.util.concurrent.TimeUnit.SECONDS);
         return Constants.mapper.readTree(r.body());
+    }
+
+    /// Meldet den Player-Call an. WARUM: Der Vergleich unserer Sitzungs-URL mit
+    /// der eines echten Chromium (2026-07-31) zeigte genau einen signierten
+    /// Unterschied — Chromium bekommt `siu=1`, und zwar INNERHALB von `sparams`,
+    /// also von YouTube mitsigniert. Wir bekommen es nicht, weil unser
+    /// Player-Call bisher komplett anonym lief: kein Cookie, keine Signatur.
+    /// Damit gewährt YouTube uns eine anonyme Streaming-Sitzung — und genau die
+    /// wird bei Made-for-Kids-Inhalten nach ~60 s auf Attestierung gestellt
+    /// (STREAM_PROTECTION_STATUS 2 -> 3), während die angemeldete Sitzung des
+    /// Browsers dasselbe Video komplett ausliefert.
+    ///
+    /// ⚠️ Cookies allein genügen youtubei nicht — es braucht zusätzlich die
+    /// SAPISIDHASH-Signatur über Zeitstempel, SAPISID und Origin. Ohne sie
+    /// behandelt Google den Aufruf weiterhin als abgemeldet.
+    /// Kill-Switch: YT_SABR_PLAYER_LOGIN=0.
+    private static Map<String, String> angemeldeteKopfzeilen(Map<String, String> basis) {
+        // Standard AUS: die Anmeldung aendert JEDE Sitzung, hat den Kids-Cap aber
+        // nachweislich nicht gebrochen (kein siu, weiterhin Segment 12/548).
+        // YT_SABR_PLAYER_LOGIN=1 schaltet sie fuer weitere Messungen zu.
+        if (!"1".equals(System.getenv("YT_SABR_PLAYER_LOGIN"))) return basis;
+        final String cookies;
+        try {
+            cookies = me.kavin.piped.utils.BgPoTokenProvider.loadCookieHeader();
+        } catch (Throwable e) {
+            return basis;
+        }
+        if (cookies == null || cookies.isEmpty()) return basis;
+        final java.util.Map<String, String> out = new java.util.HashMap<>(basis);
+        out.put("Cookie", cookies);
+        final String sapisid = keksWert(cookies, "SAPISID") != null
+                ? keksWert(cookies, "SAPISID") : keksWert(cookies, "__Secure-3PAPISID");
+        if (sapisid != null) {
+            final long ts = System.currentTimeMillis() / 1000L;
+            final String roh = ts + " " + sapisid + " https://www.youtube.com";
+            try {
+                final var md = java.security.MessageDigest.getInstance("SHA-1");
+                final byte[] h = md.digest(roh.getBytes(StandardCharsets.UTF_8));
+                final StringBuilder hex = new StringBuilder();
+                for (byte b : h) hex.append(String.format("%02x", b));
+                out.put("Authorization", "SAPISIDHASH " + ts + "_" + hex);
+                out.put("X-Origin", "https://www.youtube.com");
+                out.put("X-Goog-AuthUser", "0");
+            } catch (Exception ignored) { /* dann eben ohne Signatur */ }
+        }
+        return out;
+    }
+
+    /// Liest einen einzelnen Wert aus einem "a=1; b=2"-Kopf.
+    private static String keksWert(String header, String name) {
+        for (String teil : header.split(";")) {
+            final String s = teil.trim();
+            if (s.startsWith(name + "=")) return s.substring(name.length() + 1);
+        }
+        return null;
     }
 
     private static JsonNode webEmbedPlayer(String videoId, String visitorData, String family,

@@ -134,7 +134,7 @@ public class BgPoTokenProvider implements PoTokenProvider {
     public @Nullable String datasyncId() { return datasyncId; }
 
     /// Login-Cookies als Header-Zeile (Netscape-Format wie yt-dlp sie schreibt).
-    private static String loadCookieHeader() {
+    public static String loadCookieHeader() {
         String p = System.getenv("YOUTUBE_COOKIES_FILE");
         if (p == null || p.isEmpty()) p = "/app/youtube-cookies.txt";
         final java.io.File f = new java.io.File(p);
