@@ -226,9 +226,7 @@ public final class SabrHandlers {
                 && ustOverride != null && !ustOverride.isBlank();
 
         final JsonNode player = pureWeb
-                ? ("1".equals(System.getenv("YT_SABR_WATCHPAGE"))
-                        ? watchSeitePlayer(videoId, family)
-                        : webPlayer(videoId, visitorData, family, attestationPoToken))
+                ? spielerAntwort(videoId, visitorData, family, attestationPoToken)
                 : webClient
                 ? webEmbedPlayer(videoId, visitorData, family, attestationPoToken)
                 : androidPlayer(videoId, visitorData, family, attestationPoToken, vrClient);
@@ -502,6 +500,36 @@ public final class SabrHandlers {
         }
     }
 
+    /// Woher kommt die Player-Antwort? Drei Quellen, in dieser Reihenfolge:
+    ///   1. YT_SABR_PLAYER_JSON=<Datei> — fertige Antwort von aussen. Damit
+    ///      lassen sich Sitzungen testen, die ein anderer Client geholt hat
+    ///      (z.B. ein HTTP-Client mit Chrome-TLS-Fingerabdruck), OHNE die
+    ///      Anfrage von Hand zusammenzubauen: das Backend arbeitet ganz normal
+    ///      mit einer selbstkonsistenten Antwort weiter.
+    ///      ⚠️ Die Datei wird nach dem Lesen NICHT geloescht — sie gilt fuer
+    ///      genau ein Video, deshalb steht die videoId im Dateinamen.
+    ///   2. YT_SABR_WATCHPAGE=1 — Sitzung aus der Watch-Seite (wie der Browser).
+    ///   3. sonst der Player-API-Aufruf wie bisher.
+    private static JsonNode spielerAntwort(String videoId, String visitorData, String family,
+                                           String attestationPoToken) throws Exception {
+        final String ordner = System.getenv("YT_SABR_PLAYER_JSON");
+        if (ordner != null && !ordner.isBlank()) {
+            final java.nio.file.Path datei = java.nio.file.Path.of(ordner, videoId + ".json");
+            if (java.nio.file.Files.exists(datei)) {
+                final JsonNode pr = Constants.mapper.readTree(java.nio.file.Files.readString(datei));
+                System.out.println("[Sabr] Player-Antwort AUS DATEI " + datei
+                        + ": status=" + pr.path("playabilityStatus").path("status").asText()
+                        + " formate=" + pr.path("streamingData").path("adaptiveFormats").size()
+                        + " ust=" + findFirst(pr, "videoPlaybackUstreamerConfig").length());
+                return pr;
+            }
+            System.out.println("[Sabr] YT_SABR_PLAYER_JSON gesetzt, aber " + datei + " fehlt");
+        }
+        if ("1".equals(System.getenv("YT_SABR_WATCHPAGE")))
+            return watchSeitePlayer(videoId, family);
+        return webPlayer(videoId, visitorData, family, attestationPoToken);
+    }
+
     /// Holt die Streaming-Sitzung aus der WATCH-SEITE statt aus der Player-API.
     ///
     /// WARUM: Ein echter Chromium ruft `/youtubei/v1/player` überhaupt nicht auf
@@ -540,7 +568,17 @@ public final class SabrHandlers {
             if (imText) continue;
             if (c == '{') tiefe++;
             else if (c == '}' && --tiefe == 0)
-                return Constants.mapper.readTree(html.substring(b, i + 1));
+            {
+                final JsonNode pr = Constants.mapper.readTree(html.substring(b, i + 1));
+                final var sd = pr.path("streamingData");
+                System.out.println("[Sabr] Watch-Seite: status="
+                        + pr.path("playabilityStatus").path("status").asText()
+                        + " formate=" + sd.path("adaptiveFormats").size()
+                        + " abrUrl=" + sd.path("serverAbrStreamingUrl").asText().length()
+                        + " ust=" + findFirst(pr, "videoPlaybackUstreamerConfig").length()
+                        + " html=" + html.length());
+                return pr;
+            }
         }
         throw new IllegalStateException("ytInitialPlayerResponse unvollstaendig");
     }
