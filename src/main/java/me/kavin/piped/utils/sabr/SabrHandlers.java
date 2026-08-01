@@ -226,7 +226,9 @@ public final class SabrHandlers {
                 && ustOverride != null && !ustOverride.isBlank();
 
         final JsonNode player = pureWeb
-                ? webPlayer(videoId, visitorData, family, attestationPoToken)
+                ? ("1".equals(System.getenv("YT_SABR_WATCHPAGE"))
+                        ? watchSeitePlayer(videoId, family)
+                        : webPlayer(videoId, visitorData, family, attestationPoToken))
                 : webClient
                 ? webEmbedPlayer(videoId, visitorData, family, attestationPoToken)
                 : androidPlayer(videoId, visitorData, family, attestationPoToken, vrClient);
@@ -498,6 +500,49 @@ public final class SabrHandlers {
         } catch (NumberFormatException e) {
             return vorgabe;
         }
+    }
+
+    /// Holt die Streaming-Sitzung aus der WATCH-SEITE statt aus der Player-API.
+    ///
+    /// WARUM: Ein echter Chromium ruft `/youtubei/v1/player` überhaupt nicht auf
+    /// (Abfangschicht 2026-08-01: null Player-Calls). Seine Sitzung steckt als
+    /// `ytInitialPlayerResponse` im HTML der Watch-Seite. Wir benutzen dagegen
+    /// den API-Endpunkt — die einzige Stufe, die im Vergleich Browser/wir nie
+    /// angeglichen wurde. Zu prüfen ist, ob die so erzeugte Sitzung eine andere
+    /// Schutzstufe bekommt (wir bleiben bei Made-for-Kids immer auf prot=2 und
+    /// damit auf den ersten 60 s, der Browser erreicht prot=1).
+    ///
+    /// Schaltbar über YT_SABR_WATCHPAGE=1, Standard AUS.
+    private static JsonNode watchSeitePlayer(String videoId, String family) throws Exception {
+        final java.util.Map<String, String> kopf = angemeldeteKopfzeilen(Map.of(
+                "User-Agent", WEB_UA,
+                "Accept-Language", "de-DE,de;q=0.9",
+                "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+        final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
+                "https://www.youtube.com/watch?v=" + videoId,
+                "GET", null, kopf, family).get(25, java.util.concurrent.TimeUnit.SECONDS);
+        if (r.status() / 100 != 2)
+            throw new IllegalStateException("Watch-Seite HTTP " + r.status());
+        final String html = new String(r.body(), StandardCharsets.UTF_8);
+        final int a = html.indexOf("ytInitialPlayerResponse");
+        if (a < 0) throw new IllegalStateException("ytInitialPlayerResponse fehlt");
+        final int b = html.indexOf('{', a);
+        if (b < 0) throw new IllegalStateException("ytInitialPlayerResponse ohne Rumpf");
+        // Klammern zaehlen — die Antwort enthaelt beliebig verschachteltes JSON
+        // und Strings mit geschweiften Klammern.
+        int tiefe = 0;
+        boolean imText = false, entwertet = false;
+        for (int i = b; i < html.length(); i++) {
+            final char c = html.charAt(i);
+            if (entwertet) { entwertet = false; continue; }
+            if (c == '\\') { entwertet = true; continue; }
+            if (c == '"') { imText = !imText; continue; }
+            if (imText) continue;
+            if (c == '{') tiefe++;
+            else if (c == '}' && --tiefe == 0)
+                return Constants.mapper.readTree(html.substring(b, i + 1));
+        }
+        throw new IllegalStateException("ytInitialPlayerResponse unvollstaendig");
     }
 
     private static JsonNode webPlayer(String videoId, String visitorData, String family,
