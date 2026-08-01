@@ -52,7 +52,24 @@ public class MwebStreams {
 
     /// Holt direkte Streams. Gibt null zurück, wenn nichts Brauchbares kommt —
     /// der Aufrufer bleibt dann beim bisherigen Weg.
+    /// ⚠️ Ein Tap holt drei Playlists; ohne Cache laeuft der MWEB-Player-Call
+    /// dreimal. Gemessen 2026-08-01: pro Aufruf ~1-2 s.
+    /// 60 s TTL — lang genug fuer einen Tap, kurz genug fuer die bekannt
+    /// kurzlebigen Kids-URLs.
+    private record Treffer(Streams streams, long at) { }
+    private static final java.util.concurrent.ConcurrentHashMap<String, Treffer> CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long TTL_MS = 60_000L;
+
     public static Streams hole(String videoId) {
+        final Treffer t = CACHE.get(videoId);
+        if (t != null && System.currentTimeMillis() - t.at() < TTL_MS) return t.streams();
+        final Streams frisch = holeFrisch(videoId);
+        if (frisch != null) CACHE.put(videoId, new Treffer(frisch, System.currentTimeMillis()));
+        return frisch;
+    }
+
+    private static Streams holeFrisch(String videoId) {
         if (!aktiv()) return null;
         try {
             final JsonNode player = playerCall(videoId);

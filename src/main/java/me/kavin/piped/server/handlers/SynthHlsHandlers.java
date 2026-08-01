@@ -217,7 +217,17 @@ public class SynthHlsHandlers {
             // null cookies: the index is public; no need to forward the backend's
             // ~10KB authenticated cookie jar. Goes via the proxy like the segments
             // (proxy strips the hop-by-hop Connection header that else 400s).
-            sidx = SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, null);
+            // ⚠️ Ist das Video als gedrosselt bekannt, sind tiefe Byte-Bereiche
+            // aussichtslos — die Index-Anfrage kostet dann nur drei 403-Versuche
+            // (gemessen 559 + 111 + 77 ms), bevor die MWEB-Rettung ohnehin
+            // uebernimmt. Also gleich dorthin.
+            final boolean aussichtslos =
+                    me.kavin.piped.utils.sabr.SabrCache.wasThrottledRecently(videoId);
+            sidx = aussichtslos ? null
+                    : SidxParserJava.fetch(freshUrl, stream.indexStart, stream.indexEnd, null);
+            if (aussichtslos)
+                System.out.println("[SynthHls] " + videoId
+                        + " Index-Abruf uebersprungen (bekannt gedrosselt) -> direkt MWEB");
             if (sidx == null) {
                 // ⚠️ Ohne sidx wird die Playlist EIN Segment ueber die ganze
                 // Laufzeit — darin kann AVPlayer nicht springen (in der App
@@ -1162,7 +1172,35 @@ public class SynthHlsHandlers {
 
     /// Re-resolve with force-WebEmbed (modern URLs that googlevideo throttles
     /// less). Returns null on failure — caller keeps the original streams.
+    /// Kurzzeit-Cache für den WebEmbed-Rückfall.
+    ///
+    /// ⚠️ Ein Tap holt DREI Playlists (master, variante, audio) und jede lief
+    /// bisher in ihren eigenen WebEmbed-Aufruf. Gemessen 2026-08-01 an
+    /// tg0Ll77eBHI: master 3604 ms (Kaskade liefert audio=0 → WebEmbed), dann
+    /// variante nochmal 2062 ms WebEmbed — für dasselbe Video, Sekunden später.
+    /// Das ist der Löwenanteil der gemeldeten „ca 8 s bis es anspielt".
+    ///
+    /// 60 s TTL: lang genug für einen Tap (die drei Aufrufe liegen Millisekunden
+    /// auseinander), kurz genug, dass die bekannt kurzlebigen Kids-URLs nicht
+    /// über einen Wiedergabe-Start hinaus wiederverwendet werden.
+    private record WebEmbedTreffer(Streams streams, long at) { }
+    private static final java.util.concurrent.ConcurrentHashMap<String, WebEmbedTreffer>
+            WEBEMBED_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long WEBEMBED_TTL_MS = 60_000L;
+
     private static Streams resolveStreamsWebEmbed(String videoId) {
+        final WebEmbedTreffer t = WEBEMBED_CACHE.get(videoId);
+        if (t != null && System.currentTimeMillis() - t.at() < WEBEMBED_TTL_MS) {
+            System.out.println("[SynthHls] " + videoId + " WebEmbed aus Kurzzeit-Cache");
+            return t.streams();
+        }
+        final Streams frisch = resolveStreamsWebEmbedUncached(videoId);
+        if (frisch != null)
+            WEBEMBED_CACHE.put(videoId, new WebEmbedTreffer(frisch, System.currentTimeMillis()));
+        return frisch;
+    }
+
+    private static Streams resolveStreamsWebEmbedUncached(String videoId) {
         try {
             StreamInfo retryInfo = Multithreading.supplyAsync(() -> {
                 // ThreadLocal muss INSIDE des Lambdas gesetzt werden -- supplyAsync
