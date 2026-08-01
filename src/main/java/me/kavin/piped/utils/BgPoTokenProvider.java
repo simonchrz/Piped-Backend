@@ -401,10 +401,42 @@ public class BgPoTokenProvider implements PoTokenProvider {
 
     /// Mint a po_token bound to the videoId (content binding) rather than
     /// visitorData — for the WebEmbed streaming URLs. Returns null on failure.
+    /// ⚠️ Die Aufgabe MUSS mit — sonst schneidet SABR bei ~60 s ab.
+    ///
+    /// Belegt in der Referenz-Implementierung (LuanRT/googlevideo), gleich
+    /// zweifach mit exakt unserem Symptom:
+    ///   * Issue #38, vom Autor: „requires the web client to use content bound
+    ///     PO tokens — changing the binding to videoId should fix it".
+    ///   * Issue #45: „caused when the used potoken is WRONG. Using potoken
+    ///     generation with innertube.getAttestationChallenge(
+    ///     'ENGAGEMENT_TYPE_UNBOUND') makes the stream no longer cut off after
+    ///     60 seconds" — von zwei weiteren Nutzern bestaetigt.
+    ///
+    /// Beides zusammen: videoId-gebunden UND aus der selbst geholten
+    /// Attestierungs-Aufgabe gepraegt. Wir hatten bisher nur die Bindung; die
+    /// Aufgabe steckte allein im Pool-Token (createWebClientPoToken), nicht
+    /// hier. Kill-Switch: POTOKEN_OWN_CHALLENGE=0.
     private @Nullable String mintContentBoundPoToken(String videoId) {
         try {
+            final var rumpf = mapper.createObjectNode().put("content_binding", videoId);
+            try {
+                final String vd = getWebVisitorData();
+                final var aufgabe = fetchOwnChallenge(vd);
+                if (aufgabe != null) {
+                    rumpf.set("challenge", aufgabe);
+                    final var client = mapper.createObjectNode();
+                    client.put("clientName", "WEB").put("clientVersion", WEB_CLIENT_VERSION)
+                            .put("visitorData", vd).put("hl", "de").put("gl", "DE");
+                    final var ctx = mapper.createObjectNode();
+                    ctx.set("client", client);
+                    rumpf.set("innertube_context", ctx);
+                    rumpf.put("bypass_cache", true);
+                }
+            } catch (Exception e) {
+                System.out.println("[Piped/Bg] content-bound ohne eigene Aufgabe (" + e.getMessage() + ")");
+            }
             return ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST",
-                    mapper.writeValueAsBytes(mapper.createObjectNode().put("content_binding", videoId)),
+                    mapper.writeValueAsBytes(rumpf),
                     Map.of("Content-Type", "application/json"))
                 .thenApply(response -> {
                     try {

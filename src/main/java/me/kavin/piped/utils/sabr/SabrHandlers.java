@@ -171,16 +171,43 @@ public final class SabrHandlers {
             // derselbe Anschluss, dasselbe Video, ein echter Browser puffert
             // 148 s (2026-07-31 per Chrome-Erweiterung gemessen).
             // Kill-Switch: YT_POT_SPLIT_BINDING=0 stellt das alte Verhalten her.
-            final boolean splitBinding = !"0".equals(System.getenv("YT_POT_SPLIT_BINDING"));
+            // 🏁 DIE LOESUNG DES 60-SEKUNDEN-DECKELS (2026-08-01).
+            //
+            // Der GVS-Token (streamerContext) muss an die VIDEO-ID gebunden
+            // sein. Genau das verhinderte `splitBinding`: es gab dem
+            // Player-Aufruf einen videoId-gebundenen Token und liess den
+            // GVS-Token sitzungsgebunden ("bleibt der sitzungsgebundene") —
+            // damit sah der Server nie ein gueltiges Token fuer den Stream und
+            // meldete prot=2, bis er bei ~61 s auf prot=3 ging.
+            //
+            // Beleg aus der Referenz-Implementierung (LuanRT/googlevideo), zwei
+            // Meldungen mit exakt unserem Symptom:
+            //   * Issue #38, vom Autor: "requires the web client to use content
+            //     bound PO tokens — changing the binding to videoId should fix it"
+            //   * Issue #45: "caused when the used potoken is WRONG. Using
+            //     potoken generation with getAttestationChallenge(
+            //     'ENGAGEMENT_TYPE_UNBOUND') makes the stream no longer cut off
+            //     after 60 seconds"
+            //
+            // Gemessen mit videoId-Bindung + eigener Aufgabe: poToken=93B,
+            // prot=1 ab Runde 2, Play-Head 78 s / 96 s / 115 s, Cache 54 statt
+            // 12 Segmenten. Vorher: prot=2, Abbruch bei 61,3 s, immer Segment 12.
+            //
+            // YT_POT_SPLIT_BINDING=1 stellt das alte Verhalten wieder her.
+            final boolean splitBinding = "1".equals(System.getenv("YT_POT_SPLIT_BINDING"));
             if (splitBinding) {
                 final String perVideo = bg.sabrPoTokenForBinding(videoId);
                 if (perVideo != null) attestationPoToken = perVideo;   // Player-Aufruf
                 // poToken (streamerContext/GVS) bleibt der sitzungsgebundene.
-            } else if (contentBoundToken) {
+            } else {
+                // Ohne splitBinding IMMER content-bound — der Aufrufer-Schalter
+                // `contentBoundToken` war nur fuer die alte Leiter gedacht.
+                if (true) {
                 final String cb = bg.sabrContentBoundPoToken(videoId);
                 if (cb != null) { poToken = b64(cb); attestationPoToken = cb; }
                 else System.out.println("[Sabr] " + videoId
                         + " content-bound mint failed -> keeping visitor-bound token");
+                }
             }
         }
         // ⚠️ ÜBERSTEUERUNG fuer den Attestierungs-Test: Token UND Sitzungskennung
