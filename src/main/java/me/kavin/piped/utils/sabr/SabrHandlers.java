@@ -277,7 +277,14 @@ public final class SabrHandlers {
         // (Feldvergleich der ersten Runde, 2026-08-01). Verdacht: fuer
         // Kids-Inhalte sind nur die modernen Formate voll freigegeben.
         // YT_SABR_ITAG_A / YT_SABR_ITAG_V stellen die Wunsch-itags um.
-        final JsonNode aud = pickFormat(sd, "audio", wunschItag("YT_SABR_ITAG_A", 140));
+        // ⚠️ Zweitwunsch merken: bricht die Sitzung mit `sabr.no_audio_selected`
+        // ab, ist unser Audioformat fuer DIESE Sitzung nicht waehlbar — dann
+        // hilft nur ein anderes. Gemessen 2026-08-01 an hxOApe1P9dM und
+        // WRVsOCh907o: itag 140 (mit deutlich aelterem lmt als das Video) wurde
+        // abgelehnt, die Sitzung lieferte gar nichts.
+        final int wunschA = ALT_AUDIO.get() != null ? ALT_AUDIO.get()
+                : wunschItag("YT_SABR_ITAG_A", 140);
+        final JsonNode aud = pickFormat(sd, "audio", wunschA);
         final JsonNode vid = pickFormat(sd, "video", wunschItag("YT_SABR_ITAG_V", 137));
         final byte[] clientInfo;
         final String ua;
@@ -519,6 +526,20 @@ public final class SabrHandlers {
         }
         STS_AT = now;
         return STS_CACHE;
+    }
+
+    /// Ausweich-Audioformat fuer den zweiten Anlauf (pro Aufruf gesetzt).
+    static final ThreadLocal<Integer> ALT_AUDIO = new ThreadLocal<>();
+
+    /// Welche Audioformate bietet die Antwort ausser dem gewaehlten?
+    static java.util.List<Integer> andereAudioItags(JsonNode sd, int ausser) {
+        final java.util.List<Integer> out = new java.util.ArrayList<>();
+        for (JsonNode f : sd.path("adaptiveFormats"))
+            if (f.path("mimeType").asText("").startsWith("audio")) {
+                final int it = f.path("itag").asInt();
+                if (it != ausser) out.add(it);
+            }
+        return out;
     }
 
     /// Wunsch-itag aus der Umgebung, sonst der bisherige Vorgabewert.

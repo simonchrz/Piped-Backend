@@ -1003,6 +1003,25 @@ public final class SabrCache {
                         + rA.segments() + " complete=" + rA.complete() + ")");
             }
         }
+        // ⚠️ `sabr.no_audio_selected`: unser Audioformat ist fuer DIESE Sitzung
+        // nicht waehlbar (gemessen 2026-08-01 an hxOApe1P9dM und WRVsOCh907o —
+        // itag 140 wurde abgelehnt, die Sitzung lieferte GAR NICHTS, vorher sah
+        // das nur nach einem Reload-Loop aus). Mit einem anderen Audioformat
+        // aus derselben Antwort erneut versuchen, statt aufzugeben.
+        if (result != null && result.stopReason() != null
+                && result.stopReason().contains("no_audio_selected")) {
+            for (int altItag : new int[] { 251, 250, 249 }) {
+                System.out.println("[SabrCache] " + videoId
+                        + " no_audio_selected -> zweiter Anlauf mit Audio-itag " + altItag);
+                SabrHandlers.ALT_AUDIO.set(altItag);
+                try {
+                    final SabrHandlers.SabrMedia rA2 = attempt(videoId, fam1, true, usedClient);
+                    if (rA2 != null && rA2.segments() > 0) { result = rA2; break; }
+                } finally {
+                    SabrHandlers.ALT_AUDIO.remove();
+                }
+            }
+        }
         if (result != null && !result.complete() && result.stopReason() != null
                 && result.stopReason().startsWith("stuck")) {
             // Readahead-cap signature: data flowed, then the server stopped

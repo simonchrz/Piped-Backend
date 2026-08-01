@@ -390,6 +390,9 @@ public final class SabrSession {
     /// schickt er beim nächsten Versuch exakt dasselbe Teil 46 zurück
     /// (gemessen: identischer Inhalt über zwei Sitzungen).
     private String reloadToken = null;
+    /// Der vom Server genannte Fehlertyp (z. B. `sabr.no_audio_selected`) —
+    /// die Leiter entscheidet damit, ob ein anderer Versuch Sinn hat.
+    private String sabrErrorTyp = null;
     private int reloads = 0;
     private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
     private final java.util.Set<Integer> dumpedTypes = new java.util.HashSet<>();
@@ -652,7 +655,26 @@ public final class SabrSession {
                             break;
                         }
                         case UmpReader.SABR_REDIRECT: { String u = extractRedirect(payload); if (u != null) { abrUrl = u; redirected[0] = true; } break; }
-                        case UmpReader.SABR_ERROR: sabrError[0] = true; break;
+                        case UmpReader.SABR_ERROR: {
+                            sabrError[0] = true;
+                            // ⚠️ Bisher nur ein Flag — der Server sagt hier aber
+                            // ausdruecklich, WAS nicht stimmt.
+                            // SabrError { 1 = type (string), 2 = code (int32) }
+                            try {
+                                final ProtoReader er = new ProtoReader(payload);
+                                String typ = null; long code = -1;
+                                while (er.hasMore()) {
+                                    final int f = er.readTag();
+                                    if (f == 1 && er.wireType() == 2)
+                                        typ = new String(er.readBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                                    else if (f == 2 && er.wireType() == 0) code = er.readVarint();
+                                    else er.skip();
+                                }
+                                System.out.println("[Sabr] SABR_ERROR type=" + typ + " code=" + code);
+                                if (typ != null) sabrErrorTyp = typ;
+                            } catch (Exception ignored) { }
+                            break;
+                        }
                         case SABR_CONTEXT_UPDATE: handleContextUpdate(payload); break;
                         case UmpReader.STREAM_PROTECTION_STATUS:
                             protectionStatus[0] = readProtectionStatus(payload); break;
@@ -733,10 +755,20 @@ public final class SabrSession {
                         if (rl.abrUrl != null) abrUrl = rl.abrUrl;
                         ustreamerConfig = rl.ustreamerConfig;
                         if (rl.poToken != null) poToken = rl.poToken;
+                        // Wirklich NEU anfangen, nicht nur die URL tauschen:
+                        // frische Wiedergabe-Kennung, verworfenes Cookie, keine
+                        // alten sabr_contexts. Der Fortschritt (`states`) bleibt,
+                        // damit wir bei Segment N weitermachen.
                         playbackCookie = null;
+                        final String alteId = kennung(abrUrl);
+                        cpn = freshCpn();
+                        sabrContexts.clear();
                         System.out.println("[Sabr] Player-Antwort auf Serverwunsch erneuert (#"
                                 + reloads + ", UMP-Typ 46, Kontext="
-                                + (reloadToken == null ? "FEHLT" : reloadToken.length() + " Zeichen") + ")");
+                                + (reloadToken == null ? "FEHLT" : reloadToken.length() + " Zeichen")
+                                + ", id " + alteId + " -> " + kennung(abrUrl)
+                                + (alteId.equals(kennung(abrUrl)) ? " UNVERAENDERT" : "")
+                                + ", neuer cpn)");
                         continue;
                     }
                     System.out.println("[Sabr] UMP-Typ 46: Erneuerung lieferte nichts");
@@ -773,7 +805,10 @@ public final class SabrSession {
                     }
                 }
 
-                if (sabrError[0]) { stopReason = "SABR_ERROR"; break; }
+                if (sabrError[0]) {
+                    stopReason = sabrErrorTyp != null ? "SABR_ERROR:" + sabrErrorTyp : "SABR_ERROR";
+                    break;
+                }
                 // ⚠️ NICHT bei leerer states-Map "complete" melden: allMatch() ist auf
                 // einer leeren Menge trivial wahr -> die Session brach nach Runde 1
                 // mit complete=true und 0 Segmenten ab, obwohl noch gar kein
@@ -881,6 +916,17 @@ public final class SabrSession {
     /// URL-sichere Zeichen, wie der Browser sie erzeugt).
     private static final char[] CPN_CHARS =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".toCharArray();
+    /// `id`-Parameter der Streaming-URL, gekuerzt — damit im Log sichtbar ist,
+    /// ob die Erneuerung ueberhaupt eine ANDERE Sitzung geliefert hat.
+    private static String kennung(String url) {
+        if (url == null) return "-";
+        final int i = url.indexOf("&id=");
+        if (i < 0) return "-";
+        final int e = url.indexOf('&', i + 4);
+        final String v = e < 0 ? url.substring(i + 4) : url.substring(i + 4, e);
+        return v.length() > 12 ? v.substring(0, 12) : v;
+    }
+
     private static String freshCpn() {
         final char[] c = new char[16];
         final java.util.concurrent.ThreadLocalRandom r =
@@ -888,7 +934,12 @@ public final class SabrSession {
         for (int i = 0; i < 16; i++) c[i] = CPN_CHARS[r.nextInt(CPN_CHARS.length)];
         return new String(c);
     }
-    private final String cpn = freshCpn();
+    /// ⚠️ NICHT final. Bei RELOAD_PLAYER_RESPONSE hat der Server die laufende
+    /// Wiedergabe verworfen; mit derselben Kennung weiterzufragen heisst, ihm
+    /// genau die Sitzung wieder vorzulegen, die er gerade abgelehnt hat. Die
+    /// Referenz-Implementierung beendet den Stream an dieser Stelle (`done:
+    /// true`) und faengt einen NEUEN an — das bilden wir hier nach.
+    private String cpn = freshCpn();
     /// Client-Version für den cver-Parameter (Live-Wert 2026-07-31).
     private static final String CVER = "2.20260731.00.00";
 
