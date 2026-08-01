@@ -724,6 +724,14 @@ public final class SabrCache {
     public static int seekItag(String videoId) { return SEEK_ITAG.getOrDefault(videoId, -1); }
     /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
     private static final long SEEK_WAIT_MS = 20_000;
+    /// ⚠️ Sprung-Wartezeiten BEGRENZEN. Jede blockiert bis zu 20 s einen
+    /// HTTP-Thread. Seit die Playlist alle Segmente anbietet (Springen), kann
+    /// der Player mehrere Luecken gleichzeitig anfordern — am 2026-08-01 hing
+    /// das Backend dadurch komplett, auch /healthcheck lief in den Timeout, und
+    /// nur ein Neustart half. Mehr als drei gleichzeitige Wartende bringen
+    /// ohnehin nichts: sie warten alle auf dieselbe Download-Sitzung.
+    private static final java.util.concurrent.Semaphore SEEK_SLOTS =
+            new java.util.concurrent.Semaphore(3);
 
     static {
         SabrHandlers.SESSION_SEEK = vid -> () -> SEEK_SEQ.getOrDefault(vid, -1);
@@ -748,19 +756,29 @@ public final class SabrCache {
         SEEK_SEQ.put(videoId, missing.get(0));
         SEEK_ITAG.put(videoId, itag);
         startDownload(videoId, true, true);
-        final long deadline = System.currentTimeMillis() + SEEK_WAIT_MS;
-        while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(250);
-            missing = SparseStore.missing(videoId, itag, segs);
-            if (missing.isEmpty()) {
-                SEEK_SEQ.remove(videoId);
-                SEEK_ITAG.remove(videoId);
-                SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
-                return true;
+        // Lieber sofort 503 als den HTTP-Thread blockieren: der Player fragt
+        // den Bereich ohnehin gleich nochmal an, und der Download laeuft schon.
+        if (!SEEK_SLOTS.tryAcquire()) {
+            System.out.println("[Sparse] " + videoId + "/" + itag
+                    + " zu viele Sprung-Wartende -> sofort 503 (Download laeuft weiter)");
+            return false;
+        }
+        try {
+            final long deadline = System.currentTimeMillis() + SEEK_WAIT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                Thread.sleep(250);
+                missing = SparseStore.missing(videoId, itag, segs);
+                if (missing.isEmpty()) {
+                    SEEK_SEQ.remove(videoId);
+                    SEEK_ITAG.remove(videoId);
+                    SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
+                    return true;
+                }
+                SEEK_SEQ.put(videoId, missing.get(0));
+                SEEK_ITAG.put(videoId, itag);
             }
-            SEEK_SEQ.put(videoId, missing.get(0));
-            SEEK_ITAG.put(videoId, itag);
-        SEEK_ITAG.put(videoId, itag);
+        } finally {
+            SEEK_SLOTS.release();
         }
         SEEK_UNAVAILABLE.put(videoId, System.currentTimeMillis() + SEEK_UNAVAILABLE_TTL_MS);
         return false;
