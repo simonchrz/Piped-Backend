@@ -56,6 +56,17 @@ public class SynthHlsHandlers {
         // reine Doppelarbeit. isSabrMode() prueft die Storm-Marke ohnehin als
         // Erstes; wir ziehen die Pruefung nur VOR den Resolve.
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return sabrMaster(videoId);
+        // ⚠️ Dasselbe fuer bekannt gedrosselte Videos MIT brauchbarem Cache: der
+        // Resolve davor kostet ~3 s und wird danach ohnehin verworfen, weil
+        // isSabrMode() genau diese Bedingung prueft. Gemeldet als „dauert ca 8 s
+        // bis es anspielt" — gemessen waren es 3,2 s master + 2,8 s variante,
+        // obwohl 807 Segmente auf Platte lagen; der zweite Aufruf brauchte
+        // 0,01 s. Kill-Switch: YT_SYNTH_NO_CACHE_SHORTCUT=1.
+        if (cacheKurzschluss(videoId)) {
+            System.out.println("[ResolvePath] " + videoId
+                    + " -> SABR-CACHE (Kurzschluss VOR dem Resolve)");
+            return sabrMaster(videoId);
+        }
         Streams streams = mwebErsatz(videoId, fetchStreams(videoId, false));
         if (isSabrMode(videoId, streams)) return sabrMaster(videoId);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
@@ -129,7 +140,7 @@ public class SynthHlsHandlers {
 
     public static byte[] audioPlaylist(String videoId) throws Exception {
         // s. masterPlaylist: storm-markiert -> direkt aus /sabr, kein Resolve.
-        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId) || cacheKurzschluss(videoId))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[0]);
         final Streams streams;
@@ -159,7 +170,7 @@ public class SynthHlsHandlers {
 
     public static byte[] videoPlaylist(String videoId, int idx, int maxH, String[] codecs) throws Exception {
         // s. masterPlaylist: storm-markiert -> direkt aus /sabr, kein Resolve.
-        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId))
+        if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId) || cacheKurzschluss(videoId))
             return sabrStreamPlaylist(videoId,
                     me.kavin.piped.utils.sabr.SabrCache.itagsFor(videoId)[1]);
         final Streams streams;
@@ -333,6 +344,22 @@ public class SynthHlsHandlers {
         return false;
     }
 
+    /// Darf der Resolve uebersprungen werden, weil der SABR-Cache ohnehin
+    /// bedient? Spart auf dem kalten Tap die ganze Kaskade — gemessen 3,2 s
+    /// (master) + 2,8 s (variante), obwohl 807 Segmente auf Platte lagen.
+    /// Die Throttle-Marke liegt seit 2026-08-01 auch auf Platte und ueberlebt
+    /// damit Neustarts. Kill-Switch: YT_SYNTH_NO_CACHE_SHORTCUT=1.
+    private static boolean cacheKurzschluss(String videoId) {
+        if ("1".equals(System.getenv("YT_SYNTH_NO_CACHE_SHORTCUT"))) return false;
+        return me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)
+                // â ïž NUR bei fast vollstaendigem Cache abkuerzen. Sonst spart man
+                // 6 s und liefert dafuer ein abgeschnittenes Video (gemessen:
+                // 70 statt 807 Segmenten). Die Throttle-Marke allein genuegt
+                // NICHT â sie sagt nur, dass es mal gedrosselt war.
+                && me.kavin.piped.utils.sabr.SabrCache.cacheFastKomplett(videoId)
+                && me.kavin.piped.utils.sabr.SabrCache.cacheHatInit(videoId);
+    }
+
     private static Streams mwebErsatz(String videoId, Streams streams) {
         if (streams != null && streams.videoStreams != null && !streams.videoStreams.isEmpty()
                 && hatSegmentindex(streams))
@@ -467,7 +494,21 @@ public class SynthHlsHandlers {
             return null;
         }
         final int[] box = scanSabrSidx(file);
-        if (box == null) return null;   // ftyp/moov/sidx noch nicht auf Platte
+        if (box == null) {
+            // ⚠️ Unterscheiden: NOCH nicht geschrieben (Download laeuft gerade,
+            // gleich wieder versuchen) oder KAPUTT (Segmente da, aber der
+            // Init-Kasten fehlt dauerhaft). Letzteres gab es am 2026-08-01: die
+            // Datei begann mit Nullbytes, 440 MB Segmente lagen daneben, und die
+            // Playlist war deshalb dauerhaft nicht baubar -> HTTP 500 bei jedem
+            // Tap. Heilbar war das nur durch Loeschen von Hand.
+            if (me.kavin.piped.utils.sabr.SparseStore.contiguousFromStart(videoId, itag) > 0) {
+                System.out.println("[SynthHls] " + videoId + "/" + itag
+                        + " Cache KAPUTT (Segmente vorhanden, aber kein Init-Kasten)"
+                        + " -> verwerfen, wird neu geladen");
+                me.kavin.piped.utils.sabr.SabrCache.verwerfe(videoId);
+            }
+            return null;
+        }
         final int sidxStart = box[0];
         final int sidxEnd = sidxStart + box[1] - 1;
         final String segUrl = "/sabr/" + videoId + "/" + itag;

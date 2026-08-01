@@ -70,14 +70,36 @@ public final class SabrCache {
     private static final long THROTTLE_SEEN_TTL_MS = 60 * 60_000L;
 
     public static void noteThrottled(String videoId) {
+        try {
+            final Path m = markeDatei(videoId);
+            java.nio.file.Files.writeString(m, "");
+        } catch (Exception ignored) { }
         THROTTLE_SEEN.put(videoId, System.currentTimeMillis() + THROTTLE_SEEN_TTL_MS);
     }
 
+    /// ⚠️ Auch auf PLATTE merken. THROTTLE_SEEN liegt nur im Speicher und ist
+    /// nach jedem Neustart leer — dadurch zahlte der erste Tap auf ein bekannt
+    /// gedrosseltes Video wieder die volle Aufloesungskaskade (gemeldet als
+    /// "dauert ca 8 s bis es anspielt"; gemessen 3,2 s master + 2,8 s variante,
+    /// obwohl 807 Segmente auf Platte lagen). Die Marke gilt 24 h.
+    private static final long MARKE_GILT_MS = 24L * 3600_000L;
+
+    private static Path markeDatei(String videoId) { return dir().resolve(videoId + ".throttled"); }
+
     public static boolean wasThrottledRecently(String videoId) {
         final Long exp = THROTTLE_SEEN.get(videoId);
-        if (exp == null) return false;
-        if (exp < System.currentTimeMillis()) { THROTTLE_SEEN.remove(videoId); return false; }
-        return true;
+        if (exp != null && exp >= System.currentTimeMillis()) return true;
+        if (exp != null) THROTTLE_SEEN.remove(videoId);
+        try {
+            final Path m = markeDatei(videoId);
+            if (java.nio.file.Files.exists(m)) {
+                final long alter = System.currentTimeMillis()
+                        - java.nio.file.Files.getLastModifiedTime(m).toMillis();
+                if (alter < MARKE_GILT_MS) return true;
+                java.nio.file.Files.deleteIfExists(m);
+            }
+        } catch (Exception ignored) { }
+        return false;
     }
 
     public static boolean isStormMarked(String videoId) {
@@ -491,6 +513,29 @@ public final class SabrCache {
     /// Schwelle bewusst hoch (90 %): knapp vollständige Caches sind weiter
     /// wertvoll, weil sie garantiert halten. Abschaltbar mit
     /// YT_SABR_CACHE_ANY=1 (dann gilt wieder: jeder Cache schlägt alles).
+    /// â ïž Schwelle 25 %, NICHT 90 %. Die 90 % waren zu scharf: ein Cache mit
+    /// 499 von 807 Segmenten (62 %, 440 MB) wurde abgelehnt, die Auslieferung
+    /// fiel in die Aufloesungskaskade â 12 s und dann HTTP 500, obwohl das
+    /// Material vorlag (gemeldet als "8 s bis es anspielt").
+    /// Der Fall, der die Regel motiviert hat, waren 13 von 393 Segmenten (3 %).
+    /// 25 % trennt beides sauber.
+    private static final long MIN_ABDECKUNG = 25L;
+
+    /// Deckt der Cache das Video FAST GANZ ab (>=90 %)? Nur dann darf er die
+    /// Aufloesung ueberspringen — sonst tauscht man 6 s Wartezeit gegen eine
+    /// abgeschnittene Playlist (gemessen 2026-08-01: Kurzschluss lieferte 70
+    /// statt 807 Segmenten, weil der Cache erst zu 9 % gefuellt war).
+    public static boolean cacheFastKomplett(String videoId) {
+        boolean gesehen = false;
+        for (int itag : itagsForCached(videoId)) {
+            final int total = SparseStore.cachedTotal(videoId, itag);
+            if (total <= 0) continue;
+            gesehen = true;
+            if (SparseStore.contiguousFromStart(videoId, itag) * 100L < total * 90L) return false;
+        }
+        return gesehen;
+    }
+
     public static boolean cacheWeitgehendVollstaendig(String videoId) {
         if ("1".equals(System.getenv("YT_SABR_CACHE_ANY"))) return true;
         boolean gesehen = false;
@@ -499,9 +544,41 @@ public final class SabrCache {
             if (total <= 0) continue;
             gesehen = true;
             final int haben = SparseStore.contiguousFromStart(videoId, itag);
-            if (haben * 100L < total * 90L) return false;
+            if (haben * 100L < total * MIN_ABDECKUNG) return false;
         }
         return gesehen;
+    }
+
+    /// Traegt der Cache den Init-Kasten (ftyp/moov/sidx)? Ohne den laesst sich
+    /// keine Playlist bauen — ein Cache ohne ihn ist wertlos, egal wie viele
+    /// Segmente danebenliegen.
+    public static boolean cacheHatInit(String videoId) {
+        for (int itag : itagsForCached(videoId)) {
+            try {
+            final Path f = ensureFile(videoId, itag);
+            if (f == null) return false;
+            try (var in = java.nio.file.Files.newInputStream(f)) {
+                final byte[] kopf = in.readNBytes(12);
+                if (kopf.length < 12) return false;
+                boolean leer = true;
+                for (byte b : kopf) if (b != 0) { leer = false; break; }
+                if (leer) return false;
+            }
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Cache eines Videos komplett wegwerfen (kaputt oder veraltet).
+    public static void verwerfe(String videoId) {
+        try (var s = java.nio.file.Files.list(dir())) {
+            s.filter(p -> p.getFileName().toString().startsWith(videoId))
+             .forEach(p -> { try { java.nio.file.Files.deleteIfExists(p); } catch (Exception ignored) { } });
+        } catch (Exception e) {
+            System.out.println("[SabrCache] " + videoId + " verwerfen fehlgeschlagen: " + e.getMessage());
+        }
     }
 
     public static boolean hasCache(String videoId) {
