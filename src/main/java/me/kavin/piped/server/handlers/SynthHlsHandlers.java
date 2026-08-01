@@ -56,7 +56,7 @@ public class SynthHlsHandlers {
         // reine Doppelarbeit. isSabrMode() prueft die Storm-Marke ohnehin als
         // Erstes; wir ziehen die Pruefung nur VOR den Resolve.
         if (me.kavin.piped.utils.sabr.SabrCache.isStormMarked(videoId)) return sabrMaster(videoId);
-        Streams streams = fetchStreams(videoId, false);
+        Streams streams = mwebErsatz(videoId, fetchStreams(videoId, false));
         if (isSabrMode(videoId, streams)) return sabrMaster(videoId);
         List<PipedStream> videos = pickedVideoStreams(streams, maxH, codecs);
         PipedStream audio = pickedAudioStream(streams);
@@ -265,6 +265,31 @@ public class SynthHlsHandlers {
     // YT_FORCE_SABR for testing. The SABR fmp4 is standard (ftyp/moov/sidx/...),
     // so the same sidx->HLS byte-range segmentation applies; only the URL and the
     // box offsets come from the /sabr file instead of the resolved DASH stream.
+
+    /// Ersatzweg über den mobilen Web-Client, BEVOR wir in SABR fallen.
+    ///
+    /// Für Made-for-Kids liefert der WEB-Client keine direkten Segment-URLs mehr
+    /// (30 adaptive Formate, 0 mit `url`) — nur `serverAbrStreamingUrl`, und
+    /// dort greift der 60-Sekunden-Deckel, gegen den innerhalb von SABR nichts
+    /// hilft (Token, Identität, CAS, Formate, URL-Parameter, Transport,
+    /// IP-Familie, Sitzungsquelle, TLS-Fingerabdruck, HTTP-Client — alles
+    /// kontrolliert ausgeschlossen). MWEB liefert für dasselbe Video 32 Formate
+    /// MIT direkter URL; verifiziert bis 200 KB vor Dateiende eines
+    /// 46-Minuten-Kids-Videos (itag 137 und 140, HTTP 206).
+    ///
+    /// Nur greifen, wenn der normale Weg WIRKLICH nichts Direktes hat — sonst
+    /// kostet es bei jedem Video einen zusätzlichen Player-Call.
+    private static Streams mwebErsatz(String videoId, Streams streams) {
+        if (streams != null && streams.videoStreams != null && !streams.videoStreams.isEmpty())
+            return streams;
+        final Streams m = me.kavin.piped.utils.MwebStreams.hole(videoId);
+        if (m == null) return streams;
+        if (streams == null) return m;
+        // Titel, Dauer und Rest aus dem urspruenglichen Objekt behalten.
+        streams.videoStreams = m.videoStreams;
+        streams.audioStreams = m.audioStreams;
+        return streams;
+    }
 
     private static boolean isSabrMode(String videoId, Streams streams) {
         if (videoId.equals(System.getenv("YT_FORCE_SABR"))) return true;
