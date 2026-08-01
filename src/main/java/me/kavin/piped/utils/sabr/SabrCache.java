@@ -689,6 +689,15 @@ public final class SabrCache {
         // KEIN Springen (so in der App gemeldet, waehrend der Cache von 96 auf
         // 100 Segmente wuchs).
         if (growingNow(videoId)) return true;
+        // ⚠️ Im Streifen-Modus reicht ein vorhandener Segmentindex: fehlende
+        // Bytes werden auf Zuruf nachgefordert (dafuer wurde er gebaut).
+        // Ohne das bleibt die Playlist beim geladenen Anfang stehen, sobald der
+        // bedarfsgesteuerte Download pausiert — der Player sieht dann ein
+        // kurzes Video und Springen ist zaeh (in der App gemeldet).
+        if (SPARSE) {
+            for (int itag : itagsForCached(videoId))
+                if (SparseStore.cachedTotal(videoId, itag) > 0) return true;
+        }
         final Long exp = SEEK_PROVEN.get(videoId);
         if (exp == null) return false;
         if (exp < System.currentTimeMillis()) { SEEK_PROVEN.remove(videoId); return false; }
@@ -704,6 +713,15 @@ public final class SabrCache {
 
     /// Sprungziel je Video: die Segmentnummer, die der Player gerade braucht.
     private static final Map<String, Integer> SEEK_SEQ = new ConcurrentHashMap<>();
+    /// ⚠️ Zu welcher SPUR gehoert das Sprungziel? Ohne das rechnete die Sitzung
+    /// die Zielzeit mit der Segmentdauer der ERSTEN Spur — und das ist der Ton.
+    /// Gemessen 2026-08-01 an S27Kd7nfzfQ (46 min): Video-Segment 401 von 548
+    /// ergab 9964 ms (Audio-Taktung, 280 Segmente) mal 400 = 3.986.800 ms, also
+    /// 66 Minuten. Der Play-Head stand hinter dem Videoende, der Server lieferte
+    /// nichts, und der Sprung endete nach 20 s mit HTTP 503.
+    /// Richtig waeren 548 Segmente mal ~5091 ms = rund 2.040.000 ms.
+    private static final Map<String, Integer> SEEK_ITAG = new ConcurrentHashMap<>();
+    public static int seekItag(String videoId) { return SEEK_ITAG.getOrDefault(videoId, -1); }
     /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
     private static final long SEEK_WAIT_MS = 20_000;
 
@@ -728,6 +746,7 @@ public final class SabrCache {
         System.out.println("[Sparse] " + videoId + "/" + itag + " Bereich " + start + "-" + end
                 + ": " + missing.size() + " Segment(e) fehlen, ab " + missing.get(0) + " nachfordern");
         SEEK_SEQ.put(videoId, missing.get(0));
+        SEEK_ITAG.put(videoId, itag);
         startDownload(videoId, true, true);
         final long deadline = System.currentTimeMillis() + SEEK_WAIT_MS;
         while (System.currentTimeMillis() < deadline) {
@@ -735,10 +754,13 @@ public final class SabrCache {
             missing = SparseStore.missing(videoId, itag, segs);
             if (missing.isEmpty()) {
                 SEEK_SEQ.remove(videoId);
+                SEEK_ITAG.remove(videoId);
                 SEEK_PROVEN.put(videoId, System.currentTimeMillis() + SEEK_PROVEN_TTL_MS);
                 return true;
             }
             SEEK_SEQ.put(videoId, missing.get(0));
+            SEEK_ITAG.put(videoId, itag);
+        SEEK_ITAG.put(videoId, itag);
         }
         SEEK_UNAVAILABLE.put(videoId, System.currentTimeMillis() + SEEK_UNAVAILABLE_TTL_MS);
         return false;
@@ -825,7 +847,14 @@ public final class SabrCache {
     /// statt an einer (fast sicher) nie wachsenden Live-Playlist zu sterben.
     /// Wächst der Cache doch (Paced-Erfolg), liefert der nächste Playlist-Build
     /// automatisch mehr Segmente.
+    /// ⚠️ Ein LAUFENDER Download ist nie "terminal". Beide Marken stammen aus
+    /// der Zeit des 60-Sekunden-Deckels; seit der gefallen ist (GVS-Token an die
+    /// videoId gebunden) laedt das Video einfach weiter. Blieb die Marke stehen,
+    /// lieferte die Playlist nur den geladenen Anfang als ENDLIST — der Player
+    /// sah ein kurzes Video und Springen war zaeh (in der App gemeldet, waehrend
+    /// der Cache im Log von 217 auf 318 von 548 Segmenten wuchs).
     public static boolean isPartialTerminal(String videoId) {
+        if (growingNow(videoId)) return false;
         return isCapMarked(videoId) || isRefillExhausted(videoId);
     }
 

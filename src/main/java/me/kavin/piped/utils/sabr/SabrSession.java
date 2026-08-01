@@ -193,6 +193,9 @@ public final class SabrSession {
     /// bereits geladenen Anfang beschraenkt.
     private java.util.function.IntSupplier seekTargetSeq;
     public void setSeekTargetSeq(java.util.function.IntSupplier s) { this.seekTargetSeq = s; }
+    private java.util.function.IntSupplier seekItagSupplier;
+    /// Zu welcher Spur gehoert das Sprungziel? (s. SabrCache.SEEK_ITAG)
+    public void setSeekItag(java.util.function.IntSupplier s) { this.seekItagSupplier = s; }
 
     /// FORTSETZEN AB SEGMENT N. Was schon auf Platte liegt, beschreibt der
     /// Aufrufer hier; die Session tut dann so, als haette sie diese Segmente in
@@ -661,9 +664,22 @@ public final class SabrSession {
                 if (seekTargetSeq != null) {
                     final int want = seekTargetSeq.getAsInt();
                     if (want > 0) {
+                        // ⚠️ Die Segmentdauer der Spur nehmen, auf die sich das
+                        // Sprungziel bezieht. Die erste Spur ist der Ton und hat
+                        // eine ANDERE Taktung als das Bild (280 gegen 548
+                        // Segmente beim selben Video) — damit landete der
+                        // Play-Head hinter dem Videoende und der Sprung lief in
+                        // einen 20-Sekunden-Timeout.
+                        final int zielItag = seekItagSupplier != null
+                                ? seekItagSupplier.getAsInt() : -1;
                         long perSeg = 0;
                         for (FState st : states.values())
-                            if (st.perSegMs() > 0) { perSeg = st.perSegMs(); break; }
+                            if (st.fmt.itag == zielItag && st.perSegMs() > 0) {
+                                perSeg = st.perSegMs(); break;
+                            }
+                        if (perSeg == 0)
+                            for (FState st : states.values())
+                                if (st.perSegMs() > 0) { perSeg = st.perSegMs(); break; }
                         if (perSeg > 0) {
                             final long targetMs = perSeg * (want - 1);
                             if (Math.abs(targetMs - playerTimeMs) > perSeg) {

@@ -425,6 +425,7 @@ public final class SabrHandlers {
         session.setResume(resume);
         session.setProgressSink(progress);
         session.setSeekTargetSeq(SESSION_SEEK == null ? null : SESSION_SEEK.apply(videoId));
+        session.setSeekItag(() -> me.kavin.piped.utils.sabr.SabrCache.seekItag(videoId));
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
