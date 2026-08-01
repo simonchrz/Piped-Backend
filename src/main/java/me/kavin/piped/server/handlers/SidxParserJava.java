@@ -209,6 +209,13 @@ public class SidxParserJava {
                 redirectHops++;
             }
             if (code != 200 && code != 206) {
+                // â ïž Ohne den Statuscode ist nicht unterscheidbar, ob der Index
+                // abgelehnt (403), verschwunden (404) oder gedrosselt wird â
+                // und ohne sidx wird die Playlist EIN Segment, in dem AVPlayer
+                // nicht springen kann.
+                System.out.println("[SidxCache] ABGELEHNT itag=" + itagOf(url)
+                        + " HTTP " + code + " range=" + start + "-" + end
+                        + " pot=" + url.contains("pot="));
                 conn.disconnect();
                 return null;
             }

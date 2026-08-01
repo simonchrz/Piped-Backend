@@ -218,6 +218,28 @@ public class SynthHlsHandlers {
                 if (sidx != null)
                     System.out.println("[SynthHls] " + videoId + " sidx aus SABR-Cache gerettet ("
                             + sidx.entries.size() + " Segmente) — Springen bleibt moeglich");
+                // ⚠️ Letzte Rettung: FRISCHE URL über den mobilen Web-Client.
+                // Gemessen 2026-08-01 an einem SpongeBob-Video: die Streams aus
+                // dem WebEmbed-Rückfall antworten auf tiefe Byte-Bereiche mit
+                // 403 (HEAD auf clen/2), also scheitert auch der Index-Abruf —
+                // Ergebnis war EIN Segment über 2730 s, in dem AVPlayer nicht
+                // springen kann. MWEB liefert für dasselbe Video frische URLs
+                // mit Index-Bereich, und die tiefen Bereiche antworten dort mit
+                // 206 (mit angehängtem pot verifiziert bis 200 KB vor Dateiende).
+                if (sidx == null) {
+                    final Streams m = me.kavin.piped.utils.MwebStreams.hole(videoId);
+                    final PipedStream mv = m == null ? null : passendesFormat(m, stream.itag);
+                    if (mv != null && mv.indexEnd > mv.indexStart && mv.indexStart > 0) {
+                        sidx = SidxParserJava.fetch(swapCpn(mv.url), mv.indexStart, mv.indexEnd, null);
+                        if (sidx != null) {
+                            System.out.println("[SynthHls] " + videoId + " sidx über MWEB geholt ("
+                                    + sidx.entries.size() + " Segmente) — Springen wieder moeglich");
+                            freshUrl = swapCpn(mv.url);
+                            segUrl = rewriteToYtProxy(freshUrl);
+                            stream = mv;
+                        }
+                    }
+                }
             }
         }
 
@@ -279,8 +301,41 @@ public class SynthHlsHandlers {
     ///
     /// Nur greifen, wenn der normale Weg WIRKLICH nichts Direktes hat — sonst
     /// kostet es bei jedem Video einen zusätzlichen Player-Call.
+    /// Lässt sich aus diesen Streams überhaupt eine springbare Playlist bauen?
+    ///
+    /// ⚠️ OHNE `indexRange` gibt es keinen sidx — dann wird die Playlist EIN
+    /// Segment über die ganze Laufzeit, und darin kann AVPlayer nicht springen
+    /// (in der App gemeldet als „spielt ab, aber Vorspulen geht nicht").
+    /// Gemessen 2026-08-01 an einem SpongeBob-Video: unser Rückfallclient
+    /// WEB_EMBEDDED_PLAYER antwortet dort mit „Dieses Video ist nicht
+    /// verfügbar", der degradierte Rest hatte keine Index-Bereiche — Ergebnis
+    /// war ein Segment über 2730 s. MWEB liefert für dasselbe Video 25 Formate
+    /// mit URL UND Index-Bereich.
+    ///
+    /// Deshalb greift der MWEB-Ersatz nicht erst, wenn GAR NICHTS da ist,
+    /// sondern schon, wenn das Brauchbare fehlt.
+    /// Dasselbe Format in den MWEB-Streams finden — erst nach itag, sonst das
+    /// höchstauflösende Video mit Index-Bereich.
+    private static PipedStream passendesFormat(Streams m, int itag) {
+        if (m == null || m.videoStreams == null) return null;
+        for (PipedStream v : m.videoStreams)
+            if (v.itag == itag && v.indexEnd > v.indexStart) return v;
+        PipedStream best = null;
+        for (PipedStream v : m.videoStreams)
+            if (v.indexEnd > v.indexStart && (best == null || v.height > best.height)) best = v;
+        return best;
+    }
+
+    private static boolean hatSegmentindex(Streams s) {
+        if (s == null || s.videoStreams == null) return false;
+        for (PipedStream v : s.videoStreams)
+            if (v.indexEnd > v.indexStart && v.indexStart > 0) return true;
+        return false;
+    }
+
     private static Streams mwebErsatz(String videoId, Streams streams) {
-        if (streams != null && streams.videoStreams != null && !streams.videoStreams.isEmpty())
+        if (streams != null && streams.videoStreams != null && !streams.videoStreams.isEmpty()
+                && hatSegmentindex(streams))
             return streams;
         final Streams m = me.kavin.piped.utils.MwebStreams.hole(videoId);
         if (m == null) return streams;
