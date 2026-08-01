@@ -396,7 +396,9 @@ public final class SabrHandlers {
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
         // Attestierungs-Token. Nur einen Token nachzureichen genuegt nicht.
         final String visitorForRenewal = visitorData;
-        session.setSessionRefresher(() -> {
+        session.setSessionRefresher(new SabrSession.SessionRefresher() {
+            @Override public SabrSession.Renewal fresh() { return fresh(null); }
+            @Override public SabrSession.Renewal fresh(String reloadToken) {
             try {
                 String attest = null;
                 if (bg != null) {
@@ -406,8 +408,10 @@ public final class SabrHandlers {
                 // ⚠️ Derselbe Client wie die laufende Session — eine Erneuerung
                 // mit einem ANDEREN Client waere genau die Client<->Token-
                 // Zwickmuehle, die uns Tage gekostet hat. `pureWeb` fehlte hier.
+                // ⚠️ Den Reload-Kontext aus UMP-Teil 46 mitgeben — ohne ihn
+                // antwortet der Server mit exakt demselben Teil 46 (gemessen).
                 final JsonNode p = pureWeb
-                        ? webPlayer(videoId, visitorForRenewal, family, attest)
+                        ? webPlayer(videoId, visitorForRenewal, family, attest, reloadToken)
                         : webClient
                         ? webEmbedPlayer(videoId, visitorForRenewal, family, attest)
                         : androidPlayer(videoId, visitorForRenewal, family, attest, vrClient);
@@ -425,6 +429,7 @@ public final class SabrHandlers {
                 System.out.println("[Sabr] " + videoId + " Session-Erneuerung fehlgeschlagen: " + e.getMessage());
                 return null;
             }
+        }
         });
 
         final String reattestBinding = System.getenv("YT_SABR_REATTEST_BINDING");
@@ -585,6 +590,14 @@ public final class SabrHandlers {
 
     private static JsonNode webPlayer(String videoId, String visitorData, String family,
                                       String attestationPoToken) throws Exception {
+        return webPlayer(videoId, visitorData, family, attestationPoToken, null);
+    }
+
+    /// `reloadToken`: der Wert aus UMP-Teil 46. YouTube verlangt damit eine
+    /// Player-Antwort, die den Reload-Kontext mitführt — ohne ihn kommt beim
+    /// nächsten Versuch dasselbe Teil 46 zurück.
+    private static JsonNode webPlayer(String videoId, String visitorData, String family,
+                                      String attestationPoToken, String reloadToken) throws Exception {
         final Map<String, Object> client = new HashMap<>(Map.of(
                 "clientName", "WEB", "clientVersion", WEB_VERSION,
                 "hl", "en", "gl", "US", "userAgent", WEB_UA));
@@ -610,6 +623,13 @@ public final class SabrHandlers {
                                "html5Preference", "HTML5_PREF_WANTS"))));
         if (attestationPoToken != null)
             req.put("serviceIntegrityDimensions", Map.of("poToken", attestationPoToken));
+        if (reloadToken != null && !reloadToken.isBlank())
+            req.put("playbackContext", Map.of(
+                    "contentPlaybackContext", Map.of(
+                            "signatureTimestamp", signatureTimestamp(),
+                            "html5Preference", "HTML5_PREF_WANTS"),
+                    "reloadPlaybackContext", Map.of(
+                            "reloadPlaybackParams", Map.of("token", reloadToken))));
         final String body = Constants.mapper.writeValueAsString(req);
         final var r = rocks.kavin.reqwest4j.ReqwestUtils.fetchWithProxy(
                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",

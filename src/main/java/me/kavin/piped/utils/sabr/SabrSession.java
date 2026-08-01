@@ -285,7 +285,11 @@ public final class SabrSession {
         public final String abrUrl; public final byte[] ustreamerConfig; public final byte[] poToken;
         public Renewal(String u, byte[] c, byte[] p) { abrUrl = u; ustreamerConfig = c; poToken = p; }
     }
-    public interface SessionRefresher { Renewal fresh(); }
+    public interface SessionRefresher {
+        Renewal fresh();
+        /// Mit Reload-Kontext aus Teil 46; Standard ignoriert ihn.
+        default Renewal fresh(String reloadToken) { return fresh(); }
+    }
     private SessionRefresher sessionRefresher;
     public void setSessionRefresher(SessionRefresher r) { this.sessionRefresher = r; }
     private final String egressFamily; // "v4"/"v6" — gvs URLs are IP-signed, so the
@@ -365,6 +369,28 @@ public final class SabrSession {
             "1".equals(System.getenv("YT_SABR_REATTEST")) ? 40 : 0;
     private static final boolean POT_IN_URL = "1".equals(System.getenv("YT_SABR_POT_IN_URL"));
     private static final boolean TRACE = "1".equals(System.getenv("YT_SABR_TRACE"));
+    /// UMP-Typ 46: der Server verlangt eine NEUE Player-Antwort.
+    ///
+    /// Fehlerbild ohne Behandlung (gemessen 2026-08-01 an mbPNkDEN3Ps,
+    /// hxOApe1P9dM, WRVsOCh907o — drei von fünf Testvideos): Antworten von
+    /// konstant 191 B, KEIN prot-Teil, keine Medien, Runde für Runde. Wir haben
+    /// die Anweisung ignoriert und mit der verworfenen Sitzung weitergefragt.
+    ///
+    /// Der Inhalt ist ein base64url-verpacktes protobuf und enthält im Klartext
+    /// die videoId — also kein Fehler, sondern ein Reload-Auftrag.
+    ///
+    /// ⚠️ Das ist NICHT der Kids-Deckel: dort liefert der Server prot=2 und
+    /// echte Medien, bis er bei ~60 s auf prot=3 geht. Hier kommt von Anfang an
+    /// nichts. Zwei verschiedene Sachen, nicht verwechseln.
+    private static final int RELOAD_PLAYER_RESPONSE = 46;
+    private static final int MAX_RELOADS = 2;
+    private boolean reloadVerlangt = false;
+    /// Der Wert AUS Teil 46. Der Server will nicht irgendeine neue Player-
+    /// Antwort, sondern eine, die diesen Reload-Kontext mitführt — sonst
+    /// schickt er beim nächsten Versuch exakt dasselbe Teil 46 zurück
+    /// (gemessen: identischer Inhalt über zwei Sitzungen).
+    private String reloadToken = null;
+    private int reloads = 0;
     private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
     private final java.util.Set<Integer> dumpedTypes = new java.util.HashSet<>();
 
@@ -375,6 +401,28 @@ public final class SabrSession {
     /// der Server gar keine Medien mehr (gemessen: konstant 105B nur mit 57+67).
     private static final int SABR_CONTEXT_UPDATE = 57;
     private final java.util.Map<Integer, byte[]> sabrContexts = new java.util.LinkedHashMap<>();
+
+    /// Teil 46 ist zweifach verschachtelt: Feld 1 { Feld 1 = <Zeichenkette> }.
+    /// Die Zeichenkette ist base64url und trägt im Klartext die videoId —
+    /// sie geht unverändert als Reload-Kontext in den nächsten Player-Call.
+    private static String leseReloadToken(byte[] payload) {
+        try {
+            final ProtoReader a = new ProtoReader(payload);
+            while (a.hasMore()) {
+                final int f = a.readTag();
+                if (f == 1 && a.wireType() == 2) {
+                    final ProtoReader b = new ProtoReader(a.readBytes());
+                    while (b.hasMore()) {
+                        final int g = b.readTag();
+                        if (g == 1 && b.wireType() == 2)
+                            return new String(b.readBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                        b.skip();
+                    }
+                } else a.skip();
+            }
+        } catch (Exception ignored) { /* dann eben ohne */ }
+        return null;
+    }
 
     private void handleContextUpdate(byte[] payload) {
         int ctype = -1; byte[] value = null; boolean sendByDefault = false;
@@ -612,6 +660,10 @@ public final class SabrSession {
                             // DIAGNOSE (YT_SABR_TRACE=1): unbekannte UMP-Typen mitschreiben.
                             // Der Web-Player wertet mehr aus als wir; was wir ignorieren,
                             // kann genau die Anweisung sein, die die Session am Leben haelt.
+                            if (type == RELOAD_PLAYER_RESPONSE) {
+                                reloadVerlangt = true;
+                                reloadToken = leseReloadToken(payload);
+                            }
                             if (TRACE) {
                                 unknownParts.merge(type, 1, Integer::sum);
                                 // Beim ERSTEN Auftreten die Rohbytes hexdumpen, damit die
@@ -670,6 +722,25 @@ public final class SabrSession {
                 // das Feld bisher ignoriert und stur weitergefragt — daher sah es
                 // nach einem 60s-Fenster-Cap aus. Ein echter Client mintet dann
                 // einen frischen po_token und macht in DERSELBEN Session weiter.
+                // Der Server hat eine neue Player-Antwort verlangt (UMP 46).
+                // Anders als bei prot=3 hilft die Erneuerung hier: die Sitzung
+                // ist nicht attestierungsgesperrt, sie ist nur veraltet.
+                if (reloadVerlangt && reloads < MAX_RELOADS && sessionRefresher != null) {
+                    reloadVerlangt = false;
+                    reloads++;
+                    final Renewal rl = sessionRefresher.fresh(reloadToken);
+                    if (rl != null && rl.ustreamerConfig != null) {
+                        if (rl.abrUrl != null) abrUrl = rl.abrUrl;
+                        ustreamerConfig = rl.ustreamerConfig;
+                        if (rl.poToken != null) poToken = rl.poToken;
+                        playbackCookie = null;
+                        System.out.println("[Sabr] Player-Antwort auf Serverwunsch erneuert (#"
+                                + reloads + ", UMP-Typ 46, Kontext="
+                                + (reloadToken == null ? "FEHLT" : reloadToken.length() + " Zeichen") + ")");
+                        continue;
+                    }
+                    System.out.println("[Sabr] UMP-Typ 46: Erneuerung lieferte nichts");
+                }
                 if (protectionStatus[0] == 3 && reattests < MAX_REATTESTS) {
                     reattests++;
                     if (sessionRefresher != null) {
