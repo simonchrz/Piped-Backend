@@ -393,6 +393,53 @@ public final class SabrSession {
     /// Der vom Server genannte Fehlertyp (z. B. `sabr.no_audio_selected`) —
     /// die Leiter entscheidet damit, ob ein anderer Versuch Sinn hat.
     private String sabrErrorTyp = null;
+
+    /// SELECTABLE_FORMATS (UMP-Typ 51) — die Formate, die der Server fuer DIESE
+    /// Sitzung akzeptiert.
+    ///
+    /// Struktur aus dem Hexdump reversed (2026-08-01, 2460 B):
+    ///   repeated FormatId formats = 1;  FormatId { 1 = itag, 2 = lastModified }
+    /// Auf dem Draht: `0a 0c 08 <itag-varint> 10 <lmt-varint>` je Eintrag —
+    /// die ersten dekodierten Werte (399, 397, 160, 248, 396, 135, 137, 242)
+    /// sind samt und sonders plausible itags.
+    ///
+    /// WOFUER: bricht die Sitzung mit `sabr.no_audio_selected` ab, haben wir ein
+    /// Format gewaehlt, das hier NICHT drinsteht. Statt zu raten (wir haben
+    /// 251/250/249 durchprobiert und sind ebenfalls gescheitert) laesst sich
+    /// damit aus der angebotenen Liste waehlen.
+    private static final int SELECTABLE_FORMATS = 51;
+    private final java.util.Map<Integer, Long> selectable = new java.util.LinkedHashMap<>();
+
+    /// Bekannte Audio-itags (AAC 139/140/141, Opus 249/250/251, AC-3 256/258,
+    /// DTSE 325/328). Reicht, um „Video-only-Angebot" zu erkennen.
+    private static boolean istAudioItag(int itag) {
+        return itag == 139 || itag == 140 || itag == 141
+                || itag == 249 || itag == 250 || itag == 251
+                || itag == 256 || itag == 258 || itag == 325 || itag == 328;
+    }
+
+    private void handleSelectableFormats(byte[] payload) {
+        try {
+            final ProtoReader r = new ProtoReader(payload);
+            while (r.hasMore()) {
+                final int f = r.readTag();
+                if (f == 1 && r.wireType() == 2) {
+                    final ProtoReader e = new ProtoReader(r.readBytes());
+                    int itag = -1; long lmt = 0;
+                    while (e.hasMore()) {
+                        final int g = e.readTag();
+                        if (g == 1 && e.wireType() == 0) itag = (int) e.readVarint();
+                        else if (g == 2 && e.wireType() == 0) lmt = e.readVarint();
+                        else e.skip();
+                    }
+                    if (itag > 0) selectable.putIfAbsent(itag, lmt);
+                } else r.skip();
+            }
+        } catch (Exception ignored) { }
+    }
+
+    /// Welche Formate bietet der Server an? Leer, solange kein Teil 51 kam.
+    public java.util.Map<Integer, Long> waehlbareFormate() { return selectable; }
     private int reloads = 0;
     private final java.util.Map<Integer, Integer> unknownParts = new java.util.TreeMap<>();
     private final java.util.Set<Integer> dumpedTypes = new java.util.HashSet<>();
@@ -670,7 +717,8 @@ public final class SabrSession {
                                     else if (f == 2 && er.wireType() == 0) code = er.readVarint();
                                     else er.skip();
                                 }
-                                System.out.println("[Sabr] SABR_ERROR type=" + typ + " code=" + code);
+                                System.out.println("[Sabr] SABR_ERROR type=" + typ + " code=" + code
+                        + (selectable.isEmpty() ? "" : " | waehlbar: " + selectable.keySet()));
                                 if (typ != null) sabrErrorTyp = typ;
                             } catch (Exception ignored) { }
                             break;
@@ -682,6 +730,7 @@ public final class SabrSession {
                             // DIAGNOSE (YT_SABR_TRACE=1): unbekannte UMP-Typen mitschreiben.
                             // Der Web-Player wertet mehr aus als wir; was wir ignorieren,
                             // kann genau die Anweisung sein, die die Session am Leben haelt.
+                            if (type == SELECTABLE_FORMATS) handleSelectableFormats(payload);
                             if (type == RELOAD_PLAYER_RESPONSE) {
                                 reloadVerlangt = true;
                                 reloadToken = leseReloadToken(payload);
@@ -807,6 +856,17 @@ public final class SabrSession {
 
                 if (sabrError[0]) {
                     stopReason = sabrErrorTyp != null ? "SABR_ERROR:" + sabrErrorTyp : "SABR_ERROR";
+                    // ⚠️ Unterscheiden: „falsches Audioformat gewaehlt" (dann hilft
+                    // ein anderes) oder „der Server bietet GAR KEIN Audio an" (dann
+                    // hilft keins). Gemessen 2026-08-01 an WRVsOCh907o: die
+                    // SELECTABLE_FORMATS-Liste enthielt 18 Eintraege, alles Video —
+                    // kein 140, kein 251, kein 250, kein 249. Weitere Versuche sind
+                    // dort reine Zeitverschwendung, das Video braucht den Direktweg.
+                    if (!selectable.isEmpty() && selectable.keySet().stream().noneMatch(SabrSession::istAudioItag)) {
+                        stopReason = "SABR_ERROR:kein_audio_im_angebot";
+                        System.out.println("[Sabr] Server bietet KEIN Audioformat an ("
+                                + selectable.size() + " Formate, alles Video) -> SABR scheidet aus");
+                    }
                     break;
                 }
                 // ⚠️ NICHT bei leerer states-Map "complete" melden: allMatch() ist auf

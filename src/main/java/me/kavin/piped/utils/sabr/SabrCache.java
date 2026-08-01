@@ -1008,8 +1008,12 @@ public final class SabrCache {
         // itag 140 wurde abgelehnt, die Sitzung lieferte GAR NICHTS, vorher sah
         // das nur nach einem Reload-Loop aus). Mit einem anderen Audioformat
         // aus derselben Antwort erneut versuchen, statt aufzugeben.
+        // ⚠️ NUR wenn ueberhaupt Audio im Angebot war. Bietet der Server gar
+        // keins an, sind alle Ausweich-itags sinnlos (drei vergebliche Anlaeufe
+        // gemessen) — das Video kann SABR schlicht nicht, der Direktweg muss ran.
         if (result != null && result.stopReason() != null
-                && result.stopReason().contains("no_audio_selected")) {
+                && result.stopReason().contains("no_audio_selected")
+                && !result.stopReason().contains("kein_audio_im_angebot")) {
             for (int altItag : new int[] { 251, 250, 249 }) {
                 System.out.println("[SabrCache] " + videoId
                         + " no_audio_selected -> zweiter Anlauf mit Audio-itag " + altItag);
