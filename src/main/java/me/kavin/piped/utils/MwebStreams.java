@@ -96,7 +96,10 @@ public class MwebStreams {
     private static PipedStream baue(JsonNode f, String pot) {
         try {
             String url = f.get("url").asText();
-            url = NSigClient.maybeRewriteN(url);
+            // â ïž NICHT maybeRewriteN() â das ist ein No-Op fuer URLs aus dem
+            // NewPipe-Extractor. Unsere MWEB-URLs stammen aus einem EIGENEN
+            // Player-Call, ihr n ist noch verschluesselt. Mit rohem n: 403.
+            url = NSigClient.rewriteNUnprocessed(url);
             // ⚠️ Ohne pot antworten 137/140 am Dateiende mit 403.
             if (pot != null && !pot.isEmpty() && !url.contains("&pot="))
                 url = url + "&pot=" + pot;
