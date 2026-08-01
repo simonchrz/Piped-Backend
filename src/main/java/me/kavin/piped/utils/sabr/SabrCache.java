@@ -478,6 +478,32 @@ public final class SabrCache {
     /// Liegt ueberhaupt SABR-Material zu diesem Video auf Platte? Erlaubt der
     /// synth-hls-Schicht, bei gesperrtem Resolve trotzdem aus dem Cache zu
     /// bedienen, statt „nicht abspielbar" zu zeigen.
+    /// Deckt der Cache das Video weitgehend ab? Ein 56-Sekunden-Rest eines
+    /// halbstündigen Videos ist KEIN brauchbarer Cache — er verhindert nur, dass
+    /// eine frische Auflösung es besser macht.
+    ///
+    /// WARUM das zählt: Die Regel „bekannt gedrosselt → Cache hat Vorrang"
+    /// entstand, als Direkt-URLs binnen Sekunden starben. Seit MWEB liefert die
+    /// frische Auflösung wieder vollständige, springbare Playlists — dann darf
+    /// ein Teil-Cache nicht mehr gewinnen. Gemessen 2026-08-01 an 9HwZZ4lMr2o:
+    /// aus dem Cache 13 Segmente / 56 s, frisch aufgelöst 393 Segmente / 1870 s.
+    ///
+    /// Schwelle bewusst hoch (90 %): knapp vollständige Caches sind weiter
+    /// wertvoll, weil sie garantiert halten. Abschaltbar mit
+    /// YT_SABR_CACHE_ANY=1 (dann gilt wieder: jeder Cache schlägt alles).
+    public static boolean cacheWeitgehendVollstaendig(String videoId) {
+        if ("1".equals(System.getenv("YT_SABR_CACHE_ANY"))) return true;
+        boolean gesehen = false;
+        for (int itag : itagsForCached(videoId)) {
+            final int total = SparseStore.cachedTotal(videoId, itag);
+            if (total <= 0) continue;
+            gesehen = true;
+            final int haben = SparseStore.contiguousFromStart(videoId, itag);
+            if (haben * 100L < total * 90L) return false;
+        }
+        return gesehen;
+    }
+
     public static boolean hasCache(String videoId) {
         return anyFileFor(videoId);
     }

@@ -359,7 +359,13 @@ public class SynthHlsHandlers {
         // haben wir Material UND ist das Video als gedrosselt bekannt, hat der
         // Cache Vorrang vor frischen Direkt-URLs.
         if (me.kavin.piped.utils.sabr.SabrCache.hasCache(videoId)
-                && me.kavin.piped.utils.sabr.SabrCache.wasThrottledRecently(videoId)) {
+                && me.kavin.piped.utils.sabr.SabrCache.wasThrottledRecently(videoId)
+                // ⚠️ Nur ein weitgehend VOLLSTAENDIGER Cache darf eine frische
+                // Aufloesung schlagen. Sonst liefert ein 56-Sekunden-Rest
+                // dauerhaft ein unspringbares Video, obwohl MWEB das ganze
+                // holen koennte (gemessen: 13 Segmente aus dem Cache gegen
+                // 393 frisch).
+                && me.kavin.piped.utils.sabr.SabrCache.cacheWeitgehendVollstaendig(videoId)) {
             System.out.println("[ResolvePath] " + videoId
                     + " -> SABR-CACHE (bekannt gedrosselt, Direkt-URLs halten nicht)");
             return true;
