@@ -883,22 +883,34 @@ public final class SabrSession {
         // ⚠️ Feld 79 (`playback_authorization`, 18 B) und Feld 72 (14 B) sendet
         // der Browser ebenfalls; ihr INHALT ist sitzungsgebunden und liesse
         // sich nicht sinnvoll kopieren — sie bleiben deshalb weg.
+        // ⚠️ Werte auf den Mitschnitt vom 2026-08-01 nachgezogen (erste Runde
+        // eines echten Chromium, offenes Fenster, prot=1). Vorher standen hier
+        // Zahlen aus einem aelteren Mitschnitt, die teils grob danebenlagen:
+        // Viewport 2084x1172 statt 640x360, Feld 59 = 8192 statt 1080, und wir
+        // schickten Feld 57, das der Browser gar nicht sendet. Neu dazu: die
+        // Felder 72, 76 und 80 — Feld 72 ist reine Aufloesungsangabe und damit
+        // gefahrlos uebernehmbar. Feld 79 bleibt weg (sitzungsgebunden).
         return new ProtoWriter()
-                .varintField(18, 2084)          // client_viewport_width
-                .varintField(19, 1172)          // client_viewport_height
+                .varintField(18, 640)           // client_viewport_width
+                .varintField(19, 360)           // client_viewport_height
                 .varintField(21, 0)             // sticky_resolution
-                .varintField(23, 3221101)       // bandwidth_estimate (B/s)
+                .varintField(23, 85196)         // bandwidth_estimate (B/s)
                 .varintField(28, playerTimeMs)  // player_time_ms
                 .varintField(29, buffered)      // time_since_last_seek
                 .varintField(34, 0)             // visibility
                 .varintField(36, wall)          // elapsed_wall_time_ms
                 .varintField(39, wall)          // time_since_last_action_ms
                 .varintField(46, 1)             // drc_enabled
-                .varintField(57, 162)           // field57
                 .varintField(58, 0)             // prefer_vp9
-                .varintField(59, 8192)          // av1_quality_threshold
-                .varintField(68, 7631)          // sabr_force_max_network_interruption_duration_ms
+                .varintField(59, 1080)          // av1_quality_threshold
+                .varintField(68, 0)             // sabr_force_max_network_interruption_duration_ms
                 .varintField(71, 1)             // field71 (Browser: 1)
+                .bytesField(72, new ProtoWriter()
+                        .varintField(1, 0).varintField(2, 1080).varintField(3, 0)
+                        .varintField(4, 0).varintField(5, 1080).varintField(6, 0)
+                        .toByteArray())
+                .varintField(76, 0)
+                .varintField(80, 1)
                 .varintField(85, 1)             // field85 (Browser: 1)
                 .toByteArray();
     }

@@ -243,8 +243,15 @@ public final class SabrHandlers {
             throw new IllegalStateException("video " + videoId + " has no SABR streaming url "
                     + "(status=" + player.path("playabilityStatus").path("status").asText() + ")");
         }
-        final JsonNode aud = pickFormat(sd, "audio", 140);
-        final JsonNode vid = pickFormat(sd, "video", 137);
+        // ⚠️ Wir pinnen ein ALTFORMAT-Paar: AAC 140 + H.264 137. Ein echter
+        // Chromium fordert bei Made-for-Kids weder das eine noch das andere an —
+        // er schickt einen ganzen Katalog moderner Formate (Opus 250/251,
+        // VP9 242-248/278, AV1 394-399) und laesst den Server waehlen
+        // (Feldvergleich der ersten Runde, 2026-08-01). Verdacht: fuer
+        // Kids-Inhalte sind nur die modernen Formate voll freigegeben.
+        // YT_SABR_ITAG_A / YT_SABR_ITAG_V stellen die Wunsch-itags um.
+        final JsonNode aud = pickFormat(sd, "audio", wunschItag("YT_SABR_ITAG_A", 140));
+        final JsonNode vid = pickFormat(sd, "video", wunschItag("YT_SABR_ITAG_V", 137));
         final byte[] clientInfo;
         final String ua;
         if (pureWeb) {
@@ -480,6 +487,17 @@ public final class SabrHandlers {
         }
         STS_AT = now;
         return STS_CACHE;
+    }
+
+    /// Wunsch-itag aus der Umgebung, sonst der bisherige Vorgabewert.
+    private static int wunschItag(String schluessel, int vorgabe) {
+        final String v = System.getenv(schluessel);
+        if (v == null || v.isBlank()) return vorgabe;
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return vorgabe;
+        }
     }
 
     private static JsonNode webPlayer(String videoId, String visitorData, String family,
