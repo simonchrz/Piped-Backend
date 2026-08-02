@@ -70,7 +70,36 @@ public class BgPoTokenProvider implements PoTokenProvider {
     /// gemessen 2026-07-30 mit Safari gegen unsere IP. Deshalb hier dieselben
     /// Cookies verwenden, damit visitorData, Token und Abruf EINE Identitaet
     /// sind. Kill-Switch: POTOKEN_AUTH_VISITOR=0.
+    /// 🔑 Besucherkennung MERKEN. Der frische Abruf laedt die komplette
+    /// (angemeldete) youtube.com-Startseite — gemessen 2026-08-02 rund 950 ms,
+    /// und das bei JEDER Token-Praegung, also bei jedem kalten Tap. Die Kennung
+    /// ist aber sitzungsstabil: sie identifiziert unsere Sitzung, nicht das
+    /// Video. Zum Vergleich die anderen Posten derselben Praegung: Aufgabe
+    /// holen 38 ms, get_pot 357 ms.
+    ///
+    /// ⚠️ Bei Fehlern NICHT merken — sonst friert ein CookieMismatch-Rueckfall
+    /// auf die anonyme Kennung fuer eine halbe Stunde ein.
+    private static final long VISITOR_MEMO_MS = 30L * 60_000L;
+    private volatile String visitorMemo = null;
+    private volatile long visitorMemoBis = 0L;
+
     private String getWebVisitorData() throws Exception {
+        final String memo = visitorMemo;
+        if (memo != null && System.currentTimeMillis() < visitorMemoBis) return memo;
+        final String frisch = holeWebVisitorDataFrisch();
+        visitorMemo = frisch;
+        visitorMemoBis = System.currentTimeMillis() + VISITOR_MEMO_MS;
+        return frisch;
+    }
+
+    /// Verwirft die gemerkte Kennung — aufzurufen, wenn ein Aufruf mit ihr
+    /// scheitert (abgelaufene Sitzung).
+    void vergissVisitorData() {
+        visitorMemo = null;
+        visitorMemoBis = 0L;
+    }
+
+    private String holeWebVisitorDataFrisch() throws Exception {
         final boolean useAuth = !"0".equals(env("POTOKEN_AUTH_VISITOR"));
         final String cookies = useAuth ? loadCookieHeader() : null;
         final String html;
@@ -385,9 +414,14 @@ public class BgPoTokenProvider implements PoTokenProvider {
         // URLs and see whether googlevideo accepts it. Falls back to today's
         // behaviour (no streaming pot) when the content-bound mint fails.
         try {
+            final long t0 = System.currentTimeMillis();
             PoTokenResult base = getPoTokenPooled();
             if (base == null) return null;
+            final long t1 = System.currentTimeMillis();
             String streamingPot = mintContentBoundPoToken(videoId);
+            System.out.println("[Bg-timing] " + videoId + " pooled="
+                    + (t1 - t0) + "ms contentBound="
+                    + (System.currentTimeMillis() - t1) + "ms");
             System.out.println("[Piped/Bg] webEmbed content-bound streaming pot: "
                     + (streamingPot != null
                         ? streamingPot.substring(0, Math.min(16, streamingPot.length())) + "..."
@@ -421,7 +455,10 @@ public class BgPoTokenProvider implements PoTokenProvider {
             final var rumpf = mapper.createObjectNode().put("content_binding", videoId);
             try {
                 final String vd = getWebVisitorData();
+                final long tA = System.currentTimeMillis();
                 final var aufgabe = fetchOwnChallenge(vd);
+                System.out.println("[Bg-timing] Aufgabe holen "
+                        + (System.currentTimeMillis() - tA) + "ms");
                 if (aufgabe != null) {
                     rumpf.set("challenge", aufgabe);
                     final var client = mapper.createObjectNode();
@@ -435,10 +472,13 @@ public class BgPoTokenProvider implements PoTokenProvider {
             } catch (Exception e) {
                 System.out.println("[Piped/Bg] content-bound ohne eigene Aufgabe (" + e.getMessage() + ")");
             }
+            final long tB = System.currentTimeMillis();
             return ReqwestUtils.fetch(bgHelperUrl + "/get_pot", "POST",
                     mapper.writeValueAsBytes(rumpf),
                     Map.of("Content-Type", "application/json"))
                 .thenApply(response -> {
+                    System.out.println("[Bg-timing] get_pot "
+                            + (System.currentTimeMillis() - tB) + "ms");
                     try {
                         return mapper.readTree(new String(response.body())).get("poToken").asText();
                     } catch (Exception e) {

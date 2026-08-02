@@ -552,6 +552,32 @@ public final class SabrCache {
     /// Traegt der Cache den Init-Kasten (ftyp/moov/sidx)? Ohne den laesst sich
     /// keine Playlist bauen — ein Cache ohne ihn ist wertlos, egal wie viele
     /// Segmente danebenliegen.
+    /// Merkt, dass die normale Kaskade fuer dieses Video nichts Brauchbares
+    /// liefert (kein Audio) und direkt WebEmbed gefragt werden muss.
+    ///
+    /// ⚠️ Auf PLATTE, damit es Neustarts ueberlebt — dieselbe Lehre wie bei der
+    /// Throttle-Marke. Ohne das laufen bei jedem kalten Tap erst ANDROID und VR
+    /// ins Leere (gemessen 123 + 359 ms), bevor WebEmbed drankommt.
+    private static final long WEBEMBED_MARKE_MS = 24L * 3600_000L;
+
+    public static void noteWebEmbedNoetig(String videoId) {
+        try {
+            java.nio.file.Files.writeString(dir().resolve(videoId + ".webembed"), "");
+        } catch (Exception ignored) { }
+    }
+
+    public static boolean brauchtWebEmbed(String videoId) {
+        try {
+            final Path m = dir().resolve(videoId + ".webembed");
+            if (!java.nio.file.Files.exists(m)) return false;
+            final long alter = System.currentTimeMillis()
+                    - java.nio.file.Files.getLastModifiedTime(m).toMillis();
+            if (alter < WEBEMBED_MARKE_MS) return true;
+            java.nio.file.Files.deleteIfExists(m);
+        } catch (Exception ignored) { }
+        return false;
+    }
+
     public static boolean cacheHatInit(String videoId) {
         for (int itag : itagsForCached(videoId)) {
             try {

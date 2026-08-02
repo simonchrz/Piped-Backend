@@ -1137,6 +1137,18 @@ public class SynthHlsHandlers {
     }
 
     private static Streams resolveStreamsInner(String videoId) throws Exception {
+        // â ïž Ist bekannt, dass die Kaskade fuer dieses Video nichts liefert,
+        // direkt WebEmbed fragen. Sonst laufen ANDROID und VR jedes Mal ins
+        // Leere (gemessen 123 + 359 ms) und der Rueckfall kommt danach trotzdem.
+        if (me.kavin.piped.utils.sabr.SabrCache.brauchtWebEmbed(videoId)) {
+            final Streams direkt = resolveStreamsWebEmbed(videoId);
+            if (direkt != null && !direkt.audioStreams.isEmpty()
+                    && !direkt.videoStreams.isEmpty()) {
+                System.out.println("[SynthHls] " + videoId
+                        + " bekannt degradiert -> direkt WebEmbed (Kaskade uebersprungen)");
+                return direkt;
+            }
+        }
         Streams s = null;
         for (int attempt = 0; attempt < 3; attempt++) {
             StreamInfo info = Multithreading.supplyAsync(() -> {
@@ -1161,6 +1173,7 @@ public class SynthHlsHandlers {
         // web_embedded=4 incl. m4a.
         if (s != null && s.audioStreams.isEmpty()) {
             System.out.println("[SynthHls] " + videoId + " persistent degraded (audio=0), force-WebEmbed fallback");
+            me.kavin.piped.utils.sabr.SabrCache.noteWebEmbedNoetig(videoId);
             Streams retryS = resolveStreamsWebEmbed(videoId);
             if (retryS != null && !retryS.audioStreams.isEmpty() && !retryS.videoStreams.isEmpty()) {
                 s = retryS;

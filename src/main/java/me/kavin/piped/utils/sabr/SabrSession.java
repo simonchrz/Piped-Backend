@@ -396,6 +396,8 @@ public final class SabrSession {
     /// Der vom Server genannte Fehlertyp (z. B. `sabr.no_audio_selected`) —
     /// die Leiter entscheidet damit, ob ein anderer Versuch Sinn hat.
     private String sabrErrorTyp = null;
+    /// Hat die letzte Runde Medien gebracht? Steuert die Taktpause beim Sprung.
+    private boolean leereRunde = false;
 
     /// SELECTABLE_FORMATS (UMP-Typ 51) — die Formate, die der Server fuer DIESE
     /// Sitzung akzeptiert.
@@ -645,6 +647,12 @@ public final class SabrSession {
                 if (iter > 0) {
                     long waitMs = "1".equals(System.getenv("YT_SABR_IGNORE_BACKOFF"))
                             ? 0 : policyBackoffMs;
+                    // ⚠️ Die Taktpause NICHT kuerzen. Am 2026-08-02 auf 750 ms
+                    // verkuerzt (nach einer Runde ohne Medien, bei offenem
+                    // Sprung): die naechste Runde kam mit 11 B zurueck — der
+                    // leere UMP-Rahmen, den zu fruehes Feuern ausloest — und der
+                    // Sprung endete im 20-s-Timeout statt nach 6,8 s. Der Server
+                    // meint seine 4000 ms ernst.
                     final String gap = System.getenv("YT_SABR_GAP_MS");
                     if (gap != null && !gap.isEmpty()) {
                         try { waitMs = Math.max(waitMs, Long.parseLong(gap.trim())); }
@@ -870,6 +878,7 @@ public final class SabrSession {
                     }
                 }
 
+                leereRunde = newSegments[0] == 0;
                 if (sabrError[0]) {
                     stopReason = sabrErrorTyp != null ? "SABR_ERROR:" + sabrErrorTyp : "SABR_ERROR";
                     // ⚠️ Unterscheiden: „falsches Audioformat gewaehlt" (dann hilft
