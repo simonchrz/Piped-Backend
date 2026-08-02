@@ -953,6 +953,10 @@ public final class SabrCache {
     private static final long WEB_MEMO_TTL_MS = 10 * 60 * 1000L;
 
     private static boolean webBlocked() {
+        // Pruefschalter: den Memo-Zustand herstellen, ohne auf ein geschlossenes
+        // googlevideo-Fenster warten zu muessen. Nur zum Testen der Rettung
+        // "ANDROID brachte nichts -> WEB trotz Memo".
+        if ("1".equals(System.getenv("YT_SABR_FORCE_WEB_MEMO"))) return true;
         return !"0".equals(System.getenv("YT_SABR_WEB_MEMO"))
                 && WEB_BLOCKED_UNTIL.get() > System.currentTimeMillis();
     }
@@ -1039,6 +1043,30 @@ public final class SabrCache {
             result = attemptBothFamilies(videoId, fam1, usedClient);
         if (result != null && result.segments() > 0)
             GOOD_BINDING.put(videoId, preferContentBound);
+        // ⚠️ Das WEB-Memo behauptet "googlevideos Fenster ist zu", also 403 auf
+        // WEB — und in so einem Fenster holt ANDROID immerhin noch seine ~13 MB.
+        // Kommt ANDROID mit NULL Segmenten zurueck, ist das etwas anderes: dieses
+        // Video kann ANDROID nicht (typisch: kein_audio_im_angebot, der Server
+        // bietet ueber diesen Client gar keinen Ton an). Dann haben wir gar
+        // nichts, und die zwei Fehlversuche, die das Memo sparen soll, sind
+        // billiger als ein unabspielbares Video.
+        // Gemessen 2026-08-02 an 1mCra0aWn0U: in der App HTTP 500, im Backend
+        // dreimal kein_audio_im_angebot; mit geloeschtem Memo lief dasselbe
+        // Video ueber WEB in 5,4 s an (345 Segmente).
+        // Der Deckel bleibt eng: NUR bei null Segmenten, also nie im normalen
+        // Fenster-Zu-Fall.
+        if (skipWeb && DEFAULT_CLIENT != 0 && (result == null || result.segments() == 0)) {
+            System.out.println("[SabrCache] " + videoId + " ANDROID brachte nichts ("
+                    + (result == null ? "null" : result.stopReason())
+                    + ") -> WEB trotz Memo versuchen");
+            final SabrHandlers.SabrMedia rW = attemptBothFamilies(videoId, fam1, DEFAULT_CLIENT);
+            if (rW != null && (result == null || rW.segments() > result.segments())) {
+                result = rW;
+                usedClient = DEFAULT_CLIENT;
+                System.out.println("[SabrCache] " + videoId + " WEB trotz Memo gewann (segs="
+                        + rW.segments() + " complete=" + rW.complete() + ")");
+            }
+        }
         // Stufe 2: Client-Rueckfall auf ANDROID. Es gab Fenster (2026-07-30
         // abends), in denen der WEB-Pfad auf BEIDEN Familien hart 403te, waehrend
         // ANDROID noch seine ~13 MB holte. Ein Teil-Cache ist besser als keiner,
