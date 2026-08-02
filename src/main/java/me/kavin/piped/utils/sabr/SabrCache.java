@@ -600,6 +600,85 @@ public final class SabrCache {
         return false;
     }
 
+    /// Alle Marken zu einem Video als JSON — fuer `/debug/marken/<videoId>`.
+    ///
+    /// Warum es das gibt: die Marken liegen ueber SabrCache, ResolveMemo,
+    /// EgressManager und die Platte verteilt, und welche gerade gilt, war
+    /// bisher nur aus dem Log zu ERRATEN. Am 2026-08-02 brauchte die Suche nach
+    /// dem wahren Blocker drei Anlaeufe (erst WEB-Memo, dann fehlende
+    /// Drossel-Marke, dann blockierendes itagsFor) — mit dieser Ausgabe waere
+    /// es ein Aufruf gewesen.
+    ///
+    /// ⚠️ NUR LESEN, keine blockierenden Aufrufe. Kein itagsFor (das wartet auf
+    /// die Sitzung), kein startDownload. Sonst haengt ausgerechnet die Diagnose.
+    public static String markenBericht(String videoId) {
+        final StringBuilder b = new StringBuilder();
+        b.append("{\"videoId\":\"").append(videoId.replaceAll("[^A-Za-z0-9_-]", "")).append("\"");
+        b.append(",\"routing\":{");
+        b.append("\"throttled\":").append(wasThrottledRecently(videoId));
+        b.append(",\"throttled_datei_alter_ms\":").append(dateiAlterMs(videoId + ".throttled"));
+        b.append(",\"webembed\":").append(brauchtWebEmbed(videoId));
+        b.append(",\"webembed_datei_alter_ms\":").append(dateiAlterMs(videoId + ".webembed"));
+        b.append(",\"sabr_tot\":").append(sabrTot(videoId));
+        b.append(",\"sabr_tot_datei_alter_ms\":").append(dateiAlterMs(videoId + ".sabrtot"));
+        b.append(",\"storm\":").append(isStormMarked(videoId));
+        b.append(",\"capped_rest_ms\":").append(restMs(CAPPED_MARKS.get(videoId)));
+        b.append(",\"refill_erschoepft\":").append(isRefillExhausted(videoId));
+        b.append(",\"resolvememo_throttled\":")
+                .append(me.kavin.piped.utils.ResolveMemo.isThrottled(videoId));
+        b.append(",\"resolvememo_audio_zero\":")
+                .append(me.kavin.piped.utils.ResolveMemo.isAudioZero(videoId));
+        b.append("}");
+        b.append(",\"sitzung\":{");
+        b.append("\"download_aktiv\":").append(DOWNLOAD_ACTIVE.contains(videoId));
+        b.append(",\"hat_cache\":").append(hasCache(videoId));
+        b.append(",\"letzte_anfrage_vor_ms\":").append(seitMs(LAST_REQUEST.get(videoId)));
+        b.append(",\"letzte_wiedergabe_vor_ms\":").append(seitMs(LAST_PLAYBACK.get(videoId)));
+        b.append(",\"bedarfs_offset\":").append(DEMAND_OFFSET.getOrDefault(videoId, -1L));
+        b.append(",\"gute_bindung\":").append(GOOD_BINDING.get(videoId));
+        b.append("}");
+        b.append(",\"sprung\":{");
+        b.append("\"ziel_segment\":").append(SEEK_SEQ.getOrDefault(videoId, -1));
+        b.append(",\"ziel_itag\":").append(SEEK_ITAG.getOrDefault(videoId, -1));
+        b.append(",\"belegt_rest_ms\":").append(restMs(SEEK_PROVEN.get(videoId)));
+        b.append(",\"aussichtslos_rest_ms\":").append(restMs(SEEK_UNAVAILABLE.get(videoId)));
+        b.append("}");
+        b.append(",\"global\":{");
+        b.append("\"web_memo_rest_ms\":").append(restMs(WEB_BLOCKED_UNTIL.get()));
+        b.append(",\"egress_familie\":\"")
+                .append(me.kavin.piped.utils.EgressManager.activeEgress()).append("\"");
+        b.append("}}");
+        return b.toString();
+    }
+
+    /// Alter einer Markendatei in ms, -1 wenn sie nicht existiert.
+    private static long dateiAlterMs(String name) {
+        try {
+            final Path m = dir().resolve(name);
+            if (!java.nio.file.Files.exists(m)) return -1;
+            return System.currentTimeMillis()
+                    - java.nio.file.Files.getLastModifiedTime(m).toMillis();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /// Restlaufzeit einer Frist in ms, -1 wenn abgelaufen oder nicht gesetzt.
+    private static long restMs(Long bis) {
+        if (bis == null || bis <= 0) return -1;
+        final long rest = bis - System.currentTimeMillis();
+        return rest > 0 ? rest : -1;
+    }
+
+    private static long restMs(long bis) {
+        return restMs(bis <= 0 ? null : Long.valueOf(bis));
+    }
+
+    /// Wie lange ist ein Zeitpunkt her, in ms; -1 wenn nie.
+    private static long seitMs(Long zeitpunkt) {
+        return zeitpunkt == null ? -1 : System.currentTimeMillis() - zeitpunkt;
+    }
+
     public static boolean cacheHatInit(String videoId) {
         for (int itag : itagsForCached(videoId)) {
             try {

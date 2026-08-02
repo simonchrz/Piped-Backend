@@ -190,6 +190,19 @@ public class ServerLauncher extends MultithreadedHttpServerLauncher {
                     String body = "{\"input\":\"" + url.replace("\\", "\\\\").replace("\"", "\\\"") + "\",\"rewritten\":\"" + (rewritten == null ? "" : rewritten).replace("\\", "\\\\").replace("\"", "\\\"") + "\"}";
                     return getJsonResponse(body.getBytes(UTF_8), "no-store");
                 }))
+                // Welche Marken gelten gerade fuer dieses Video? Die Marken liegen
+                // ueber SabrCache, ResolveMemo, EgressManager und die Platte
+                // verteilt; bisher liess sich nur aus dem Log ERRATEN, welche
+                // greift. Am 2026-08-02 kostete das drei Anlaeufe, bis der wahre
+                // Blocker gefunden war. Nur lesend, keine blockierenden Aufrufe.
+                .map(GET, "/debug/marken/:videoId", AsyncServlet.ofBlocking(executor, request -> {
+                    final String videoId = request.getPathParameter("videoId");
+                    if (videoId == null || videoId.isBlank())
+                        return getJsonResponse("{\"error\":\"missing videoId\"}".getBytes(UTF_8), "no-store");
+                    return getJsonResponse(
+                            me.kavin.piped.utils.sabr.SabrCache.markenBericht(videoId).getBytes(UTF_8),
+                            "no-store");
+                }))
                 .map(HttpMethod.OPTIONS, "/*", request -> HttpResponse.ofCode(200))
                 .map(GET, "/webhooks/pubsub", AsyncServlet.ofBlocking(executor, request -> {
                     var topic = request.getQueryParameter("hub.topic");
