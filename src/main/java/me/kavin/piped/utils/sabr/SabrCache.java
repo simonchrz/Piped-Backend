@@ -747,6 +747,19 @@ public final class SabrCache {
     /// nichts, und der Sprung endete nach 20 s mit HTTP 503.
     /// Richtig waeren 548 Segmente mal ~5091 ms = rund 2.040.000 ms.
     private static final Map<String, Integer> SEEK_ITAG = new ConcurrentHashMap<>();
+    /// Videos, deren SABR-POST mit 403 abgewiesen wurde — fuer die ist der
+    /// SABR-Weg zu und der Playlist-Bau soll nicht darauf warten. Kurze Frist,
+    /// damit es sich von selbst heilt, wenn googlevideo wieder aufmacht.
+    private static final Map<String, Long> SABR_TOT = new ConcurrentHashMap<>();
+    private static final long SABR_TOT_TTL_MS = 5 * 60 * 1000L;
+
+    public static boolean sabrTot(String videoId) {
+        final Long bis = SABR_TOT.get(videoId);
+        if (bis == null) return false;
+        if (bis > System.currentTimeMillis()) return true;
+        SABR_TOT.remove(videoId);
+        return false;
+    }
     public static int seekItag(String videoId) { return SEEK_ITAG.getOrDefault(videoId, -1); }
     /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
     private static final long SEEK_WAIT_MS = 20_000;
@@ -1348,6 +1361,13 @@ public final class SabrCache {
                     paced, publishHook, resume, progressSink);
         } catch (Exception e) {
             System.out.println("[SabrCache] " + videoId + " attempt(" + family + ") threw: " + e.getMessage());
+            // Ein 403 auf die SABR-POST bedeutet: dieser Weg ist fuer dieses
+            // Video zu. Merken, sonst wartet der Playlist-Bau bei JEDER Anfrage
+            // die vollen 10 s ab und laeuft danach ins 12-s-Budget des Servers —
+            // der MWEB-Notausgang kam dadurch nie zum Zug (gemessen 2026-08-02
+            // an 1mCra0aWn0U: dreimal HTTP 500 nach 12,0 s).
+            if (e.getMessage() != null && e.getMessage().contains("HTTP 403"))
+                SABR_TOT.put(videoId, System.currentTimeMillis() + SABR_TOT_TTL_MS);
         } finally {
             // the session closes the streams it was handed; this is defensive for
             // the error path (runSession throws before the session's finally runs).

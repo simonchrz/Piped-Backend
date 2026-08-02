@@ -475,16 +475,59 @@ public class SynthHlsHandlers {
     private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
         final Runnable releaseSlot = SLOT_RELEASE.get();
         if (releaseSlot != null) releaseSlot.run();
+        // Ist der SABR-Weg fuer dieses Video als zu bekannt, gar nicht erst
+        // warten — sonst frisst die Wartezeit das Server-Budget auf, bevor der
+        // Notausgang drankommt.
+        if (me.kavin.piped.utils.sabr.SabrCache.sabrTot(videoId)) {
+            final byte[] sofort = mwebNotausgang(videoId, itag);
+            if (sofort != null) {
+                System.out.println("[SynthHls] " + videoId + "/" + itag
+                        + " SABR bekannt zu -> sofort MWEB-Direkt");
+                return sofort;
+            }
+        }
         final long deadline = System.currentTimeMillis() + SABR_PLAYLIST_WAIT_MS;
         for (;;) {
             final byte[] pl = trySabrStreamPlaylist(videoId, itag);
             if (pl != null) return pl;
             if (System.currentTimeMillis() >= deadline) {
                 me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+                // ⚠️ NOTAUSGANG. Es gibt Videos, die SABR ueberhaupt nicht kann:
+                // WEB antwortet auf beiden Egress-Familien mit 403, ANDROID
+                // bietet gar keinen Ton an (SABR_ERROR:kein_audio_im_angebot).
+                // Dann gibt es nie einen sidx, und bisher flog von hier eine
+                // Ausnahme -> HTTP 500 -> in der App "Dieses Video ist zurzeit
+                // nicht abspielbar". Der MWEB-Direktweg kann dieselben Videos
+                // aber sehr wohl: gemessen 2026-08-02 an 1mCra0aWn0U, 345
+                // Segmente, waehrend SABR dreimal hintereinander nichts lieferte.
+                // Die Storm-/Drossel-Marke schickt uns in den SABR-Modus; ist
+                // der leer, ist der Direktweg besser als gar nichts.
+                final byte[] direkt = mwebNotausgang(videoId, itag);
+                if (direkt != null) {
+                    System.out.println("[SynthHls] " + videoId + "/" + itag
+                            + " SABR liefert nichts -> Notausgang ueber MWEB-Direkt");
+                    return direkt;
+                }
                 throw new IllegalStateException("sabr cache not usable yet for "
                         + videoId + "/" + itag + " (kein sidx / 0 Segmente)");
             }
             Thread.sleep(400);   // die Session schreibt fortlaufend — gleich nochmal
+        }
+    }
+
+    /// Direkt-Playlist aus den MWEB-URLs bauen, wenn der SABR-Weg fuer dieses
+    /// Video verschlossen ist. null = auch das geht nicht.
+    private static byte[] mwebNotausgang(String videoId, int itag) {
+        try {
+            final Streams m = me.kavin.piped.utils.MwebStreams.hole(videoId);
+            if (m == null) return null;
+            final PipedStream pick = passendesFormat(m, itag);
+            if (pick == null || pick.url == null) return null;
+            return streamPlaylist(videoId, pick, m.duration);
+        } catch (Exception e) {
+            System.out.println("[SynthHls] " + videoId + " Notausgang fehlgeschlagen: "
+                    + e.getMessage());
+            return null;
         }
     }
 
