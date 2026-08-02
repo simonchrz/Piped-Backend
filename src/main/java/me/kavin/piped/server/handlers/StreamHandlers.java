@@ -625,6 +625,18 @@ public class StreamHandlers {
                         && !"false".equalsIgnoreCase(System.getenv("YT_SABR_STORM_FALLBACK"))
                         && (sabrCacheReady || SabrHandlers.sabrViable(videoId))) {
                     SabrCache.markStorm(videoId);
+                    // 🔑 Den MWEB-Ersatz JETZT schon warmlaufen lassen. Kann
+                    // dieses Video kein SABR (403 auf die POST), braucht der
+                    // Playlist-Bau den Direktweg — und der Abruf dauert rund 2 s.
+                    // Faengt er erst an, wenn der Playlist-Bau ihn vermisst, ist
+                    // das Rennen gegen das 12-s-Budget des Servers knapp und
+                    // ging gemessen jedes zweite Mal verloren. Aus dem
+                    // Kurzzeit-Cache (60 s) kostet er danach 0 ms.
+                    Multithreading.runAsync(() -> {
+                        try {
+                            me.kavin.piped.utils.MwebStreams.hole(videoId);
+                        } catch (Exception ignored) { }
+                    });
                     Multithreading.runAsync(() -> {
                         try {
                             // itagsFor triggers the one-time session download and

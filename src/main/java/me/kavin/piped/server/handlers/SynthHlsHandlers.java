@@ -457,7 +457,13 @@ public class SynthHlsHandlers {
     /// 12 s) — sonst bricht der Aufruf VON AUSSEN mit 500 ab, waehrend wir noch
     /// warten (2026-07-31 selbst gebaut: 15 s Wartefrist gegen 12 s Budget ->
     /// "YT resolve exceeded 12s budget", 0 Segmente).
-    private static final int SABR_PLAYLIST_WAIT_MS = 10_000;
+    /// ⚠️ MUSS deutlich unter dem 12-s-Budget des Servers bleiben, denn danach
+    /// kommt noch der MWEB-Notausgang (~2 s). Mit den alten 10 s ging beides
+    /// zusammen ueber das Budget und der Notausgang wurde ABGESCHNITTEN — in der
+    /// App kam trotzdem HTTP 500 (gemessen 2026-08-02 an 1mCra0aWn0U, dreimal
+    /// "YT resolve exceeded 12s budget"). Die Playlist ist ohnehin fertig,
+    /// sobald die erste Runde Init und sidx geschrieben hat.
+    private static final int SABR_PLAYLIST_WAIT_MS = 6_000;
 
     /// Vom Route-Layer gesetzt: gibt den YT-Resolve-Slot FRÜH frei, sobald der
     /// Request nur noch auf LOKALE SABR-Daten wartet.
@@ -473,6 +479,7 @@ public class SynthHlsHandlers {
     public static final ThreadLocal<Runnable> SLOT_RELEASE = new ThreadLocal<>();
 
     private static byte[] sabrStreamPlaylist(String videoId, int itag) throws Exception {
+        System.out.println("[SynthHls-dbg] " + videoId + "/" + itag + " sabrStreamPlaylist betreten");
         final Runnable releaseSlot = SLOT_RELEASE.get();
         if (releaseSlot != null) releaseSlot.run();
         // Ist der SABR-Weg fuer dieses Video als zu bekannt, gar nicht erst
@@ -486,10 +493,37 @@ public class SynthHlsHandlers {
                 return sofort;
             }
         }
+        // 🔑 Den Notausgang PARALLEL zum Warten vorbereiten. Die 403-Absage von
+        // googlevideo kam im Mitschnitt erst 11 s nach Beginn der Anfrage, das
+        // Server-Budget endet nach 12 s — wer dann erst anfaengt, MWEB zu holen
+        // (~2 s), kommt nie an. Liegt das Ergebnis dagegen schon bereit, kostet
+        // der Umstieg 0 ms. Der Aufruf ist gedeckelt gecacht (MwebStreams), er
+        // faellt also hoechstens einmal pro Video und Minute an.
+        final java.util.concurrent.CompletableFuture<byte[]> ersatz =
+                java.util.concurrent.CompletableFuture.supplyAsync(
+                        () -> mwebNotausgang(videoId, itag));
         final long deadline = System.currentTimeMillis() + SABR_PLAYLIST_WAIT_MS;
         for (;;) {
             final byte[] pl = trySabrStreamPlaylist(videoId, itag);
             if (pl != null) return pl;
+            // Die 403-Absage kommt oft ERST WAEHREND wir hier warten (im
+            // Mitschnitt 7 s nach dem Start). Nur beim Eintritt zu pruefen hiess
+            // die vollen Sekunden abzusitzen und dann am Budget zu sterben.
+            if (me.kavin.piped.utils.sabr.SabrCache.sabrTot(videoId)) {
+                // ⚠️ Kurz WARTEN statt nur abfragen. Die 403-Absage und das
+                // MWEB-Ergebnis treffen fast gleichzeitig ein; mit getNow() war
+                // der Ersatz meist noch nicht fertig, die Schleife lief weiter
+                // und das Server-Budget kam zuerst — HTTP 500 beim ERSTEN Tap.
+                byte[] frueh = ersatz.getNow(null);
+                if (frueh == null) try {
+                    frueh = ersatz.get(3, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception ignored) { }
+                if (frueh != null) {
+                    System.out.println("[SynthHls] " + videoId + "/" + itag
+                            + " SABR waehrend des Wartens abgewiesen -> MWEB-Direkt");
+                    return frueh;
+                }
+            }
             if (System.currentTimeMillis() >= deadline) {
                 me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
                 // ⚠️ NOTAUSGANG. Es gibt Videos, die SABR ueberhaupt nicht kann:
@@ -502,7 +536,10 @@ public class SynthHlsHandlers {
                 // Segmente, waehrend SABR dreimal hintereinander nichts lieferte.
                 // Die Storm-/Drossel-Marke schickt uns in den SABR-Modus; ist
                 // der leer, ist der Direktweg besser als gar nichts.
-                final byte[] direkt = mwebNotausgang(videoId, itag);
+                byte[] direkt = ersatz.getNow(null);
+                if (direkt == null) try {
+                    direkt = ersatz.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (Exception ignored) { }
                 if (direkt != null) {
                     System.out.println("[SynthHls] " + videoId + "/" + itag
                             + " SABR liefert nichts -> Notausgang ueber MWEB-Direkt");

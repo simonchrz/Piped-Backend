@@ -367,6 +367,15 @@ public final class SabrCache {
     /// antwortet er mit dem, was da ist (oder 502) — der Download laeuft im
     /// Hintergrund weiter.
     private static final long EARLY_WAIT_MS = 30_000;
+    /// ⚠️ Wartezeit fuer itagsFor SEPARAT und KURZ. Der Aufruf steht als
+    /// Argument im Playlist-Bau, blockiert also die laufende Anfrage — und die
+    /// hat nur 12 s Budget, von denen der Resolve schon rund 6 s frisst. Mit den
+    /// 30 s von EARLY_WAIT_MS wurde der Playlist-Bau erst nach 11,5 s betreten
+    /// und sein MWEB-Ersatz mitten im Abruf abgebrochen: HTTP 500 in der App
+    /// (2026-08-02, 4 von 4 kalten Versuchen an 1mCra0aWn0U).
+    /// Die itags stehen in den Dateinamen, sobald die Sitzung die ersten Bytes
+    /// geschrieben hat — das dauert im gesunden Fall rund 2 s.
+    private static final long ITAGS_WAIT_MS = 2_500;
 
     /// Startet den Download im HINTERGRUND (einmal pro Video) und wartet nur,
     /// bis der Anfang serviert werden kann.
@@ -450,6 +459,19 @@ public final class SabrCache {
     /// (the preferred picks) for pre-manifest cache entries.
     public static int[] itagsFor(String videoId) throws Exception {
         final Path manifest = DIR.resolve(safe(videoId) + ".itags");
+        // ⚠️ HIER hing der erste Tap. Der Aufruf steht als Argument im
+        // Playlist-Bau und wartet auf die SABR-Sitzung — bei einem Video, dessen
+        // SABR-POST 403t, waren das 11,5 s, und der Playlist-Bau wurde erst
+        // danach betreten, mit einer halben Sekunde Restbudget. Der MWEB-Ersatz
+        // wurde dann mitten im Abruf abgebrochen (InterruptedException), die App
+        // bekam HTTP 500 (gemessen 2026-08-02, 4 von 4 kalten Versuchen).
+        // Ist der 403 bekannt, hier NICHT warten: das uebliche Paar zurueckgeben
+        // und den Playlist-Bau sofort seinen Direktweg gehen lassen.
+        if (!Files.exists(manifest) && sabrTot(videoId)) {
+            System.out.println("[SabrCache] " + videoId
+                    + " itagsFor: SABR bekannt abgewiesen -> kein Warten");
+            return new int[] { 140, 137 };
+        }
         if (!Files.exists(manifest)) {
             // Das Manifest schreibt download() erst am ENDE. Seit der Download
             // im Hintergrund laeuft (s. ensureFile) darf hier nicht mehr
@@ -457,7 +479,7 @@ public final class SabrCache {
             // itags stehen aber schon in den Dateinamen, sobald die Session die
             // ersten Bytes geschrieben hat.
             startDownload(videoId);
-            final long deadline = System.currentTimeMillis() + EARLY_WAIT_MS;
+            final long deadline = System.currentTimeMillis() + ITAGS_WAIT_MS;
             while (System.currentTimeMillis() < deadline
                     && !Files.exists(manifest) && !anyFileFor(videoId)
                     && DOWNLOAD_ACTIVE.contains(videoId)) {
@@ -999,6 +1021,19 @@ public final class SabrCache {
     }
 
     private static void download(String videoId, boolean allowPacedRequested, boolean demand) throws Exception {
+        // ⚠️ Weist googlevideo die SABR-POST fuer dieses Video mit 403 ab, ist
+        // die ganze Leiter sinnlos — sie fuhr trotzdem drei Sitzungen (WEB
+        // visitor-bound, WEB content-bound, ANDROID) und brauchte dafuer rund
+        // 12 s, WAEHREND SIE DEN RESOLVE-SLOT HIELT. Die Playlist-Anfrage stand
+        // die ganze Zeit in der Warteschlange und starb am 12-s-Budget des
+        // Servers, noch bevor sie ihren MWEB-Notausgang erreichte: in der App
+        // kam HTTP 500 (gemessen 2026-08-02 an 1mCra0aWn0U, mehrfach).
+        // Die Marke laeuft nach 5 Minuten ab, heilt sich also selbst.
+        if (sabrTot(videoId)) {
+            System.out.println("[SabrCache] " + videoId
+                    + " SABR bekannt abgewiesen (403) -> Leiter uebersprungen");
+            return;
+        }
         // YT_SABR_PACED_ALWAYS=1: getaktete 1x-Sitzung schon im ERSTLAUF, nicht
         // erst beim Nachfuellen markierter Videos. Gegenprobe zur Frage, ob der
         // Kids-Cap am zu schnell vorlaufenden player_time haengt â der Server
@@ -1091,6 +1126,15 @@ public final class SabrCache {
         // content-bound-Stufe weiter unten lief bisher nur im `stuck`-Fall —
         // bei 403/0 Segmenten sprangen wir direkt auf ANDROID und liessen die
         // wirksamste Stufe aus.
+        // ⚠️ Nach einem 403 die restlichen Sprossen NICHT mehr fahren. Jede
+        // kostet rund 5 s und haelt dabei den Resolve-Slot; die wartende
+        // Playlist-Anfrage starb dadurch am 12-s-Budget, bevor ihr
+        // MWEB-Notausgang drankam.
+        if (sabrTot(videoId)) {
+            System.out.println("[SabrCache] " + videoId
+                    + " 403 -> restliche Sprossen uebersprungen");
+            return;
+        }
         if (!skipWeb && DEFAULT_CLIENT != 0 && (result == null || result.segments() == 0)) {
             System.out.println("[SabrCache] " + videoId
                     + " WEB visitor-bound brachte nichts -> WEB content-bound");
