@@ -196,6 +196,15 @@ public final class SabrSession {
     private java.util.function.IntSupplier seekItagSupplier;
     /// Zu welcher Spur gehoert das Sprungziel? (s. SabrCache.SEEK_ITAG)
     public void setSeekItag(java.util.function.IntSupplier s) { this.seekItagSupplier = s; }
+    /// Liefert die EXAKTE Startzeit (ms) eines Segments der Sprung-Spur, aus dem
+    /// sidx aufsummiert. -1 wenn unbekannt. Siehe die Begruendung am Sprung.
+    private java.util.function.IntToLongFunction seekTimeSupplier;
+    public void setSeekTimeMs(java.util.function.IntToLongFunction f) { this.seekTimeSupplier = f; }
+    /// (itag, segmentnummer) -> exakte Startzeit in ms aus dem sidx, -1 unbekannt.
+    private java.util.function.BiFunction<Integer, Integer, Long> exakteStartzeit;
+    public void setExakteStartzeit(java.util.function.BiFunction<Integer, Integer, Long> f) {
+        this.exakteStartzeit = f;
+    }
 
     /// FORTSETZEN AB SEGMENT N. Was schon auf Platte liegt, beschreibt der
     /// Aufrufer hier; die Session tut dann so, als haette sie diese Segmente in
@@ -262,10 +271,30 @@ public final class SabrSession {
             s.maxSeq = r.lastSeq;
             s.initWritten = true;              // Init liegt bereits in der Datei
             final long perSeg = s.perSegMs();
+            // ⚠️ EXAKTE Zeiten aus dem sidx, keine Mittelwerte. Aus diesen
+            // Werten baut bufferedRanges() den gemeldeten Puffer, und der Server
+            // wertet die ZEITFELDER aus — nicht nur die Segmentindizes, wie hier
+            // frueher angenommen. Reichte der geschaetzte Puffer auch nur
+            // Millisekunden in das fehlende Segment hinein, galt es ihm als
+            // vorhanden und er lieferte es NIE nach: gemessen 2026-08-02 an
+            // 9HwZZ4lMr2o, Loch bei Segment 11, Server schickte 12,13,14 und
+            // danach nur leere Runden bis stop=stuck — die Datei hing seit einem
+            // Tag bei 10 von 393 Segmenten fest.
+            int exakteTreffer = 0;
             for (int q = 1; q <= r.lastSeq; q++) {
                 s.seen.add(q);
-                s.segTimes.put(q, new long[]{perSeg * (q - 1), perSeg});
+                long start = -1, dauer = -1;
+                if (exakteStartzeit != null) {
+                    final long a = exakteStartzeit.apply(itag, q);
+                    final long b = exakteStartzeit.apply(itag, q + 1);
+                    if (a >= 0 && b > a) { start = a; dauer = b - a; exakteTreffer++; }
+                }
+                if (start < 0) { start = perSeg * (q - 1); dauer = perSeg; }
+                s.segTimes.put(q, new long[]{start, dauer});
             }
+            if (exakteTreffer > 0)
+                System.out.println("[Sabr] " + itag + " Puffer mit " + exakteTreffer
+                        + "/" + r.lastSeq + " exakten sidx-Zeiten belegt");
             System.out.println("[Sabr] " + itag + " fortsetzen ab Segment " + (r.lastSeq + 1)
                     + "/" + r.totalSegments + " (" + r.bufferedMs + "ms gepuffert, lmt=" + r.lmt + ")");
             if (progressSink != null) progressSink.resumeApplied(itag, true);
@@ -688,11 +717,48 @@ public final class SabrSession {
                         if (perSeg == 0)
                             for (FState st : states.values())
                                 if (st.perSegMs() > 0) { perSeg = st.perSegMs(); break; }
-                        if (perSeg > 0) {
+                        // 🔑 ZWEI Dinge muessen stimmen, sonst kommt das
+                        // angeforderte Segment NIE (gemessen 2026-08-02 an
+                        // 9HwZZ4lMr2o, Segment 30 angefordert -> Server schickte
+                        // 31,32,33,34; nach 20 s HTTP 503, Sitzung endete
+                        // stuck und begann von vorn):
+                        //
+                        // 1. Die Zeit muss EXAKT sein. perSeg * (want-1) nimmt
+                        //    eine mittlere Dauer; die Segmente sind hier aber
+                        //    3921 bis 6798 ms lang. Darum die aufsummierte
+                        //    Startzeit aus dem sidx.
+                        // 2. Die Zeit muss VOR das Zielsegment. Der Server liest
+                        //    player_time als "das laeuft gerade" und schickt ab
+                        //    dem FOLGENDEN Segment. Zielten wir mitten in
+                        //    Segment 30, begann er bei 31.
+                        long exaktMs = -1;
+                        if (seekTimeSupplier != null) {
+                            final long e = seekTimeSupplier.applyAsLong(want);
+                            if (e >= 0) exaktMs = Math.max(0, e - 1);
+                        }
+                        if (exaktMs >= 0) {
+                            // ⚠️ OHNE Schwelle. Die Schwelle stammt aus der Zeit
+                            // der geschaetzten Zielzeit und verschluckte genau die
+                            // Korrektur, auf die es ankommt: steht der Play-Head
+                            // schon auf der STARTZEIT des fehlenden Segments,
+                            // gilt es dem Server als "laeuft gerade" und er
+                            // schickt ab dem naechsten — das Loch bleibt ewig.
+                            // Gemessen an 9HwZZ4lMr2o: Loch bei 11, Head 51810 =
+                            // exakt dessen Start, Server lieferte 12..16, danach
+                            // nur noch leere Runden bis stop=stuck.
+                            if (playerTimeMs != exaktMs) {
+                                if (playerTimeMs / 1000 != exaktMs / 1000)
+                                    System.out.println("[Sabr] Sprung auf Segment " + want
+                                            + " (" + exaktMs + "ms"
+                                            + (perSeg > 0 ? ", mittel waere " + (perSeg * (want - 1)) : "")
+                                            + ")");
+                                playerTimeMs = exaktMs;
+                            }
+                        } else if (perSeg > 0) {
                             final long targetMs = perSeg * (want - 1);
                             if (Math.abs(targetMs - playerTimeMs) > perSeg) {
                                 System.out.println("[Sabr] Sprung auf Segment " + want
-                                        + " (" + targetMs + "ms)");
+                                        + " (" + targetMs + "ms, geschaetzt)");
                                 playerTimeMs = targetMs;
                             }
                         }
@@ -1345,6 +1411,10 @@ public final class SabrSession {
         if (pg.isInit) {
             if (!s.initWritten && s.pendingInit == null) { s.pendingInit = pg.data.toByteArray(); newSegments[0]++; }
         } else if (s.seen.add(pg.seq)) {
+            // TEMP 2026-08-02: welche Segmentnummern schickt der Server wirklich?
+            // Der Runden-Zaehler zeigt nur den zusammenhaengenden Frontier.
+            if ("1".equals(System.getenv("YT_SABR_LOG_SEQ")))
+                System.out.println("[SabrSeq] itag=" + s.fmt.itag + " seq=" + pg.seq);
             if (pg.seq > s.maxSeq) s.maxSeq = pg.seq;
             s.bufferedMs += pg.durationMs;
             s.segTimes.put(pg.seq, new long[]{pg.startMs, pg.durationMs});

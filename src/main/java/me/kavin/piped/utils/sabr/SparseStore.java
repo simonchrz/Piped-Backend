@@ -215,6 +215,18 @@ public final class SparseStore {
     private static final Map<String, Long> TOTAL_LEN = new ConcurrentHashMap<>();
     private static final Map<String, Integer> TOTAL_SEGS = new ConcurrentHashMap<>();
     private static final Map<String, Long> TOTAL_DUR_MS = new ConcurrentHashMap<>();
+    /// Startzeit jedes Segments in ms, Index = Segmentnummer (1-basiert wie im
+    /// sidx und in der Playlist). Aus dem sidx aufsummiert, s. buildOffsets.
+    private static final Map<String, long[]> START_MS = new ConcurrentHashMap<>();
+
+    /// Startzeit von Segment `seq` (1-basiert) in ms, oder -1 wenn unbekannt.
+    public static long segmentStartMs(String videoId, int itag, int seq) {
+        final long[] a = START_MS.get(key(videoId, itag));
+        if (a == null) { present(videoId, itag); }   // erzwingt buildOffsets
+        final long[] b = START_MS.get(key(videoId, itag));
+        if (b == null || seq < 1 || seq >= b.length) return -1;
+        return b[seq];
+    }
 
     /// Gesamtdauer laut sidx in Millisekunden; 0 = unbekannt.
     public static long cachedDurationMs(String videoId, int itag) {
@@ -284,6 +296,19 @@ public final class SparseStore {
         long ticks = 0;
         for (long[] e : entries) ticks += e[1];
         TOTAL_DUR_MS.put(key(videoId, itag), ticks * 1000L / Math.max(1, lastTimescale));
+        // 🔑 EXAKTE Startzeiten je Segment aus dem sidx. Die Segmentdauern
+        // schwanken erheblich (gemessen an 9HwZZ4lMr2o: 3921 bis 6798 ms), eine
+        // MITTLERE Dauer mal Segmentnummer liegt darum schon nach 30 Segmenten
+        // rund 2 s daneben — und beim Sprung entscheidet genau das darueber, ob
+        // der Server das angeforderte Segment schickt oder das naechste.
+        final long[] startMs = new long[entries.size() + 2];
+        long lauf = 0;
+        for (int i = 0; i < entries.size(); i++) {
+            startMs[i + 1] = lauf * 1000L / Math.max(1, lastTimescale);
+            lauf += entries.get(i)[1];
+        }
+        startMs[entries.size() + 1] = lauf * 1000L / Math.max(1, lastTimescale);
+        START_MS.put(key(videoId, itag), startMs);
         // ⚠️ HIER NICHT persistieren: persist() liest present(), und present()
         // ruft (bei fehlender Karte) die Ableitung, die wieder hierher fuehrt.
         // ConcurrentHashMap bricht so eine rekursive Aktualisierung ab, der

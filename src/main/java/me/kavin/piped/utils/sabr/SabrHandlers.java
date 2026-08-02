@@ -426,6 +426,10 @@ public final class SabrHandlers {
         session.setProgressSink(progress);
         session.setSeekTargetSeq(SESSION_SEEK == null ? null : SESSION_SEEK.apply(videoId));
         session.setSeekItag(() -> me.kavin.piped.utils.sabr.SabrCache.seekItag(videoId));
+        session.setSeekTimeMs(seq -> me.kavin.piped.utils.sabr.SparseStore.segmentStartMs(
+                videoId, me.kavin.piped.utils.sabr.SabrCache.seekItag(videoId), seq));
+        session.setExakteStartzeit((itag, seq) ->
+                me.kavin.piped.utils.sabr.SparseStore.segmentStartMs(videoId, itag, seq));
 
         // Vollstaendige Session-Erneuerung bei prot=3: NEUER Player-Call (gleicher
         // Client/Egress/visitorData) → frische abrUrl + ustreamerConfig + frischer
