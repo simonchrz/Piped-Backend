@@ -734,6 +734,37 @@ public class SynthHlsHandlers {
                     + emitted + "/" + sidx.entries.size() + " -> partial ENDLIST");
             sb.append("#EXT-X-ENDLIST");
             if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+        } else if (!"0".equals(System.getenv("YT_SYNTH_STRICT_LENGTH"))) {
+            // 🔑 ENTSCHEIDUNG 2026-08-02: lieber ein ehrlicher Fehler als ein
+            // stillschweigend gekuerztes Video.
+            //
+            // Bisher wurde die Teil-Playlist mit ENDLIST ausgeliefert. Der
+            // Player haelt sie dann fuer das GANZE Video: gemessen an
+            // tg0Ll77eBHI 664 von 807 Segmenten — 3355 s statt 4111 s, das
+            // Video endete zwoelf Minuten zu frueh und sah dabei aus, als
+            // waere es zu Ende. Nichts in der Antwort verriet das.
+            //
+            // Wichtig: das ist NICHT der Cap-Fall (partialTerminal, s. Zweig
+            // darueber). Dort ist der Teil wirklich alles, was je kommt, und
+            // ein Teil-Video schlaegt gar keins. Hier dagegen ist der Cache
+            // nur GERADE unvollstaendig — typisch nach einem fehlgeschlagenen
+            // Sprung, der SEEK_UNAVAILABLE fuer 10 Minuten setzt und damit
+            // seekable() und listAll ausschaltet. Nachfuellen laeuft, der
+            // naechste Abruf kann vollstaendig sein.
+            //
+            // Kill-Switch: YT_SYNTH_STRICT_LENGTH=0 stellt das alte Verhalten
+            // wieder her.
+            final double sollSek = sidx.entries.stream().mapToDouble(e -> e.duration).sum();
+            if (videoId != null) me.kavin.piped.utils.sabr.SabrCache.requestRefill(videoId);
+            System.out.println("[SynthHls] " + videoId + "/" + itag
+                    + " Teil-Cache " + emitted + "/" + sidx.entries.size()
+                    + " (" + Math.round(emittedSeconds) + "s statt "
+                    + Math.round(sollSek) + "s) -> ehrlicher Fehler statt gekuerztem Video");
+            throw new IllegalStateException("Teil-Cache fuer " + videoId + "/" + itag
+                    + ": " + emitted + " von " + sidx.entries.size() + " Segmenten ("
+                    + Math.round(emittedSeconds) + "s statt " + Math.round(sollSek)
+                    + "s). Nachfuellen angefordert — lieber ein Fehler als ein"
+                    + " Video, das zu frueh endet.");
         } else {
             // ⚠️ Teil-Cache EHRLICH als fertiges Video ausliefern statt als
             // wachsende EVENT-Playlist. Ohne ENDLIST haelt AVPlayer das fuer
