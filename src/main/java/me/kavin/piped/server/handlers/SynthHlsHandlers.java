@@ -1361,17 +1361,54 @@ public class SynthHlsHandlers {
     // Pick ONE videoOnly rendition (single-variant — preserves the cold-tap
     // prewarm): the highest <= maxH within the FIRST preferred codec that has any
     // matching rendition (codec preference beats resolution, per the app contract).
+    /// WebM/Matroska taugt nicht fuer diese Playlisten — und zwar hart:
+    /// der Segmentindex heisst dort `Cues` und liegt anders als eine sidx-Box.
+    /// Ohne sidx wird die Playlist EIN Segment ueber die volle Laufzeit; gemessen
+    /// 2026-08-02 an dQw4w9WgXcQ mit `codecs=vp9`: **151 MB in einem einzigen
+    /// Byte-Range**, kein Springen moeglich. AVPlayer spielt VP9/WebM in HLS
+    /// ohnehin nicht — die Rendition waere also auch dann unbrauchbar, wenn der
+    /// Index da waere. Lieber die naechste Codec-Stufe (in der Praxis avc)
+    /// ausliefern als eine formal gueltige, praktisch tote Playlist.
+    ///
+    /// ⚠️ Betrifft heute keinen App-Pfad: die App spielt `d.hlsURL` OHNE Query
+    /// (Backend-Vorgabe avc) und fordert nur auf dem AV1-HDR-Pfad ausdruecklich
+    /// `codecs=av1` an. Es ist eine Falle fuer den naechsten, der die
+    /// Geraete-Codecliste (auf A16/M1 `vp9,avc`) an den Master haengt.
+    private static boolean istWebM(PipedStream s) {
+        final String m = s.mimeType == null ? "" : s.mimeType.toLowerCase();
+        return m.contains("webm") || m.contains("matroska");
+    }
+
     private static List<PipedStream> pickedVideoStreams(Streams streams, int maxH, String[] codecPref) {
         List<PipedStream> out = new ArrayList<>();
         for (String pref : codecPref) {
             PipedStream best = null;
             for (PipedStream s : streams.videoStreams) {
+                if (istWebM(s)) continue;
                 if (s.codec == null || !codecMatches(s.codec, pref)) continue;
                 int h = s.height;
                 if (h <= 0 || h > maxH) continue;
                 if (best == null || h > best.height || (h == best.height && s.bitrate > best.bitrate)) best = s;
             }
             if (best != null) { out.add(best); return out; }
+        }
+        // ⚠️ RUECKFALL. Ohne ihn liefert ein Wunsch, den nur WebM erfuellen
+        // koennte (`codecs=vp9` allein), GAR NICHTS — die Master-Playlist
+        // antwortet dann "no playable streams". Das war eine Regression, die
+        // ich mir mit dem WebM-Ausschluss selbst gebaut habe (2026-08-02).
+        // Lieber die beste MP4-Rendition unter dem Deckel als eine leere
+        // Antwort: der Anfragende bekommt etwas Spielbares statt nichts.
+        PipedStream ersatz = null;
+        for (PipedStream s : streams.videoStreams) {
+            if (istWebM(s) || s.height <= 0 || s.height > maxH) continue;
+            if (ersatz == null || s.height > ersatz.height
+                    || (s.height == ersatz.height && s.bitrate > ersatz.bitrate))
+                ersatz = s;
+        }
+        if (ersatz != null) {
+            System.out.println("[SynthHls] Codec-Wunsch nicht in MP4 erfuellbar -> "
+                    + "Rueckfall auf itag " + ersatz.itag);
+            out.add(ersatz);
         }
         return out;
     }
