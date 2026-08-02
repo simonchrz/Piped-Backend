@@ -180,6 +180,28 @@ public class DownloaderImpl extends Downloader {
             }
         }
 
+        // TEMP-Mitschnitt fuer den Go-Port (2026-08-02): was schickt NPE bei
+        // einem browse-Aufruf WIRKLICH? Der yt-backend-Dev bekommt auf
+        // browseId=FEtrending HTTP 400, waehrend derselbe Endpunkt mit einer
+        // Kanal-browseId 200 liefert; fuenf Hypothesen sind bei ihm widerlegt.
+        // Statt weiter zu raten: die echte Anfrage aufzeichnen.
+        //
+        // Schaltbar ueber YT_DUMP_REQ (Teilstring der URL, z. B. "browse").
+        // Standard aus — der Rumpf enthaelt den Innertube-Kontext samt
+        // visitorData, das gehoert nicht dauerhaft ins Log.
+        final String dumpFilter = System.getenv("YT_DUMP_REQ");
+        if (dumpFilter != null && !dumpFilter.isBlank() && request.url().contains(dumpFilter)) {
+            final StringBuilder d = new StringBuilder("\n===== NPE-Anfrage =====\n");
+            d.append(request.httpMethod()).append(' ').append(request.url()).append('\n');
+            headers.forEach((k, v) -> d.append("  ").append(k).append(": ")
+                    .append("Cookie".equalsIgnoreCase(k) || "Authorization".equalsIgnoreCase(k)
+                            ? "<" + v.length() + " Zeichen, unterdrueckt>" : v).append('\n'));
+            if (bytes != null)
+                d.append("--- Rumpf (").append(bytes.length).append(" B) ---\n")
+                 .append(new String(bytes, java.nio.charset.StandardCharsets.UTF_8)).append('\n');
+            d.append("=======================");
+            System.out.println(d);
+        }
         var future = ReqwestUtils.fetchWithProxy(request.url(), request.httpMethod(), bytes, headers, EgressManager.activeEgress());
 
         // Recaptcha solver code
