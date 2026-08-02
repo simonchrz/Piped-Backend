@@ -57,6 +57,15 @@ public final class SabrHandlers {
     /// Erst WEB (mit visitorData + Attestierung wie die echte Sitzung),
     /// dann ANDROID als Rueckfall.
     public static boolean sabrViable(String videoId) {
+        // Die Probe prueft nur, OB eine serverAbrStreamingUrl im Player-Response
+        // steht — sie fragt sie nie an. Genau deshalb meldete sie "geht", waehrend
+        // die eigentliche SABR-POST mit 403 abgewiesen wurde. Ist das fuer dieses
+        // Video schon passiert, hier ehrlich nein sagen: dann faellt die
+        // Storm-Markierung weg und der Resolve nimmt gleich den Direktweg.
+        if (SabrCache.sabrTot(videoId)) {
+            System.out.println("[Sabr] " + videoId + " sabrViable=false (403 bekannt)");
+            return false;
+        }
         String visitorData = null, attest = null;
         try {
             final BgPoTokenProvider bg = BgPoTokenProvider.instance();

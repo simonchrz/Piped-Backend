@@ -337,13 +337,29 @@ public class SynthHlsHandlers {
     /// sondern schon, wenn das Brauchbare fehlt.
     /// Dasselbe Format in den MWEB-Streams finden — erst nach itag, sonst das
     /// höchstauflösende Video mit Index-Bereich.
+    /// Format zum itag suchen — in DER Liste, zu der der itag gehoert. Ohne
+    /// exakten Treffer das beste Format DERSELBEN Art, nie ueber Kreuz.
+    ///
+    /// ⚠️ Suchte frueher NUR in videoStreams und fiel ohne Treffer auf "bestes
+    /// Video" zurueck. Der Aufrufer in streamPlaylist ersetzt damit das ganze
+    /// Format (`stream = mv`, also URL UND Byte-Offsets) — fuer die TONSPUR kam
+    /// so das BILD heraus. Die Ton-Playlist zeigte auf itag 137 und hatte die
+    /// 345 Segmente des Videos statt ihrer eigenen 182; AVPlayer bekam zweimal
+    /// Video und zeigte einen schwarzen Frame ohne Ton und ohne Fehlermeldung
+    /// (gemeldet 2026-08-02 an 1mCra0aWn0U).
     private static PipedStream passendesFormat(Streams m, int itag) {
-        if (m == null || m.videoStreams == null) return null;
-        for (PipedStream v : m.videoStreams)
-            if (v.itag == itag && v.indexEnd > v.indexStart) return v;
+        if (m == null) return null;
+        final boolean ton = me.kavin.piped.utils.sabr.SabrSession.istAudioItag(itag);
+        final List<PipedStream> liste = ton ? m.audioStreams : m.videoStreams;
+        if (liste == null) return null;
+        for (PipedStream s : liste)
+            if (s.itag == itag && s.indexEnd > s.indexStart) return s;
         PipedStream best = null;
-        for (PipedStream v : m.videoStreams)
-            if (v.indexEnd > v.indexStart && (best == null || v.height > best.height)) best = v;
+        for (PipedStream s : liste) {
+            if (s.indexEnd <= s.indexStart) continue;
+            if (best == null) { best = s; continue; }
+            if (ton ? s.bitrate > best.bitrate : s.height > best.height) best = s;
+        }
         return best;
     }
 
@@ -558,6 +574,13 @@ public class SynthHlsHandlers {
         try {
             final Streams m = me.kavin.piped.utils.MwebStreams.hole(videoId);
             if (m == null) return null;
+            // ⚠️ NICHT passendesFormat() nehmen. Das durchsucht nur die
+            // Video-Liste und faellt, wenn der itag fehlt, auf "bestes Video"
+            // zurueck — fuer die TON-Spur (140) kam so das BILD heraus. Die
+            // Ton-Playlist zeigte dann auf itag 137, AVPlayer bekam zweimal
+            // Video: kein Ton, schwarzes Bild, und zwar OHNE Fehlermeldung
+            // (gemeldet 2026-08-02, beide Playlisten hatten 345 Segmente,
+            // die Tonspur hat in Wahrheit 182).
             final PipedStream pick = passendesFormat(m, itag);
             if (pick == null || pick.url == null) return null;
             return streamPlaylist(videoId, pick, m.duration);

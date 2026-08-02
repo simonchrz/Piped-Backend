@@ -775,12 +775,33 @@ public final class SabrCache {
     private static final Map<String, Long> SABR_TOT = new ConcurrentHashMap<>();
     private static final long SABR_TOT_TTL_MS = 5 * 60 * 1000L;
 
+    /// ⚠️ Auch auf PLATTE. Rein im Speicher vergisst ein Neustart die
+    /// Erkenntnis, und der erste Tap danach laeuft wieder in die volle
+    /// Entdeckung (Resolve + SABR-Sitzung bis zum 403, zusammen ueber dem
+    /// 12-s-Budget des Servers) — in der App HTTP 500. So kostet es das
+    /// hoechstens EINMAL je Video und Frist.
+    private static final long SABR_TOT_DATEI_MS = 6L * 3600_000L;
+
     public static boolean sabrTot(String videoId) {
         final Long bis = SABR_TOT.get(videoId);
-        if (bis == null) return false;
-        if (bis > System.currentTimeMillis()) return true;
-        SABR_TOT.remove(videoId);
+        if (bis != null && bis > System.currentTimeMillis()) return true;
+        if (bis != null) SABR_TOT.remove(videoId);
+        try {
+            final Path m = dir().resolve(safe(videoId) + ".sabrtot");
+            if (!java.nio.file.Files.exists(m)) return false;
+            final long alter = System.currentTimeMillis()
+                    - java.nio.file.Files.getLastModifiedTime(m).toMillis();
+            if (alter < SABR_TOT_DATEI_MS) return true;
+            java.nio.file.Files.deleteIfExists(m);
+        } catch (Exception ignored) { }
         return false;
+    }
+
+    private static void merkeSabrTot(String videoId) {
+        SABR_TOT.put(videoId, System.currentTimeMillis() + SABR_TOT_TTL_MS);
+        try {
+            java.nio.file.Files.writeString(dir().resolve(safe(videoId) + ".sabrtot"), "");
+        } catch (Exception ignored) { }
     }
     public static int seekItag(String videoId) { return SEEK_ITAG.getOrDefault(videoId, -1); }
     /// Wie lange ein Abruf auf nachgeforderte Bytes wartet.
@@ -1411,7 +1432,7 @@ public final class SabrCache {
             // der MWEB-Notausgang kam dadurch nie zum Zug (gemessen 2026-08-02
             // an 1mCra0aWn0U: dreimal HTTP 500 nach 12,0 s).
             if (e.getMessage() != null && e.getMessage().contains("HTTP 403"))
-                SABR_TOT.put(videoId, System.currentTimeMillis() + SABR_TOT_TTL_MS);
+                merkeSabrTot(videoId);
         } finally {
             // the session closes the streams it was handed; this is defensive for
             // the error path (runSession throws before the session's finally runs).

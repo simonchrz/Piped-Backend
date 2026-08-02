@@ -446,7 +446,7 @@ public final class SabrSession {
 
     /// Bekannte Audio-itags (AAC 139/140/141, Opus 249/250/251, AC-3 256/258,
     /// DTSE 325/328). Reicht, um „Video-only-Angebot" zu erkennen.
-    private static boolean istAudioItag(int itag) {
+    public static boolean istAudioItag(int itag) {
         return itag == 139 || itag == 140 || itag == 141
                 || itag == 249 || itag == 250 || itag == 251
                 || itag == 256 || itag == 258 || itag == 325 || itag == 328;
